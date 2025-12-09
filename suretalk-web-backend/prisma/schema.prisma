@@ -1,0 +1,226 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// User model
+model User {
+  id                   String    @id @default(uuid())
+  email                String    @unique @db.VarChar(255)
+  phone                String?   @db.VarChar(20)
+  firstName            String?   @db.VarChar(100)
+  lastName             String?   @db.VarChar(100)
+  passwordHash         String    @db.VarChar(255)
+  subscriptionTier     String    @default("LITE") // LITE, ESSENTIAL, PREMIUM
+  stripeCustomerId     String?   @unique @db.VarChar(100)
+  stripeSubscriptionId String?   @unique @db.VarChar(100)
+  verified             Boolean   @default(false)
+  emailVerified        Boolean   @default(false)
+  isAdmin              Boolean   @default(false)
+  status               String    @default("ACTIVE") // ACTIVE, SUSPENDED, DELETED
+  lastLogin            DateTime?
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+
+  // Relations
+  voiceNotes        VoiceNote[]
+  contacts          Contact[]
+  voiceWills        VoiceWill[]
+  scheduledMessages ScheduledMessage[]
+  sessions          Session[]
+  auditLogs         AuditLog[]
+
+  @@index([email])
+  @@index([phone])
+  @@index([stripeCustomerId])
+  @@index([createdAt])
+}
+
+// Session for JWT management (optional)
+model Session {
+  id        String   @id @default(uuid())
+  userId    String
+  token     String   @unique @db.VarChar(512)
+  expiresAt DateTime
+  userAgent String?  @db.VarChar(500)
+  ipAddress String?  @db.VarChar(45)
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+// Voice Notes
+model VoiceNote {
+  id              String   @id @default(uuid())
+  userId          String
+  recordingSid    String?  @db.VarChar(100) // Twilio recording SID
+  s3Key           String   @db.VarChar(500)
+  s3Bucket        String   @default("suretalk-voice-notes") @db.VarChar(255)
+  title           String?  @db.VarChar(200)
+  description     String?  @db.Text
+  duration        Int? // in seconds
+  fileSize        BigInt? // in bytes
+  storageClass    String   @default("STANDARD") @db.VarChar(50)
+  isPermanent     Boolean  @default(false)
+  retentionDays   Int? // null means permanent
+  tierWhenCreated String   @default("LITE") @db.VarChar(20)
+  isPublic        Boolean  @default(false)
+  playCount       Int      @default(0)
+  tags            String[] // e.g., ["meeting", "important"]
+  metadata        Json? // additional metadata
+
+  // Timestamps
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  expiresAt DateTime? // auto-calculated based on retention policy
+  deletedAt DateTime?
+
+  // Relations
+  user   User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  shares Share[]
+
+  // Generated field for expiresAt
+  //@@ignore
+  //expiresAtComputed = createdAt + (retentionDays || 180) * 24 * 60 * 60 * 1000
+
+  @@index([userId])
+  @@index([createdAt])
+  @@index([isPermanent])
+  @@index([storageClass])
+  @@index([expiresAt])
+  @@index([tags])
+}
+
+// Contacts
+model Contact {
+  id               String  @id @default(uuid())
+  userId           String
+  name             String  @db.VarChar(100)
+  phone            String? @db.VarChar(20)
+  email            String? @db.VarChar(255)
+  relationship     String? @db.VarChar(50)
+  canReceiveLegacy Boolean @default(false)
+  isEmergency      Boolean @default(false)
+  notes            String? @db.Text
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user              User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  scheduledMessages ScheduledMessage[]
+  shares            Share[]
+
+  @@unique([userId, phone])
+  @@unique([userId, email])
+  @@index([userId])
+  @@index([phone])
+  @@index([email])
+}
+
+// Voice Wills (Premium feature)
+model VoiceWill {
+  id               String    @id @default(uuid())
+  userId           String
+  title            String    @db.VarChar(200)
+  s3Key            String    @db.VarChar(500)
+  description      String?   @db.Text
+  executorName     String    @db.VarChar(100)
+  executorPhone    String    @db.VarChar(20)
+  executorEmail    String?   @db.VarChar(255)
+  releaseCondition String    @default("MANUAL") // MANUAL, DATE, EVENT
+  releaseDate      DateTime?
+  isReleased       Boolean   @default(false)
+  releasedAt       DateTime?
+  releasedBy       String?   @db.VarChar(100) // admin userId who released it
+  kmsKeyId         String?   @db.VarChar(100)
+  metadata         Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([isReleased])
+  @@index([releaseDate])
+  @@index([executorPhone])
+}
+
+// Scheduled Messages (Premium feature)
+model ScheduledMessage {
+  id             String    @id @default(uuid())
+  userId         String
+  contactId      String?
+  title          String    @db.VarChar(200)
+  s3Key          String    @db.VarChar(500)
+  message        String?   @db.Text
+  scheduledFor   DateTime
+  deliveryMethod String    @default("CALL") // CALL, SMS, EMAIL
+  status         String    @default("PENDING") // PENDING, SENT, FAILED, CANCELLED
+  sentAt         DateTime?
+  retryCount     Int       @default(0)
+  errorMessage   String?   @db.Text
+  metadata       Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  contact Contact? @relation(fields: [contactId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([contactId])
+  @@index([scheduledFor])
+  @@index([status])
+}
+
+// Share voice notes with contacts
+model Share {
+  id          String    @id @default(uuid())
+  voiceNoteId String
+  contactId   String
+  permission  String    @default("VIEW") // VIEW, DOWNLOAD
+  expiresAt   DateTime?
+  accessedAt  DateTime?
+  accessCount Int       @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  voiceNote VoiceNote @relation(fields: [voiceNoteId], references: [id], onDelete: Cascade)
+  contact   Contact   @relation(fields: [contactId], references: [id], onDelete: Cascade)
+
+  @@unique([voiceNoteId, contactId])
+  @@index([expiresAt])
+}
+
+// System logs/audit trail
+model AuditLog {
+  id           String  @id @default(uuid())
+  userId       String?
+  action       String  @db.VarChar(100) // e.g., "USER_LOGIN", "VOICE_NOTE_CREATED"
+  resourceId   String? @db.VarChar(100)
+  resourceType String? @db.VarChar(50)
+  details      Json?
+  ipAddress    String? @db.VarChar(45)
+  userAgent    String? @db.VarChar(500)
+
+  createdAt DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([action])
+  @@index([createdAt])
+  @@index([resourceType, resourceId])
+}

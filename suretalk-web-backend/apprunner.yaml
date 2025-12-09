@@ -1,0 +1,38 @@
+version: 1.0
+runtime: nodejs18
+build:
+  commands:
+    pre-build:
+      - npm ci
+      - npx prisma generate
+      - npm run build
+  dockerfile: Dockerfile
+  port: 3000
+
+run:
+  network:
+    vpc-connector: suretalk-vpc-connector
+  env:
+    - name: NODE_ENV
+      value: production
+    - name: DATABASE_URL
+      value: ${DATABASE_URL}
+    - name: JWT_SECRET
+      value: ${JWT_SECRET}
+    - name: AWS_REGION
+      value: ${AWS_REGION}
+    - name: S3_BUCKET_NAME
+      value: ${S3_BUCKET_NAME}
+
+health-check:
+  path: /health
+  interval: 30
+  timeout: 5
+  healthy-threshold: 2
+  unhealthy-threshold: 5
+
+auto-scaling:
+  min-size: 2
+  max-size: 10
+  target-cpu: 70
+  target-memory: 80
