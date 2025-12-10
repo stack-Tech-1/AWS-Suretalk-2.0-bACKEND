@@ -76,29 +76,34 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // Health check endpoint
-app.get('/health', (req, res) => {
+app.get('/health', (_req, res) => {
   res.status(200).json({
     status: 'healthy',
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
     environment: process.env.NODE_ENV,
-    database: 'connected' // You can add database health check here
+    database: 'connected'
   });
 });
 
-// API routes will be imported here
-// Example: app.use('/api/auth', authRoutes);
+// Import routes
+import authRoutes from './modules/auth/auth.routes';
+import userRoutes from './modules/users/user.routes';
+
+// API Routes
+app.use('/api/auth', authRoutes);
+app.use('/api/user', userRoutes);
 
 // 404 handler
-app.use((req, res) => {
+app.use((_req, res) => {
   res.status(404).json({
     error: 'Not Found',
-    message: `Cannot ${req.method} ${req.path}`
+    message: 'Resource not found'
   });
 });
 
 // Error handler
-app.use((err: Error, req: express.Request, res: express.Response, next: express.NextFunction) => {
+app.use((err: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
   logger.error('Unhandled error:', err);
   
   const statusCode = (err as any).statusCode || 500;
@@ -135,7 +140,9 @@ process.on('SIGINT', gracefulShutdown);
 const server = app.listen(PORT, () => {
   logger.info(`🚀 Server running on port ${PORT}`);
   logger.info(`📝 Environment: ${process.env.NODE_ENV}`);
-  logger.info(`🌍 CORS origins: ${corsOptions.origin.join(', ')}`);
+  if (corsOptions.origin && Array.isArray(corsOptions.origin)) {
+    logger.info(`🌍 CORS origins: ${corsOptions.origin.join(', ')}`);
+  }
 });
 
-export { app, prisma, logger };
+export { app, prisma, logger, server };

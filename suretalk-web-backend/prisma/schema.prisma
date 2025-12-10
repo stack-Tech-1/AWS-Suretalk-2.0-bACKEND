@@ -89,10 +89,6 @@ model VoiceNote {
   user   User    @relation(fields: [userId], references: [id], onDelete: Cascade)
   shares Share[]
 
-  // Generated field for expiresAt
-  //@@ignore
-  //expiresAtComputed = createdAt + (retentionDays || 180) * 24 * 60 * 60 * 1000
-
   @@index([userId])
   @@index([createdAt])
   @@index([isPermanent])
