@@ -1,0 +1,11 @@
+# C:\Users\SMC\Documents\GitHub\AWS-Suretalk-2.0-bACKEND\.dockerignore
+node_modules
+npm-debug.log
+logs/
+.env
+.git
+.gitignore
+README.md
+Dockerfile
+.dockerignore
+.vscode
