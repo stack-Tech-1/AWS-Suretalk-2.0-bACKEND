@@ -23,8 +23,8 @@ async function seedAdmin() {
     await pool.query(
       `INSERT INTO users (
         email, phone, full_name, password_hash, 
-        ssubscription_tier, is_admin, admin_status, storage_limit_gb
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        subscription_tier, is_admin, admin_status, storage_limit_gb
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
       [
         'admin@suretalk.com',
         '+1234567890',
@@ -35,7 +35,8 @@ async function seedAdmin() {
         'approved',
         1000
       ]
-    );
+    );    
+
 
     console.log('Admin user created successfully!');
     console.log('Email: admin@suretalk.com');
