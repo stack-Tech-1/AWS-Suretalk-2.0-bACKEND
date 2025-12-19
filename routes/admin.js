@@ -841,18 +841,35 @@ router.post('/register-request', authenticate, [
         error: 'Failed to process admin request'
       });
     }
+  });  
+
+  router.post('/admin/request', async (req, res) => {
+    try {
+      const { email, phone, password, fullName, department, reason } = req.body;
+  
+      const passwordHash = await bcrypt.hash(password, 10);
+  
+      await pool.query(
+        `INSERT INTO users (
+          email, phone, password_hash, full_name,
+          is_admin, admin_status
+        ) VALUES ($1, $2, $3, $4, false, 'pending')`,
+        [email, phone, passwordHash, fullName]
+      );
+  
+      res.status(201).json({
+        success: true,
+        message: 'Admin request submitted and pending approval'
+      });
+  
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        error: 'Failed to submit admin request'
+      });
+    }
   });
 
-  router.get('/admin/pending', authenticateAdmin, async (req, res) => {
-    const result = await pool.query(
-      `SELECT id, email, full_name, created_at 
-       FROM users WHERE admin_status = 'pending'`
-    );
-  
-    res.json({ success: true, data: result.rows });
-  });
-
-  
   router.post('/admin/approve', authenticateAdmin, async (req, res) => {
     const { userId } = req.body;
   
@@ -866,6 +883,14 @@ router.post('/register-request', authenticate, [
     res.json({ success: true, message: 'Admin approved' });
   });
 
+  router.get('/admin/pending', authenticateAdmin, async (req, res) => {
+    const result = await pool.query(
+      `SELECT id, email, full_name, created_at 
+       FROM users WHERE admin_status = 'pending'`
+    );
+  
+    res.json({ success: true, data: result.rows });
+  });
   
   router.post('/admin/reject', authenticateAdmin, async (req, res) => {
     const { userId } = req.body;
@@ -879,6 +904,5 @@ router.post('/register-request', authenticate, [
   
     res.json({ success: true, message: 'Admin rejected' });
   });
-  
 
 module.exports = router;

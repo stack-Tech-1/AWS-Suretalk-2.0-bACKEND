@@ -503,7 +503,7 @@ router.get('/profile', authenticate, async (req, res) => {
       const userQuery = await pool.query(
         `SELECT id, email, phone, full_name, subscription_tier, subscription_status,
                 profile_image_url, storage_limit_gb, contacts_limit, voice_notes_limit,
-                created_at, last_login, is_admin  
+                created_at, last_login, is_admin, admin_status  
          FROM users WHERE id = $1`,
         [req.user.id]
       );
@@ -527,34 +527,7 @@ router.get('/profile', authenticate, async (req, res) => {
         error: 'Failed to fetch profile'
       });
     }
-  });
-
-  router.post('/admin/request', async (req, res) => {
-    try {
-      const { email, phone, password, fullName, department, reason } = req.body;
-  
-      const passwordHash = await bcrypt.hash(password, 10);
-  
-      await pool.query(
-        `INSERT INTO users (
-          email, phone, password_hash, full_name,
-          is_admin, admin_status
-        ) VALUES ($1, $2, $3, $4, false, 'pending')`,
-        [email, phone, passwordHash, fullName]
-      );
-  
-      res.status(201).json({
-        success: true,
-        message: 'Admin request submitted and pending approval'
-      });
-  
-    } catch (error) {
-      res.status(500).json({
-        success: false,
-        error: 'Failed to submit admin request'
-      });
-    }
-  });
+  }); 
   
 
 module.exports = router;
