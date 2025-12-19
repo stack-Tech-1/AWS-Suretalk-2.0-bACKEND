@@ -15,10 +15,10 @@ const authenticate = async (req, res, next) => {
     
     // Check if user exists and is active
     const userQuery = await pool.query(
-      'SELECT id, email, phone, full_name, subscription_tier, subscription_status, profile_image_url FROM users WHERE id = $1 AND deleted_at IS NULL',
-      [decoded.userId]
-    );
-
+        `SELECT id, email, phone, full_name, subscription_tier, subscription_status, profile_image_url, is_admin FROM users WHERE id = $1 AND deleted_at IS NULL`,
+        [decoded.userId]
+      );
+      
     if (userQuery.rows.length === 0) {
       throw new Error('User not found');
     }
@@ -51,9 +51,12 @@ const authenticateAdmin = async (req, res, next) => {
         [req.user.id]
       );
 
-      if (adminCheck.rows.length === 0 || !adminCheck.rows[0].is_admin) {
-        throw new Error('Admin access required');
-      }
+      const admin = adminCheck.rows[0];
+
+    if (!admin || !admin.is_admin || admin.admin_status !== 'approved') {
+    throw new Error('Admin access required');
+    }
+
 
       next();
     });

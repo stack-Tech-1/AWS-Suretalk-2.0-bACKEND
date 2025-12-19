@@ -23,7 +23,7 @@ async function seedAdmin() {
     await pool.query(
       `INSERT INTO users (
         email, phone, full_name, password_hash, 
-        subscription_tier, is_admin, storage_limit_gb
+        ssubscription_tier, is_admin, admin_status, storage_limit_gb
       ) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
       [
         'admin@suretalk.com',
@@ -32,6 +32,7 @@ async function seedAdmin() {
         passwordHash,
         'LEGACY_VAULT_PREMIUM',
         true,
+        'approved',
         1000
       ]
     );

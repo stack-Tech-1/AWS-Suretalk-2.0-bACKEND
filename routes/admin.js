@@ -3,6 +3,8 @@ const express = require('express');
 const router = express.Router();
 const { authenticate, authenticateAdmin } = require('../middleware/auth');
 const { pool } = require('../config/database');
+const { body, validationResult } = require('express-validator'); 
+const bcrypt = require('bcrypt'); 
 
 // Get system overview stats
 router.get('/overview', authenticateAdmin, async (req, res) => {
@@ -612,5 +614,271 @@ router.get('/storage', authenticateAdmin, async (req, res) => {
     });
   }
 });
+
+
+
+// Request admin access
+router.post('/register-request', authenticate, [
+    body('email').isEmail().normalizeEmail(),
+    body('phone').isMobilePhone(),
+    body('fullName').notEmpty().trim(),
+    body('password').isLength({ min: 10 }),
+    body('reason').notEmpty().trim(),
+    body('department').optional().trim(),
+    body('requestedBy').optional().trim()
+  ], async (req, res) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({
+          success: false,
+          errors: errors.array()
+        });
+      }
+  
+      const { 
+        email, phone, fullName, password, reason, department, requestedBy 
+      } = req.body;
+  
+      // Check if user already exists
+      const existingUser = await pool.query(
+        'SELECT id FROM users WHERE email = $1',
+        [email]
+      );
+  
+      if (existingUser.rows.length > 0) {
+        return res.status(400).json({
+          success: false,
+          error: 'User with this email already exists'
+        });
+      }
+  
+      // Hash password
+      const saltRounds = 10;
+      const passwordHash = await bcrypt.hash(password, saltRounds);
+  
+      // Create user with pending admin status
+      const newUser = await pool.query(
+        `INSERT INTO users (
+          email, phone, full_name, password_hash, 
+          subscription_tier, is_admin, admin_status, admin_reason, admin_department,
+          requested_by_admin_id, subscription_status
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        RETURNING id, email, full_name, admin_status, created_at`,
+        [
+          email,
+          phone,
+          fullName,
+          passwordHash,
+          'ESSENTIAL', // Default tier
+          false, // Not admin yet
+          'pending', // Admin status: pending, approved, rejected
+          reason,
+          department || null,
+          requestedBy || req.user?.id || null,
+          'inactive' // Wait for admin approval
+        ]
+      );
+  
+      // Log the admin request
+      await pool.query(
+        `INSERT INTO system_logs (user_id, level, service, message, metadata)
+         VALUES ($1, 'info', 'admin', 'Admin access requested', $2)`,
+        [
+          newUser.rows[0].id,
+          JSON.stringify({
+            requestedBy: requestedBy || 'self',
+            reason: reason,
+            department: department
+          })
+        ]
+      );
+  
+      // TODO: Send notification to existing admins
+      // TODO: Send email confirmation to requester
+  
+      res.status(201).json({
+        success: true,
+        message: 'Admin access request submitted successfully',
+        data: {
+          requestId: newUser.rows[0].id,
+          status: 'pending',
+          estimatedReviewTime: '24-48 hours'
+        }
+      });
+  
+    } catch (error) {
+      console.error('Admin registration request error:', error);
+      res.status(500).json({
+        success: false,
+        error: 'Failed to submit admin request'
+      });
+    }
+  });
+  
+  // Get pending admin requests (for existing admins)
+  router.get('/pending-requests', authenticateAdmin, async (req, res) => {
+    try {
+      const { page = 1, limit = 20 } = req.query;
+      const offset = (page - 1) * limit;
+  
+      const result = await pool.query(
+        `SELECT 
+          u.id, u.email, u.phone, u.full_name, u.admin_reason, u.admin_department,
+          u.requested_by_admin_id, u.created_at,
+          ru.full_name as requested_by_name,
+          (SELECT COUNT(*) FROM users WHERE admin_status = 'pending') as total_count
+         FROM users u
+         LEFT JOIN users ru ON u.requested_by_admin_id = ru.id
+         WHERE u.admin_status = 'pending'
+         ORDER BY u.created_at DESC
+         LIMIT $1 OFFSET $2`,
+        [parseInt(limit), offset]
+      );
+  
+      res.json({
+        success: true,
+        data: {
+          requests: result.rows,
+          pagination: {
+            page: parseInt(page),
+            limit: parseInt(limit),
+            total: result.rows[0]?.total_count || 0,
+            totalPages: Math.ceil((result.rows[0]?.total_count || 0) / limit)
+          }
+        }
+      });
+  
+    } catch (error) {
+      console.error('Get pending requests error:', error);
+      res.status(500).json({
+        success: false,
+        error: 'Failed to fetch pending requests'
+      });
+    }
+  });
+  
+  // Approve/Reject admin request
+  router.post('/requests/:id/action', authenticateAdmin, [
+    body('action').isIn(['approve', 'reject']),
+    body('notes').optional().trim()
+  ], async (req, res) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({
+          success: false,
+          errors: errors.array()
+        });
+      }
+  
+      const { id } = req.params;
+      const { action, notes } = req.body;
+  
+      // Get the request
+      const requestQuery = await pool.query(
+        `SELECT id, email, admin_status FROM users WHERE id = $1`,
+        [id]
+      );
+  
+      if (requestQuery.rows.length === 0) {
+        return res.status(404).json({
+          success: false,
+          error: 'Request not found'
+        });
+      }
+  
+      const request = requestQuery.rows[0];
+  
+      if (request.admin_status !== 'pending') {
+        return res.status(400).json({
+          success: false,
+          error: `Request is already ${request.admin_status}`
+        });
+      }
+  
+      // Update user based on action
+      if (action === 'approve') {
+        await pool.query(
+          `UPDATE users 
+           SET is_admin = true, 
+               admin_status = 'approved',
+               approved_by_admin_id = $1,
+               approved_at = CURRENT_TIMESTAMP,
+               subscription_status = 'active',
+               updated_at = CURRENT_TIMESTAMP
+           WHERE id = $2`,
+          [req.user.id, id]
+        );
+  
+        // TODO: Send approval email
+        // TODO: Log approval
+  
+      } else if (action === 'reject') {
+        await pool.query(
+          `UPDATE users 
+           SET admin_status = 'rejected',
+               rejected_by_admin_id = $1,
+               rejected_at = CURRENT_TIMESTAMP,
+               rejection_notes = $2,
+               updated_at = CURRENT_TIMESTAMP
+           WHERE id = $3`,
+          [req.user.id, notes || null, id]
+        );
+  
+        // TODO: Send rejection email
+      }
+  
+      res.json({
+        success: true,
+        message: `Admin request ${action}d successfully`
+      });
+  
+    } catch (error) {
+      console.error('Process admin request error:', error);
+      res.status(500).json({
+        success: false,
+        error: 'Failed to process admin request'
+      });
+    }
+  });
+
+  router.get('/admin/pending', authenticateAdmin, async (req, res) => {
+    const result = await pool.query(
+      `SELECT id, email, full_name, created_at 
+       FROM users WHERE admin_status = 'pending'`
+    );
+  
+    res.json({ success: true, data: result.rows });
+  });
+
+  
+  router.post('/admin/approve', authenticateAdmin, async (req, res) => {
+    const { userId } = req.body;
+  
+    await pool.query(
+      `UPDATE users 
+       SET is_admin = true, admin_status = 'approved'
+       WHERE id = $1`,
+      [userId]
+    );
+  
+    res.json({ success: true, message: 'Admin approved' });
+  });
+
+  
+  router.post('/admin/reject', authenticateAdmin, async (req, res) => {
+    const { userId } = req.body;
+  
+    await pool.query(
+      `UPDATE users 
+       SET admin_status = 'rejected'
+       WHERE id = $1`,
+      [userId]
+    );
+  
+    res.json({ success: true, message: 'Admin rejected' });
+  });
+  
 
 module.exports = router;

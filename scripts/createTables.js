@@ -26,6 +26,8 @@ async function createTables() {
 
         profile_image_url TEXT,
         is_admin BOOLEAN DEFAULT FALSE,
+        admin_status VARCHAR(20) DEFAULT 'none',
+
 
         last_login TIMESTAMP,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,

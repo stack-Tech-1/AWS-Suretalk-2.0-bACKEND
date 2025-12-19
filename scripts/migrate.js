@@ -28,6 +28,7 @@ async function runMigrations() {
         email_verified BOOLEAN DEFAULT FALSE,
         phone_verified BOOLEAN DEFAULT FALSE,
         two_factor_enabled BOOLEAN DEFAULT FALSE,
+        admin_status VARCHAR(20) DEFAULT 'none',
         profile_image_url TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,

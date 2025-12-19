@@ -10,7 +10,7 @@ const { authenticate } = require('../middleware/auth');
 // Validation middleware
 const validateRegister = [
   body('email').isEmail().normalizeEmail(),
-  body('phone').isMobilePhone(),
+  body('phone').notEmpty().isLength({ min: 10 }),
   body('password').isLength({ min: 8 }),
   body('fullName').notEmpty().trim()
 ];
@@ -57,13 +57,21 @@ router.post('/register', validateRegister, async (req, res) => {
        RETURNING id, email, phone, full_name, subscription_tier, created_at`,
       [email, phone, passwordHash, fullName]
     );
+    
+    // Generate JWT token with more user info
+    const createdUser = newUser.rows[0];
 
-    // Generate JWT token
     const token = jwt.sign(
-      { userId: newUser.rows[0].id },
+      { 
+        userId: createdUser.id,
+        email: createdUser.email,
+        isAdmin: false,
+        tier: createdUser.subscription_tier
+      },
       process.env.JWT_SECRET,
       { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
     );
+    
 
     // Generate refresh token
     const refreshToken = jwt.sign(
@@ -106,11 +114,11 @@ router.post('/login', validateLogin, async (req, res) => {
 
     // Find user
     const userQuery = await pool.query(
-      `SELECT id, email, phone, full_name, password_hash, subscription_tier, 
-              subscription_status, profile_image_url, last_login
-       FROM users WHERE email = $1 AND deleted_at IS NULL`,
-      [email]
-    );
+        `SELECT id, email, phone, full_name, password_hash, subscription_tier, subscription_status, 
+        profile_image_url, last_login, is_admin, admin_status
+        FROM users WHERE email = $1 AND deleted_at IS NULL`,
+        [email]
+      );
 
     if (userQuery.rows.length === 0) {
       return res.status(401).json({
@@ -130,6 +138,13 @@ router.post('/login', validateLogin, async (req, res) => {
       });
     }
 
+    if (user.is_admin && user.admin_status !== 'approved') {
+        return res.status(403).json({
+          success: false,
+          error: 'Admin access pending approval'
+        });
+      }
+      
     // Check subscription status
     if (user.subscription_status !== 'active') {
       return res.status(403).json({
@@ -144,12 +159,16 @@ router.post('/login', validateLogin, async (req, res) => {
       [user.id]
     );
 
-    // Generate tokens
     const token = jwt.sign(
-      { userId: user.id },
-      process.env.JWT_SECRET,
-      { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
-    );
+        { 
+          userId: user.id,
+          email: user.email,    
+          tier: user.subscription_tier,
+          isAdmin: user.is_admin || false  // ADD THIS LINE
+        },
+        process.env.JWT_SECRET,
+        { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
+      );
 
     const refreshToken = jwt.sign(
       { userId: user.id },
@@ -229,37 +248,6 @@ router.post('/refresh', async (req, res) => {
   }
 });
 
-// Get current user profile
-router.get('/profile', authenticate, async (req, res) => {
-  try {
-    const userQuery = await pool.query(
-      `SELECT id, email, phone, full_name, subscription_tier, subscription_status,
-              profile_image_url, storage_limit_gb, contacts_limit, voice_notes_limit,
-              created_at, last_login
-       FROM users WHERE id = $1`,
-      [req.user.id]
-    );
-
-    if (userQuery.rows.length === 0) {
-      return res.status(404).json({
-        success: false,
-        error: 'User not found'
-      });
-    }
-
-    res.json({
-      success: true,
-      data: userQuery.rows[0]
-    });
-
-  } catch (error) {
-    console.error('Profile error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to fetch profile'
-    });
-  }
-});
 
 // Update user profile
 router.put('/profile', authenticate, async (req, res) => {
@@ -509,5 +497,64 @@ router.post('/reset-password', [
     });
   }
 });
+
+router.get('/profile', authenticate, async (req, res) => {
+    try {
+      const userQuery = await pool.query(
+        `SELECT id, email, phone, full_name, subscription_tier, subscription_status,
+                profile_image_url, storage_limit_gb, contacts_limit, voice_notes_limit,
+                created_at, last_login, is_admin  
+         FROM users WHERE id = $1`,
+        [req.user.id]
+      );
+  
+      if (userQuery.rows.length === 0) {
+        return res.status(404).json({
+          success: false,
+          error: 'User not found'
+        });
+      }
+  
+      res.json({
+        success: true,
+        data: userQuery.rows[0]
+      });
+  
+    } catch (error) {
+      console.error('Profile error:', error);
+      res.status(500).json({
+        success: false,
+        error: 'Failed to fetch profile'
+      });
+    }
+  });
+
+  router.post('/admin/request', async (req, res) => {
+    try {
+      const { email, phone, password, fullName, department, reason } = req.body;
+  
+      const passwordHash = await bcrypt.hash(password, 10);
+  
+      await pool.query(
+        `INSERT INTO users (
+          email, phone, password_hash, full_name,
+          is_admin, admin_status
+        ) VALUES ($1, $2, $3, $4, false, 'pending')`,
+        [email, phone, passwordHash, fullName]
+      );
+  
+      res.status(201).json({
+        success: true,
+        message: 'Admin request submitted and pending approval'
+      });
+  
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        error: 'Failed to submit admin request'
+      });
+    }
+  });
+  
 
 module.exports = router;
