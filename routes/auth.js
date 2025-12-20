@@ -528,6 +528,89 @@ router.get('/profile', authenticate, async (req, res) => {
       });
     }
   }); 
+
+  
+  // Request admin access
+router.post(
+    '/admin/request',
+    [
+      body('email').isEmail().normalizeEmail(),
+      body('phone').notEmpty().isLength({ min: 10 }),
+      body('password').isLength({ min: 8 }),
+      body('fullName').notEmpty().trim(),
+      body('reason').notEmpty().trim(),
+      body('department').optional().trim()
+    ],
+    async (req, res) => {
+      try {
+        const errors = validationResult(req);
+        if (!errors.isEmpty()) {
+          return res.status(400).json({
+            success: false,
+            errors: errors.array()
+          });
+        }
+  
+        const {
+          email,
+          phone,
+          password,
+          fullName,
+          subscriptionTier,
+        } = req.body;
+  
+        // Check if user already exists
+        const existingUser = await pool.query(
+          'SELECT id FROM users WHERE email = $1 OR phone = $2',
+          [email, phone]
+        );
+  
+        if (existingUser.rows.length > 0) {
+          return res.status(400).json({
+            success: false,
+            error: 'User with this email or phone already exists'
+          });
+        }
+  
+        // Hash password
+        const passwordHash = await bcrypt.hash(password, 10);
+  
+        // Create pending admin user
+        const result = await pool.query(
+          `
+          INSERT INTO users (
+            email,
+            phone,
+            password_hash,
+            full_name,
+            is_admin,
+            admin_status,
+            subscription_tier
+          )
+          VALUES ($1, $2, $3, $4, true, 'pending', $5)
+          RETURNING id, email, full_name, is_admin, admin_status, created_at
+          `,
+          [email, phone, passwordHash, fullName, subscriptionTier] 
+        );
+  
+        res.status(201).json({
+          success: true,
+          message: 'Admin request submitted and pending approval',
+          data: {
+            user: result.rows[0]
+          }
+        });
+  
+      } catch (error) {
+        console.error('Admin request error:', error);
+        res.status(500).json({
+          success: false,
+          error: 'Failed to submit admin request'
+        });
+      }
+    }
+  );
+  
   
 
 module.exports = router;

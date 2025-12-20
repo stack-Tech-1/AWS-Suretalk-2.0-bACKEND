@@ -43,30 +43,39 @@ const authenticate = async (req, res, next) => {
 
 // Admin authentication middleware
 const authenticateAdmin = async (req, res, next) => {
-  try {
-    await authenticate(req, res, async () => {
-      // Check if user is admin (you can add an is_admin field to users table)
-      const adminCheck = await pool.query(
-        'SELECT is_admin FROM users WHERE id = $1',
-        [req.user.id]
-      );
-
-      const admin = adminCheck.rows[0];
-
-    if (!admin || !admin.is_admin || admin.admin_status !== 'approved') {
-    throw new Error('Admin access required');
+    try {
+      await authenticate(req, res, async () => {
+        const adminCheck = await pool.query(
+          'SELECT is_admin, admin_status FROM users WHERE id = $1',
+          [req.user.id]
+        );
+  
+        if (adminCheck.rows.length === 0) {
+          return res.status(403).json({
+            success: false,
+            error: 'Admin access required'
+          });
+        }
+  
+        const admin = adminCheck.rows[0];
+  
+        if (!admin.is_admin || admin.admin_status !== 'approved') {
+          return res.status(403).json({
+            success: false,
+            error: 'Admin access required'
+          });
+        }
+  
+        next();
+      });
+    } catch (error) {
+      res.status(401).json({
+        success: false,
+        error: 'Please authenticate'
+      });
     }
-
-
-      next();
-    });
-  } catch (error) {
-    res.status(403).json({
-      success: false,
-      error: 'Admin access required'
-    });
-  }
-};
+  };
+  
 
 // Tier validation middleware
 const validateTier = (requiredTier) => async (req, res, next) => {

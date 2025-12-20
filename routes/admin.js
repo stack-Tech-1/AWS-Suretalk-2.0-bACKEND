@@ -724,15 +724,23 @@ router.post('/register-request', authenticate, [
   
       const result = await pool.query(
         `SELECT 
-          u.id, u.email, u.phone, u.full_name, u.admin_reason, u.admin_department,
-          u.requested_by_admin_id, u.created_at,
-          ru.full_name as requested_by_name,
-          (SELECT COUNT(*) FROM users WHERE admin_status = 'pending') as total_count
-         FROM users u
-         LEFT JOIN users ru ON u.requested_by_admin_id = ru.id
-         WHERE u.admin_status = 'pending'
-         ORDER BY u.created_at DESC
-         LIMIT $1 OFFSET $2`,
+            u.id,
+            u.email,
+            u.phone,
+            u.full_name,
+            u.admin_reason,
+            u.admin_department,
+            u.admin_status,
+            u.requested_by_admin_id,
+            u.created_at,
+            ru.full_name AS requested_by_name,
+            COUNT(*) OVER() AS total_count
+            FROM users u
+            LEFT JOIN users ru ON u.requested_by_admin_id = ru.id
+            WHERE u.admin_status = 'pending'
+            ORDER BY u.created_at DESC
+            LIMIT $1 OFFSET $2
+            `,
         [parseInt(limit), offset]
       );
   
