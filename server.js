@@ -6,6 +6,7 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const { createLogger, format, transports } = require('winston');
 const AWS = require('aws-sdk');
+const WebSocket = require('ws');
 
 // Initialize AWS SDK
 AWS.config.update({
@@ -36,6 +37,7 @@ const logger = createLogger({
 });
 
 const app = express();
+
 
 // Security middleware
 app.use(helmet({
@@ -147,11 +149,101 @@ pool.connect((err, client, release) => {
   release();
 });
 
+
+
 const PORT = process.env.PORT || 5000;
 const server = app.listen(PORT, () => {
   logger.info(`Server running on port ${PORT}`);
   logger.info(`Environment: ${process.env.NODE_ENV || 'development'}`);
 });
+
+const wss = new WebSocket.Server({ server });
+
+wss.on('connection', (ws) => {
+  console.log('New WebSocket connection');
+
+  ws.on('message', (message) => {
+    try {
+      const data = JSON.parse(message);
+      
+      if (data.type === 'subscribe') {
+        // Store subscription
+        ws.subscriptions = ws.subscriptions || new Set();
+        ws.subscriptions.add(data.data.channel);
+        
+        // Send initial data
+        if (data.data.channel === 'storage') {
+          sendStorageUpdate(ws, data.data.bucket);
+        }
+      } else if (data.type === 'unsubscribe') {
+        if (ws.subscriptions) {
+          ws.subscriptions.delete(data.data.channel);
+        }
+      }
+    } catch (error) {
+      console.error('WebSocket message error:', error);
+    }
+  });
+
+  ws.on('close', () => {
+    console.log('WebSocket connection closed');
+  });
+});
+
+// Function to send storage updates
+async function sendStorageUpdate(ws, bucket = null) {
+  try {
+    const { pool } = require('./config/database');
+    
+    // Get real-time storage metrics
+    const query = bucket 
+      ? `SELECT s3_bucket, COUNT(*) as file_count, 
+                COALESCE(SUM(file_size_bytes), 0) as total_bytes
+         FROM voice_notes 
+         WHERE s3_bucket = $1 AND deleted_at IS NULL
+         GROUP BY s3_bucket`
+      : `SELECT s3_bucket, COUNT(*) as file_count, 
+                COALESCE(SUM(file_size_bytes), 0) as total_bytes
+         FROM voice_notes 
+         WHERE deleted_at IS NULL
+         GROUP BY s3_bucket`;
+
+    const params = bucket ? [bucket] : [];
+    const result = await pool.query(query, params);
+
+    const update = {
+      type: 'storage_update',
+      data: {
+        timestamp: new Date().toISOString(),
+        metrics: result.rows.map(row => ({
+          bucket: row.s3_bucket,
+          files: row.file_count,
+          size: row.total_bytes,
+          sizeGB: Math.round(row.total_bytes / (1024 * 1024 * 1024))
+        })),
+        bucket: bucket
+      }
+    };
+
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(update));
+    }
+  } catch (error) {
+    console.error('Storage update error:', error);
+  }
+}
+
+// Broadcast updates periodically
+setInterval(() => {
+  wss.clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN && client.subscriptions) {
+      if (client.subscriptions.has('storage')) {
+        // You could determine which bucket this client is subscribed to
+        sendStorageUpdate(client);
+      }
+    }
+  });
+}, 30000); // Update every 30 seconds
 
 // Graceful shutdown
 process.on('SIGTERM', () => {
