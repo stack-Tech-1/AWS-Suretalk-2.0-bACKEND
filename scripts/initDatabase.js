@@ -1,4 +1,4 @@
-// scripts/initDatabase.js
+// scripts/initDatabase.js - COMPLETE CORRECTED VERSION
 const { pool } = require('../config/database');
 
 async function initDatabase() {
@@ -7,6 +7,31 @@ async function initDatabase() {
   try {
     await client.query('BEGIN');
     console.log('Initializing database...');
+
+
+        // 21. Create login_attempts table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS login_attempts (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        email VARCHAR(255) NOT NULL,
+        ip_address INET NOT NULL,
+        user_agent TEXT,
+        success BOOLEAN NOT NULL DEFAULT false,
+        failure_reason TEXT,
+        is_admin_attempt BOOLEAN DEFAULT false,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    await client.query(`
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS failed_login_attempts INTEGER DEFAULT 0;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS account_locked_until TIMESTAMP;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS two_factor_secret VARCHAR(255);
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_ip INET;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMP;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN DEFAULT false;
+    `);
+
 
     // 1. Create users table (merged version)
     await client.query(`
@@ -17,11 +42,11 @@ async function initDatabase() {
         password_hash VARCHAR(255) NOT NULL,
         full_name VARCHAR(255) NOT NULL,
         
-        subscription_tier VARCHAR(50) DEFAULT 'ESSENTIAL',
+        subscription_tier VARCHAR(50) DEFAULT 'LITE',
         subscription_status VARCHAR(50) DEFAULT 'active',
         
         storage_limit_gb INTEGER DEFAULT 5,
-        contacts_limit INTEGER DEFAULT 9,
+        contacts_limit INTEGER,  
         voice_notes_limit INTEGER DEFAULT 100,
         
         stripe_customer_id VARCHAR(255),
@@ -40,6 +65,37 @@ async function initDatabase() {
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         deleted_at TIMESTAMP
       )
+    `);
+
+    // Add settings column separately
+    await client.query(`
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS settings JSONB DEFAULT '{}';
+    `);
+
+    // Create trigger to set contacts_limit based on subscription_tier
+    await client.query(`
+      CREATE OR REPLACE FUNCTION set_user_limits()
+      RETURNS TRIGGER AS $$
+      BEGIN
+        IF NEW.contacts_limit IS NULL THEN
+          CASE NEW.subscription_tier
+            WHEN 'LITE' THEN NEW.contacts_limit := 3;
+            WHEN 'ESSENTIAL' THEN NEW.contacts_limit := 9;
+            WHEN 'PREMIUM' THEN NEW.contacts_limit := 15;
+            ELSE NEW.contacts_limit := 3;
+          END CASE;
+        END IF;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql;
+    `);
+
+    await client.query(`
+      DROP TRIGGER IF EXISTS trigger_set_user_limits ON users;
+      CREATE TRIGGER trigger_set_user_limits
+      BEFORE INSERT OR UPDATE ON users
+      FOR EACH ROW
+      EXECUTE FUNCTION set_user_limits();
     `);
 
     // 2. Create contacts table
@@ -263,79 +319,201 @@ async function initDatabase() {
         description TEXT,
         is_encrypted BOOLEAN DEFAULT FALSE,
         requires_restart BOOLEAN DEFAULT FALSE,
-        created_by UUID REFERENCES users(id),
+        created_by UUID REFERENCES users(id) ON DELETE CASCADE,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(category, setting_key)
-          )
-      `);
+        UNIQUE(category, setting_key, created_by)
+      )
+    `);
 
     // 13. Create support_tickets table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS support_tickets (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        ticket_number VARCHAR(20) UNIQUE NOT NULL,
+        subject VARCHAR(255) NOT NULL,
+        description TEXT NOT NULL,
+        category VARCHAR(50) DEFAULT 'general',
+        priority VARCHAR(20) DEFAULT 'medium',
+        status VARCHAR(20) DEFAULT 'open',
+        
+        -- Admin fields
+        assigned_to UUID REFERENCES users(id),
+        resolved_by UUID REFERENCES users(id),
+        
+        -- Internal notes (only visible to admins)
+        internal_notes TEXT,
+        
+        -- Timestamps
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        resolved_at TIMESTAMP,
+        closed_at TIMESTAMP
+      )
+    `);
+
+    // 14. Create ticket_responses table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS ticket_responses (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        ticket_id UUID NOT NULL REFERENCES support_tickets(id) ON DELETE CASCADE,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        message TEXT NOT NULL,
+        is_internal BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // 15. Create knowledge_base_articles table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS knowledge_base_articles (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        title VARCHAR(255) NOT NULL,
+        content TEXT NOT NULL,
+        category VARCHAR(50) NOT NULL,
+        tags TEXT[] DEFAULT '{}',
+        views INTEGER DEFAULT 0,
+        helpful_votes INTEGER DEFAULT 0,
+        not_helpful_votes INTEGER DEFAULT 0,
+        
+        -- Publishing
+        published BOOLEAN DEFAULT TRUE,
+        published_by UUID REFERENCES users(id),
+        published_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        
+        -- Auditing
+        created_by UUID REFERENCES users(id),
+        updated_by UUID REFERENCES users(id),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // 16. Create analytics_events table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS analytics_events (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        event_type VARCHAR(50) NOT NULL,
+        event_data JSONB DEFAULT '{}',
+        
+        -- For voice note events
+        voice_note_id UUID REFERENCES voice_notes(id) ON DELETE SET NULL,
+        
+        -- For contact events
+        contact_id UUID REFERENCES contacts(id) ON DELETE SET NULL,
+        
+        -- For scheduled message events
+        scheduled_message_id UUID REFERENCES scheduled_messages(id) ON DELETE SET NULL,
+        
+        ip_address INET,
+        user_agent TEXT,
+        metadata JSONB DEFAULT '{}',
+        
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // 17. Create daily_analytics table (for aggregated data)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS daily_analytics (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        date DATE NOT NULL,
+        
+        -- Counts
+        voice_notes_created INTEGER DEFAULT 0,
+        voice_notes_played INTEGER DEFAULT 0,
+        voice_notes_shared INTEGER DEFAULT 0,
+        voice_notes_downloaded INTEGER DEFAULT 0,
+        contacts_added INTEGER DEFAULT 0,
+        scheduled_messages_created INTEGER DEFAULT 0,
+        scheduled_messages_sent INTEGER DEFAULT 0,
+        
+        -- Durations
+        total_recording_seconds INTEGER DEFAULT 0,
+        total_playback_seconds INTEGER DEFAULT 0,
+        
+        -- Storage
+        storage_bytes_added BIGINT DEFAULT 0,
+        storage_bytes_deleted BIGINT DEFAULT 0,
+        
+        UNIQUE(user_id, date)
+      )
+    `);
+
+    // 18. Create user_sessions table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS user_sessions (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        session_token VARCHAR(512) NOT NULL,
+        device_name VARCHAR(255),
+        device_type VARCHAR(50),
+        user_agent TEXT,
+        ip_address INET,
+        last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        is_active BOOLEAN DEFAULT TRUE,
+        UNIQUE(session_token)
+      )
+    `);
+
+    // 19. Create notifications table  
 await client.query(`
-  CREATE TABLE IF NOT EXISTS support_tickets (
+  CREATE TABLE IF NOT EXISTS notifications (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    ticket_number VARCHAR(20) UNIQUE NOT NULL,
-    subject VARCHAR(255) NOT NULL,
-    description TEXT NOT NULL,
-    category VARCHAR(50) DEFAULT 'general',
-    priority VARCHAR(20) DEFAULT 'medium',
-    status VARCHAR(20) DEFAULT 'open',
+    type VARCHAR(50) NOT NULL,
+    title VARCHAR(255) NOT NULL,
+    message TEXT NOT NULL,
     
-    -- Admin fields
-    assigned_to UUID REFERENCES users(id),
-    resolved_by UUID REFERENCES users(id),
+    -- Metadata
+    data JSONB DEFAULT '{}',
+    icon VARCHAR(100),
+    priority VARCHAR(20) DEFAULT 'normal' CHECK (priority IN ('low', 'normal', 'high', 'urgent')),
     
-    -- Internal notes (only visible to admins)
-    internal_notes TEXT,
+    -- Status
+    is_read BOOLEAN DEFAULT FALSE,
+    is_pushed BOOLEAN DEFAULT FALSE,
+    
+    -- Expiration for temporary notifications
+    expires_at TIMESTAMP,
     
     -- Timestamps
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    resolved_at TIMESTAMP,
-    closed_at TIMESTAMP
+    read_at TIMESTAMP,
+    pushed_at TIMESTAMP
   )
 `);
 
-// 14. Create ticket_responses table
+
+/// 20. Create push subscriptions table for browser notifications 
 await client.query(`
-  CREATE TABLE IF NOT EXISTS ticket_responses (
+  CREATE TABLE IF NOT EXISTS push_subscriptions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    ticket_id UUID NOT NULL REFERENCES support_tickets(id) ON DELETE CASCADE,
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    message TEXT NOT NULL,
-    is_internal BOOLEAN DEFAULT FALSE,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-  )
-`);
-
-// 15. Create knowledge_base_articles table
-await client.query(`
-  CREATE TABLE IF NOT EXISTS knowledge_base_articles (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    title VARCHAR(255) NOT NULL,
-    content TEXT NOT NULL,
-    category VARCHAR(50) NOT NULL,
-    tags TEXT[] DEFAULT '{}',
-    views INTEGER DEFAULT 0,
-    helpful_votes INTEGER DEFAULT 0,
-    not_helpful_votes INTEGER DEFAULT 0,
-    
-    -- Publishing
-    published BOOLEAN DEFAULT TRUE,
-    published_by UUID REFERENCES users(id),
-    published_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    
-    -- Auditing
-    created_by UUID REFERENCES users(id),
-    updated_by UUID REFERENCES users(id),
+    endpoint TEXT NOT NULL UNIQUE,
+    expiration_time BIGINT,
+    p256dh TEXT NOT NULL,
+    auth TEXT NOT NULL,
+    user_agent TEXT,
+    ip_address INET,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   )
 `);
 
-    // Create all indexes (combined from both files)
+    // Create all indexes
     await client.query(`
+      -- Login attempts indexes
+      CREATE INDEX IF NOT EXISTS idx_login_attempts_email ON login_attempts(email);
+      CREATE INDEX IF NOT EXISTS idx_login_attempts_ip ON login_attempts(ip_address);
+      CREATE INDEX IF NOT EXISTS idx_login_attempts_created_at ON login_attempts(created_at);
+      CREATE INDEX IF NOT EXISTS idx_login_attempts_success ON login_attempts(success);
+
+
       -- Users indexes
       CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
       CREATE INDEX IF NOT EXISTS idx_users_phone ON users(phone);
@@ -368,6 +546,13 @@ await client.query(`
       
       -- Billing indexes
       CREATE INDEX IF NOT EXISTS idx_billing_user ON billing_history(user_id);
+
+      -- Analytics indexes
+      CREATE INDEX IF NOT EXISTS idx_analytics_events_user_id ON analytics_events(user_id);
+      CREATE INDEX IF NOT EXISTS idx_analytics_events_event_type ON analytics_events(event_type);
+      CREATE INDEX IF NOT EXISTS idx_analytics_events_created_at ON analytics_events(created_at);
+      CREATE INDEX IF NOT EXISTS idx_daily_analytics_user_id ON daily_analytics(user_id);
+      CREATE INDEX IF NOT EXISTS idx_daily_analytics_date ON daily_analytics(date);
       
       -- System logs indexes
       CREATE INDEX IF NOT EXISTS idx_system_logs_created ON system_logs(created_at);
@@ -399,25 +584,18 @@ await client.query(`
       CREATE INDEX IF NOT EXISTS idx_knowledge_base_articles_category ON knowledge_base_articles(category);
       CREATE INDEX IF NOT EXISTS idx_knowledge_base_articles_published ON knowledge_base_articles(published);
       CREATE INDEX IF NOT EXISTS idx_knowledge_base_articles_created_by ON knowledge_base_articles(created_by);
+      
+      -- User sessions indexes
+      CREATE INDEX IF NOT EXISTS idx_user_sessions_user_id ON user_sessions(user_id);
+      CREATE INDEX IF NOT EXISTS idx_user_sessions_is_active ON user_sessions(is_active);
+
+      -- Notifications indexes
+      CREATE INDEX IF NOT EXISTS idx_notifications_user_id ON notifications(user_id);
+      CREATE INDEX IF NOT EXISTS idx_notifications_created_at ON notifications(created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_notifications_is_read ON notifications(is_read);
+      CREATE INDEX IF NOT EXISTS idx_notifications_user_unread ON notifications(user_id, is_read);
+      CREATE INDEX IF NOT EXISTS idx_notifications_type ON notifications(type);
     `);
-
-    // Add trigger for support_tickets
-await client.query(`
-  DROP TRIGGER IF EXISTS update_support_tickets_updated_at ON support_tickets;
-  CREATE TRIGGER update_support_tickets_updated_at
-  BEFORE UPDATE ON support_tickets
-  FOR EACH ROW
-  EXECUTE FUNCTION update_updated_at_column();
-`);
-
-// Add trigger for knowledge_base_articles
-await client.query(`
-  DROP TRIGGER IF EXISTS update_knowledge_base_articles_updated_at ON knowledge_base_articles;
-  CREATE TRIGGER update_knowledge_base_articles_updated_at
-  BEFORE UPDATE ON knowledge_base_articles
-  FOR EACH ROW
-  EXECUTE FUNCTION update_updated_at_column();
-`);
 
     // Create triggers for updated_at
     await client.query(`
@@ -431,12 +609,12 @@ await client.query(`
     `);
 
     // Add these tables to the triggers array:
-      const tables = [
-        'users', 'contacts', 'voice_notes', 'voice_wills', 
-        'scheduled_messages', 'lifecycle_rules', 'storage_config',
-        'support_tickets', 'knowledge_base_articles'  
-      ];
-    
+    const tables = [
+      'users', 'contacts', 'voice_notes', 'voice_wills', 
+      'scheduled_messages', 'lifecycle_rules', 'storage_config',
+      'support_tickets', 'knowledge_base_articles', 'user_sessions'
+    ];
+  
     for (const table of tables) {
       await client.query(`
         DROP TRIGGER IF EXISTS update_${table}_updated_at ON ${table};
@@ -445,6 +623,51 @@ await client.query(`
         FOR EACH ROW
         EXECUTE FUNCTION update_updated_at_column();
       `);
+    }
+
+    // Insert default system settings - FIXED VERSION
+    // First, let's check if we can use a simpler approach without ON CONFLICT
+    console.log('Inserting default system settings...');
+    
+    // We'll insert each default setting one by one to avoid conflict issues
+    const defaultSettings = [
+      ['notifications', 'email', 'true', 'boolean', null],
+      ['notifications', 'push', 'true', 'boolean', null],
+      ['notifications', 'voice', 'false', 'boolean', null],
+      ['notifications', 'weeklyDigest', 'true', 'boolean', null],
+      ['privacy', 'profileVisible', 'true', 'boolean', null],
+      ['privacy', 'activityVisible', 'false', 'boolean', null],
+      ['privacy', 'autoDelete', '180', 'number', null],
+      ['privacy', 'dataExport', 'true', 'boolean', null],
+      ['appearance', 'theme', 'light', 'string', null],
+      ['appearance', 'fontSize', 'medium', 'string', null],
+      ['appearance', 'density', 'comfortable', 'string', null],
+      ['security', 'twoFactor', 'false', 'boolean', null],
+      ['security', 'loginAlerts', 'true', 'boolean', null],
+      ['security', 'sessionTimeout', '30', 'number', null],
+      ['backup', 'autoBackup', 'true', 'boolean', null],
+      ['backup', 'backupFrequency', 'daily', 'string', null],
+      ['backup', 'backupTime', '02:00', 'string', null],
+      ['backup', 'retentionDays', '30', 'number', null],
+      ['backup', 'includeVoiceNotes', 'true', 'boolean', null],
+      ['backup', 'includeContacts', 'true', 'boolean', null],
+      ['backup', 'includeScheduledMessages', 'true', 'boolean', null],
+      ['backup', 'includeSettings', 'true', 'boolean', null],
+      ['backup', 'encryptBackup', 'true', 'boolean', null],
+      ['backup', 'cloudStorage', 'true', 'boolean', null]
+    ];
+
+    for (const [category, key, value, type, createdBy] of defaultSettings) {
+      try {
+        // Use upsert approach
+        await client.query(`
+          INSERT INTO system_settings (category, setting_key, setting_value, setting_type, created_by)
+          VALUES ($1, $2, $3, $4, $5)
+          ON CONFLICT (category, setting_key, created_by) DO NOTHING
+        `, [category, key, value, type, createdBy]);
+      } catch (error) {
+        console.log(`Skipping duplicate setting: ${category}.${key}`);
+      }
     }
 
     await client.query('COMMIT');

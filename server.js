@@ -1,4 +1,3 @@
-// C:\Users\SMC\Documents\GitHub\AWS-Suretalk-2.0-fRONTEND\surechat-backend\server.js
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -8,12 +7,23 @@ const { createLogger, format, transports } = require('winston');
 const AWS = require('aws-sdk');
 const WebSocket = require('ws');
 
+const settingsRoutes = require('./routes/settings');
+const devicesRoutes = require('./routes/devices');
+const backupRoutes = require('./routes/backup');
+
 // Initialize AWS SDK
 AWS.config.update({
   region: process.env.AWS_REGION || 'us-east-1',
   accessKeyId: process.env.AWS_ACCESS_KEY_ID,
   secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
 });
+
+// Add after WebSocket initialization
+if (process.env.NODE_ENV === 'production' || process.env.ENABLE_SCHEDULER === 'true') {
+  const { startScheduler } = require('./workers/messageScheduler');
+  startScheduler();
+  logger.info('Message scheduler started');
+}
 
 // Create Winston logger
 const logger = createLogger({
@@ -59,6 +69,28 @@ const limiter = rateLimit({
 });
 app.use('/api/', limiter);
 
+const adminRateLimit = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5, // 5 attempts per window for admin
+  skipSuccessfulRequests: true,
+  message: 'Too many login attempts. Please try again later.',
+  standardHeaders: true,
+  legacyHeaders: false
+});
+
+// Add slow down for brute force protection
+const slowDown = require('express-slow-down');
+const adminSlowDown = slowDown({
+  windowMs: 15 * 60 * 1000,
+  delayAfter: 3,
+  delayMs: (used, req) => {
+    const delayAfter = req.slowDown.limit;
+    return (used - delayAfter) * 1000;
+  },
+  maxDelayMs: 10000
+});
+app.use('/api/admin/login', adminSlowDown);
+
 // CORS configuration
 const corsOptions = {
   origin: process.env.NODE_ENV === 'production' 
@@ -95,6 +127,8 @@ app.get('/health', (req, res) => {
 });
 
 // API Routes
+app.use('/api/admin/login', adminRateLimit);
+app.use('/api/auth/admin*', adminRateLimit);
 app.use('/api/auth', require('./routes/auth'));
 app.use('/api/users', require('./routes/users'));
 app.use('/api/voice-notes', require('./routes/voiceNotes'));
@@ -103,9 +137,12 @@ app.use('/api/vault', require('./routes/vault'));
 app.use('/api/scheduled', require('./routes/scheduled'));
 app.use('/api/admin', require('./routes/admin'));
 app.use('/api/billing', require('./routes/billing'));
-
-// S3 signed URL endpoint
+app.use('/api/settings', settingsRoutes);
+app.use('/api/devices', devicesRoutes);
+app.use('/api/backup', backupRoutes);
+app.use('/api/notifications', require('./routes/notifications').router);
 app.use('/api/storage', require('./routes/storage'));
+app.use('/api/auth', require('./routes/adminAuth'));
 
 // Error handling middleware
 app.use((err, req, res, next) => {

@@ -1,4 +1,3 @@
-// C:\Users\SMC\Documents\GitHub\AWS-Suretalk-2.0-fRONTEND\surechat-backend\middleware\auth.js
 const jwt = require('jsonwebtoken');
 const { pool } = require('../config/database');
 
@@ -139,9 +138,36 @@ const userRateLimit = () => {
   };
 };
 
+// Analytics recording middleware
+const recordAnalyticsEvent = async (req, eventType, data = {}) => {
+  try {
+    await pool.query(
+      `INSERT INTO analytics_events (
+        user_id, event_type, event_data,
+        ip_address, user_agent, metadata
+      ) VALUES ($1, $2, $3, $4, $5, $6)`,
+      [
+        req.user?.id,
+        eventType,
+        JSON.stringify(data),
+        req.ip,
+        req.get('user-agent'),
+        JSON.stringify({
+          url: req.originalUrl,
+          method: req.method,
+          timestamp: new Date().toISOString()
+        })
+      ]
+    );
+  } catch (error) {
+    console.warn('Analytics recording failed:', error);
+  }
+};
+
 module.exports = {
   authenticate,
   authenticateAdmin,
   validateTier,
-  userRateLimit
+  userRateLimit,
+  recordAnalyticsEvent
 };

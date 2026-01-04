@@ -6,11 +6,27 @@ const { authenticate } = require('../middleware/auth');
 const { pool } = require('../config/database');
 const { generateDownloadUrl } = require('../utils/s3Storage');
 const Twilio = require('twilio');
+const nodemailer = require('nodemailer');
+const { createNotification } = require('./notifications');
 
 // Initialize Twilio client
 const twilioClient = process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN
   ? new Twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
   : null;
+
+
+  // Initialize email transporter
+const emailTransporter = nodemailer.createTransport({
+  host: process.env.SMTP_HOST,
+  port: process.env.SMTP_PORT,
+  secure: process.env.SMTP_SECURE === 'true',
+  auth: {
+    user: process.env.SMTP_USER,
+    pass: process.env.SMTP_PASS
+  }
+});
+
+
 
 // Get all scheduled messages
 router.get('/', authenticate, async (req, res) => {
@@ -247,6 +263,18 @@ router.post('/', authenticate, [
         metadata || {}
       ]
     );
+
+     // Create notification
+  await createNotification(req.user.id, 'message', 
+    'scheduled message created', 
+    `"${Message.title}" has been successfully recorded`,
+    {
+      messageId: message.id,
+      title: message.title,      
+      url: `/usersDashboard/scheduled/${message.id}`
+    },
+    '/icons/message-sent.png'
+  );
 
     res.status(201).json({
       success: true,
@@ -492,6 +520,355 @@ router.get('/stats', authenticate, async (req, res) => {
     res.status(500).json({
       success: false,
       error: 'Failed to fetch scheduled message statistics'
+    });
+  }
+});
+
+
+// Add this new endpoint for scheduling with contacts
+router.post('/schedule-with-contacts', authenticate, [
+  body('voiceNoteId').notEmpty().isUUID(),
+  body('contactIds').isArray().notEmpty(),
+  body('deliveryMethod').isIn(['email', 'sms', 'both']),
+  body('scheduledFor').isISO8601(),
+  body('message').optional().trim()
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        errors: errors.array()
+      });
+    }
+
+    const {
+      voiceNoteId,
+      contactIds,
+      deliveryMethod,
+      scheduledFor,
+      message,
+      customSubject,
+      customMessage
+    } = req.body;
+
+    // Verify voice note belongs to user
+    const noteQuery = await pool.query(
+      `SELECT vn.*, u.email as user_email, u.full_name as user_name
+       FROM voice_notes vn
+       JOIN users u ON vn.user_id = u.id
+       WHERE vn.id = $1 AND vn.user_id = $2 AND vn.deleted_at IS NULL`,
+      [voiceNoteId, req.user.id]
+    );
+
+    if (noteQuery.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'Voice note not found'
+      });
+    }
+
+    const voiceNote = noteQuery.rows[0];
+
+    // Get contacts
+    const contactsQuery = await pool.query(
+      `SELECT id, name, email, phone, can_receive_messages
+       FROM contacts 
+       WHERE id = ANY($1) AND user_id = $2`,
+      [contactIds, req.user.id]
+    );
+
+    if (contactsQuery.rows.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'No valid contacts found'
+      });
+    }
+
+    const contacts = contactsQuery.rows;
+    const scheduledMessages = [];
+
+    // Generate download URL for voice note
+    const downloadUrl = await generateDownloadUrl(
+      voiceNote.s3_key,
+      voiceNote.s3_bucket,
+      7 * 24 * 3600 // 7 days expiry for scheduled messages
+    );
+
+    // Create scheduled message for each contact
+    for (const contact of contacts) {
+      if (!contact.can_receive_messages) {
+        continue; // Skip contacts who can't receive messages
+      }
+
+      let recipientEmail = null;
+      let recipientPhone = null;
+
+      if (deliveryMethod.includes('email') && contact.email) {
+        recipientEmail = contact.email;
+      }
+
+      if (deliveryMethod.includes('sms') && contact.phone) {
+        recipientPhone = contact.phone;
+      }
+
+      if (!recipientEmail && !recipientPhone) {
+        continue; // Skip if no valid delivery method for this contact
+      }
+
+      // Create scheduled message record
+      const scheduledMessage = await pool.query(
+        `INSERT INTO scheduled_messages (
+          user_id, voice_note_id, recipient_contact_id,
+          recipient_email, recipient_phone, delivery_method,
+          scheduled_for, custom_message, metadata
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        RETURNING *`,
+        [
+          req.user.id,
+          voiceNoteId,
+          contact.id,
+          recipientEmail,
+          recipientPhone,
+          deliveryMethod,
+          new Date(scheduledFor),
+          customMessage || message || `Voice note from ${voiceNote.user_name}`,
+          JSON.stringify({
+            voiceNoteTitle: voiceNote.title,
+            contactName: contact.name,
+            downloadUrl,
+            deliveryAttempts: 0,
+            scheduledBy: req.user.id
+          })
+        ]
+      );
+
+      scheduledMessages.push(scheduledMessage.rows[0]);
+
+      // Record analytics event
+      await pool.query(
+        `INSERT INTO analytics_events (
+          user_id, event_type, voice_note_id, contact_id, event_data
+        ) VALUES ($1, 'scheduled_message_created', $2, $3, $4)`,
+        [
+          req.user.id,
+          voiceNoteId,
+          contact.id,
+          JSON.stringify({
+            scheduledFor,
+            deliveryMethod,
+            noteTitle: voiceNote.title,
+            contactName: contact.name
+          })
+        ]
+      );
+    }
+
+    res.status(201).json({
+      success: true,
+      message: `Scheduled ${scheduledMessages.length} message(s) successfully`,
+      data: {
+        scheduledMessages,
+        totalScheduled: scheduledMessages.length,
+        skippedContacts: contacts.length - scheduledMessages.length
+      }
+    });
+
+  } catch (error) {
+    console.error('Schedule with contacts error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to schedule messages'
+    });
+  }
+});
+
+// Add email/SMS sending functionality
+const sendEmailNotification = async (to, subject, message, downloadUrl, voiceNoteTitle, senderName) => {
+  try {
+    const emailHtml = `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>${subject}</title>
+        <style>
+          body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto; padding: 20px; }
+          .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; text-align: center; border-radius: 10px 10px 0 0; }
+          .content { background: #f9f9f9; padding: 30px; border-radius: 0 0 10px 10px; }
+          .button { display: inline-block; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 12px 30px; text-decoration: none; border-radius: 5px; margin: 20px 0; }
+          .footer { margin-top: 30px; padding-top: 20px; border-top: 1px solid #eee; color: #666; font-size: 12px; }
+        </style>
+      </head>
+      <body>
+        <div class="header">
+          <h1>${voiceNoteTitle}</h1>
+          <p>A voice message from ${senderName}</p>
+        </div>
+        <div class="content">
+          <p>${message}</p>
+          <p>Click the button below to listen to the voice note:</p>
+          <a href="${downloadUrl}" class="button">Listen to Voice Note</a>
+          <p><small>This link will expire in 7 days.</small></p>
+          <div class="footer">
+            <p>Sent via SureTalk - Your Voice, Preserved Forever</p>
+            <p>If you didn't expect this message, please ignore it.</p>
+          </div>
+        </div>
+      </body>
+      </html>
+    `;
+
+    const mailOptions = {
+      from: `"SureTalk" <${process.env.SMTP_FROM || 'noreply@suretalk.com'}>`,
+      to,
+      subject,
+      html: emailHtml,
+      text: `${message}\n\nListen to voice note: ${downloadUrl}\n\nThis link will expire in 7 days.`
+    };
+
+    await emailTransporter.sendMail(mailOptions);
+    return true;
+  } catch (error) {
+    console.error('Email sending error:', error);
+    throw error;
+  }
+};
+
+const sendSMSNotification = async (to, message, downloadUrl, voiceNoteTitle, senderName) => {
+  try {
+    const smsMessage = `
+${message}
+
+Voice note "${voiceNoteTitle}" from ${senderName}
+Listen here: ${downloadUrl}
+
+Link expires in 7 days.
+Sent via SureTalk
+    `.trim();
+
+    await twilioClient.messages.create({
+      body: smsMessage,
+      from: process.env.TWILIO_PHONE_NUMBER,
+      to
+    });
+
+    return true;
+  } catch (error) {
+    console.error('SMS sending error:', error);
+    throw error;
+  }
+};
+
+// Add endpoint to send test message
+router.post('/send-test', authenticate, [
+  body('voiceNoteId').notEmpty().isUUID(),
+  body('recipientEmail').optional().isEmail(),
+  body('recipientPhone').optional().isMobilePhone(),
+  body('deliveryMethod').isIn(['email', 'sms', 'both'])
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        errors: errors.array()
+      });
+    }
+
+    const { voiceNoteId, recipientEmail, recipientPhone, deliveryMethod } = req.body;
+
+    // Verify voice note
+    const noteQuery = await pool.query(
+      `SELECT vn.*, u.email as user_email, u.full_name as user_name
+       FROM voice_notes vn
+       JOIN users u ON vn.user_id = u.id
+       WHERE vn.id = $1 AND vn.user_id = $2`,
+      [voiceNoteId, req.user.id]
+    );
+
+    if (noteQuery.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'Voice note not found'
+      });
+    }
+
+    const voiceNote = noteQuery.rows[0];
+    const downloadUrl = await generateDownloadUrl(
+      voiceNote.s3_key,
+      voiceNote.s3_bucket,
+      3600 // 1 hour for test
+    );
+
+    const testResults = [];
+
+    // Send test email
+    if (deliveryMethod.includes('email') && recipientEmail) {
+      try {
+        await sendEmailNotification(
+          recipientEmail,
+          `Test: ${voiceNote.title}`,
+          'This is a test message from SureTalk',
+          downloadUrl,
+          voiceNote.title,
+          voiceNote.user_name
+        );
+        testResults.push({
+          method: 'email',
+          recipient: recipientEmail,
+          status: 'sent'
+        });
+      } catch (emailError) {
+        testResults.push({
+          method: 'email',
+          recipient: recipientEmail,
+          status: 'failed',
+          error: emailError.message
+        });
+      }
+    }
+
+    // Send test SMS
+    if (deliveryMethod.includes('sms') && recipientPhone) {
+      try {
+        await sendSMSNotification(
+          recipientPhone,
+          'Test message from SureTalk',
+          downloadUrl,
+          voiceNote.title,
+          voiceNote.user_name
+        );
+        testResults.push({
+          method: 'sms',
+          recipient: recipientPhone,
+          status: 'sent'
+        });
+      } catch (smsError) {
+        testResults.push({
+          method: 'sms',
+          recipient: recipientPhone,
+          status: 'failed',
+          error: smsError.message
+        });
+      }
+    }
+
+    res.json({
+      success: true,
+      message: 'Test completed',
+      data: {
+        testResults,
+        downloadUrl
+      }
+    });
+
+  } catch (error) {
+    console.error('Send test error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to send test message'
     });
   }
 });

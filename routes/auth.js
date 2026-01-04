@@ -12,7 +12,8 @@ const validateRegister = [
   body('email').isEmail().normalizeEmail(),
   body('phone').notEmpty().isLength({ min: 10 }),
   body('password').isLength({ min: 8 }),
-  body('fullName').notEmpty().trim()
+  body('fullName').notEmpty().trim(),
+  body('subscriptionTier').optional().isIn(['LITE', 'ESSENTIAL', 'PREMIUM'])
 ];
 
 const validateLogin = [
@@ -31,7 +32,7 @@ router.post('/register', validateRegister, async (req, res) => {
       });
     }
 
-    const { email, phone, password, fullName } = req.body;
+    const { email, phone, password, fullName, subscriptionTier } = req.body;
 
     // Check if user already exists
     const existingUser = await pool.query(
@@ -50,15 +51,54 @@ router.post('/register', validateRegister, async (req, res) => {
     const saltRounds = 10;
     const passwordHash = await bcrypt.hash(password, saltRounds);
 
-    // Create user
+    // Set default limits based on tier
+    let storageLimitGb, contactsLimit, voiceNotesLimit;
+    
+    switch(subscriptionTier || 'ESSENTIAL') {
+      case 'LITE':
+        storageLimitGb = 1;
+        contactsLimit = 3;
+        voiceNotesLimit = 3;
+        break;
+      case 'ESSENTIAL':
+        storageLimitGb = 5;
+        contactsLimit = 9;
+        voiceNotesLimit = 100; // Unlimited for practical purposes
+        break;
+      case 'LEGACY_VAULT_PREMIUM':
+        storageLimitGb = 50; // More storage for premium
+        contactsLimit = 50; // More contacts for premium
+        voiceNotesLimit = 1000; // Even more notes
+        break;
+      default:
+        storageLimitGb = 5;
+        contactsLimit = 9;
+        voiceNotesLimit = 100;
+    }
+
+    // Create user with selected tier and appropriate limits
     const newUser = await pool.query(
-      `INSERT INTO users (email, phone, password_hash, full_name, subscription_tier)
-       VALUES ($1, $2, $3, $4, 'ESSENTIAL')
-       RETURNING id, email, phone, full_name, subscription_tier, created_at`,
-      [email, phone, passwordHash, fullName]
+      `INSERT INTO users (
+        email, phone, password_hash, full_name, 
+        subscription_tier, storage_limit_gb, contacts_limit, voice_notes_limit,
+        subscription_status
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'active')
+      RETURNING id, email, phone, full_name, subscription_tier, 
+                storage_limit_gb, contacts_limit, voice_notes_limit,
+                created_at`,
+      [
+        email, 
+        phone, 
+        passwordHash, 
+        fullName, 
+        subscriptionTier, 
+        storageLimitGb,
+        contactsLimit,
+        voiceNotesLimit
+      ]
     );
     
-    // Generate JWT token with more user info
+    // Generate JWT token with tier info
     const createdUser = newUser.rows[0];
 
     const token = jwt.sign(
@@ -71,7 +111,6 @@ router.post('/register', validateRegister, async (req, res) => {
       process.env.JWT_SECRET,
       { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
     );
-    
 
     // Generate refresh token
     const refreshToken = jwt.sign(
@@ -82,11 +121,16 @@ router.post('/register', validateRegister, async (req, res) => {
 
     res.status(201).json({
       success: true,
-      message: 'User registered successfully',
+      message: `User registered successfully with ${createdUser.subscription_tier} tier`,
       data: {
         user: newUser.rows[0],
         token,
-        refreshToken
+        refreshToken,
+        limits: {
+          storageGb: createdUser.storage_limit_gb,
+          contacts: createdUser.contacts_limit,
+          voiceNotes: createdUser.voice_notes_limit
+        }
       }
     });
 

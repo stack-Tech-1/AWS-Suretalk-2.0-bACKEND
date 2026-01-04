@@ -7,6 +7,7 @@ const { body, validationResult } = require('express-validator');
 const bcrypt = require('bcrypt'); 
 const { uploadToS3 } = require('../utils/s3Storage');
 const multer = require('multer');
+//const upload = multer({ storage: multer.memoryStorage() });
 
 
 // Get system overview stats

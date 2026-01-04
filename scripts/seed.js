@@ -17,7 +17,7 @@ async function seedAdmin() {
     }
 
     // Hash password
-    const passwordHash = await bcrypt.hash('Admin123!', 10);
+    const passwordHash = await bcrypt.hash('Admin123456789!', 10);
 
     // Create admin user
     await pool.query(

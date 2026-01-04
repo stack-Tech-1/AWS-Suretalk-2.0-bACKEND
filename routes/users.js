@@ -689,4 +689,352 @@ router.post('/support/knowledge-base/:id/vote', authenticate, [
   }
 });
 
+
+// Get user activity analytics
+router.get('/activity', authenticate, async (req, res) => {
+  try {
+    const { period = 'week', timezone = 'UTC' } = req.query;
+    
+    let dateRange;
+    const now = new Date();
+    
+    switch (period) {
+      case 'day':
+        dateRange = `DATE(created_at AT TIME ZONE '${timezone}') = CURRENT_DATE AT TIME ZONE '${timezone}'`;
+        break;
+      case 'week':
+        dateRange = `created_at >= NOW() - INTERVAL '7 days'`;
+        break;
+      case 'month':
+        dateRange = `created_at >= NOW() - INTERVAL '30 days'`;
+        break;
+      default:
+        dateRange = `created_at >= NOW() - INTERVAL '7 days'`;
+    }
+
+    // Get daily activity for the period
+    const dailyQuery = await pool.query(
+      `WITH daily_stats AS (
+        SELECT 
+          DATE(created_at AT TIME ZONE $2) as date,
+          COUNT(*) FILTER (WHERE event_type = 'voice_note_created') as notes_created,
+          COUNT(*) FILTER (WHERE event_type = 'voice_note_played') as notes_played,
+          COUNT(*) FILTER (WHERE event_type = 'voice_note_shared') as notes_shared,
+          COUNT(*) FILTER (WHERE event_type = 'voice_note_downloaded') as notes_downloaded,
+          COUNT(*) FILTER (WHERE event_type = 'contact_added') as contacts_added
+        FROM analytics_events
+        WHERE user_id = $1 AND ${dateRange}
+        GROUP BY DATE(created_at AT TIME ZONE $2)
+        ORDER BY date
+      )
+      SELECT * FROM daily_stats`,
+      [req.user.id, timezone]
+    );
+
+    // Get weekly summary
+    const weeklyQuery = await pool.query(
+      `SELECT 
+        EXTRACT(DOW FROM created_at) as day_of_week,
+        COUNT(*) FILTER (WHERE event_type = 'voice_note_created') as notes_created,
+        COUNT(*) FILTER (WHERE event_type = 'voice_note_played') as notes_played
+      FROM analytics_events
+      WHERE user_id = $1 AND created_at >= NOW() - INTERVAL '7 days'
+      GROUP BY EXTRACT(DOW FROM created_at)
+      ORDER BY day_of_week`,
+      [req.user.id]
+    );
+
+    // Get voice note play statistics
+    const playStatsQuery = await pool.query(
+      `SELECT 
+        vn.id,
+        vn.title,
+        vn.play_count,
+        vn.last_played,
+        COUNT(ae.id) as recent_plays
+      FROM voice_notes vn
+      LEFT JOIN analytics_events ae ON vn.id = ae.voice_note_id 
+        AND ae.event_type = 'voice_note_played'
+        AND ae.created_at >= NOW() - INTERVAL '7 days'
+      WHERE vn.user_id = $1 AND vn.deleted_at IS NULL
+      GROUP BY vn.id, vn.title, vn.play_count, vn.last_played
+      ORDER BY vn.play_count DESC
+      LIMIT 10`,
+      [req.user.id]
+    );
+
+    // Format the data for the chart
+    const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+    const weeklyData = days.map((dayName, index) => {
+      const dayStats = weeklyQuery.rows.find(row => parseInt(row.day_of_week) === index);
+      return {
+        day: dayName,
+        notes: dayStats ? parseInt(dayStats.notes_created) : 0,
+        listens: dayStats ? parseInt(dayStats.notes_played) : 0
+      };
+    });
+
+    // Get total statistics
+    const totalsQuery = await pool.query(
+      `SELECT 
+        COUNT(*) FILTER (WHERE event_type = 'voice_note_created') as total_notes_created,
+        COUNT(*) FILTER (WHERE event_type = 'voice_note_played') as total_notes_played,
+        COUNT(*) FILTER (WHERE event_type = 'voice_note_shared') as total_notes_shared,
+        COUNT(*) FILTER (WHERE event_type = 'contact_added') as total_contacts_added
+      FROM analytics_events
+      WHERE user_id = $1`,
+      [req.user.id]
+    );
+
+    res.json({
+      success: true,
+      data: {
+        daily: dailyQuery.rows,
+        weekly: weeklyData,
+        playStats: playStatsQuery.rows,
+        totals: totalsQuery.rows[0] || {},
+        period,
+        timezone
+      }
+    });
+
+  } catch (error) {
+    console.error('Get analytics error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch analytics data'
+    });
+  }
+});
+
+// Record analytics event
+router.post('/event', authenticate, [
+  body('eventType').notEmpty().isIn([
+    'voice_note_created',
+    'voice_note_played',
+    'voice_note_shared',
+    'voice_note_downloaded',
+    'voice_note_favorited',
+    'voice_note_deleted',
+    'contact_added',
+    'contact_updated',
+    'contact_deleted',
+    'scheduled_message_created',
+    'scheduled_message_sent',
+    'scheduled_message_cancelled',
+    'vault_item_created',
+    'vault_item_accessed',
+    'login',
+    'logout',
+    'page_view',
+    'error'
+  ]),
+  body('eventData').optional().isObject(),
+  body('voiceNoteId').optional().isUUID(),
+  body('contactId').optional().isUUID(),
+  body('scheduledMessageId').optional().isUUID()
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        errors: errors.array()
+      });
+    }
+
+    const {
+      eventType,
+      eventData = {},
+      voiceNoteId,
+      contactId,
+      scheduledMessageId
+    } = req.body;
+
+    // Record the event
+    const result = await pool.query(
+      `INSERT INTO analytics_events (
+        user_id, event_type, event_data,
+        voice_note_id, contact_id, scheduled_message_id,
+        ip_address, user_agent, metadata
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      RETURNING id, created_at`,
+      [
+        req.user.id,
+        eventType,
+        JSON.stringify(eventData),
+        voiceNoteId || null,
+        contactId || null,
+        scheduledMessageId || null,
+        req.ip,
+        req.get('user-agent'),
+        JSON.stringify({
+          url: req.get('referer') || req.originalUrl,
+          method: req.method
+        })
+      ]
+    );
+
+    // If it's a voice note play event, update the play_count
+    if (eventType === 'voice_note_played' && voiceNoteId) {
+      await pool.query(
+        `UPDATE voice_notes 
+         SET play_count = play_count + 1, 
+             last_played = CURRENT_TIMESTAMP
+         WHERE id = $1 AND user_id = $2`,
+        [voiceNoteId, req.user.id]
+      );
+    }
+
+    // Update daily analytics (this could also be done with a scheduled job)
+    const today = new Date().toISOString().split('T')[0];
+    
+    // Determine which counter to increment based on event type
+    let counterField;
+    switch (eventType) {
+      case 'voice_note_created':
+        counterField = 'voice_notes_created';
+        break;
+      case 'voice_note_played':
+        counterField = 'voice_notes_played';
+        break;
+      case 'voice_note_shared':
+        counterField = 'voice_notes_shared';
+        break;
+      case 'voice_note_downloaded':
+        counterField = 'voice_notes_downloaded';
+        break;
+      case 'contact_added':
+        counterField = 'contacts_added';
+        break;
+      case 'scheduled_message_created':
+        counterField = 'scheduled_messages_created';
+        break;
+      case 'scheduled_message_sent':
+        counterField = 'scheduled_messages_sent';
+        break;
+      default:
+        counterField = null;
+    }
+
+    if (counterField) {
+      await pool.query(
+        `INSERT INTO daily_analytics (user_id, date, ${counterField})
+         VALUES ($1, $2, 1)
+         ON CONFLICT (user_id, date) 
+         DO UPDATE SET ${counterField} = daily_analytics.${counterField} + 1`,
+        [req.user.id, today]
+      );
+    }
+
+    res.status(201).json({
+      success: true,
+      data: result.rows[0]
+    });
+
+  } catch (error) {
+    console.error('Record analytics event error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to record analytics event'
+    });
+  }
+});
+
+// Get aggregated statistics
+router.get('/stats', authenticate, async (req, res) => {
+  try {
+    const { startDate, endDate } = req.query;
+    
+    let dateCondition = '';
+    const queryParams = [req.user.id];
+    let paramCount = 2;
+
+    if (startDate) {
+      dateCondition += ` AND date >= $${paramCount}`;
+      queryParams.push(startDate);
+      paramCount++;
+    }
+
+    if (endDate) {
+      dateCondition += ` AND date <= $${paramCount}`;
+      queryParams.push(endDate);
+      paramCount++;
+    }
+
+    const statsQuery = await pool.query(
+      `SELECT 
+        COALESCE(SUM(voice_notes_created), 0) as total_notes_created,
+        COALESCE(SUM(voice_notes_played), 0) as total_notes_played,
+        COALESCE(SUM(voice_notes_shared), 0) as total_notes_shared,
+        COALESCE(SUM(voice_notes_downloaded), 0) as total_notes_downloaded,
+        COALESCE(SUM(contacts_added), 0) as total_contacts_added,
+        COALESCE(SUM(scheduled_messages_created), 0) as total_scheduled_created,
+        COALESCE(SUM(scheduled_messages_sent), 0) as total_scheduled_sent,
+        COALESCE(SUM(total_recording_seconds), 0) as total_recording_seconds,
+        COALESCE(SUM(total_playback_seconds), 0) as total_playback_seconds,
+        COUNT(DISTINCT date) as active_days
+       FROM daily_analytics 
+       WHERE user_id = $1 ${dateCondition}`,
+      queryParams
+    );
+
+    // Get most active day
+    const mostActiveQuery = await pool.query(
+      `SELECT date, 
+              (voice_notes_created + voice_notes_played + contacts_added) as activity_score
+       FROM daily_analytics 
+       WHERE user_id = $1 ${dateCondition}
+       ORDER BY activity_score DESC 
+       LIMIT 1`,
+      queryParams
+    );
+
+    // Get recent activity streak
+    const streakQuery = await pool.query(
+      `WITH RECURSIVE dates AS (
+        SELECT CURRENT_DATE as date
+        UNION ALL
+        SELECT date - 1
+        FROM dates
+        WHERE date > CURRENT_DATE - 30
+      ),
+      active_days AS (
+        SELECT DISTINCT date 
+        FROM daily_analytics 
+        WHERE user_id = $1 
+          AND (voice_notes_created > 0 OR voice_notes_played > 0 OR contacts_added > 0)
+          ${dateCondition.replace(/date/g, 'daily_analytics.date')}
+      )
+      SELECT MAX(streak) as current_streak
+      FROM (
+        SELECT date, 
+               ROW_NUMBER() OVER (ORDER BY date DESC) - 
+               ROW_NUMBER() OVER (PARTITION BY active_days.date IS NOT NULL ORDER BY dates.date DESC) as streak_group
+        FROM dates
+        LEFT JOIN active_days ON dates.date = active_days.date
+        ORDER BY dates.date DESC
+      ) streaks
+      WHERE date = CURRENT_DATE`,
+      queryParams
+    );
+
+    res.json({
+      success: true,
+      data: {
+        ...statsQuery.rows[0],
+        most_active_day: mostActiveQuery.rows[0] || null,
+        current_streak: streakQuery.rows[0]?.current_streak || 0
+      }
+    });
+
+  } catch (error) {
+    console.error('Get analytics stats error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch analytics statistics'
+    });
+  }
+});
+
 module.exports = router;

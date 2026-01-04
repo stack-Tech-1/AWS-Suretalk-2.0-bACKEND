@@ -5,6 +5,50 @@ const { body, validationResult } = require('express-validator');
 const { authenticate, validateTier } = require('../middleware/auth');
 const { pool } = require('../config/database');
 
+
+
+
+
+// Get contact statistics
+router.get('/stats', authenticate, async (req, res) => {
+  try {
+    const statsQuery = await pool.query(
+      `SELECT 
+        COUNT(*) as total_contacts,
+        COUNT(CASE WHEN is_beneficiary THEN 1 END) as beneficiaries,
+        COUNT(CASE WHEN can_receive_messages THEN 1 END) as can_receive_messages
+       FROM contacts 
+       WHERE user_id = $1`,
+      [req.user.id]
+    );
+
+    // Get user's contact limit
+    const userQuery = await pool.query(
+      'SELECT contacts_limit, subscription_tier FROM users WHERE id = $1',
+      [req.user.id]
+    );
+
+    const user = userQuery.rows[0];
+
+    res.json({
+      success: true,
+      data: {
+        ...statsQuery.rows[0],
+        contact_limit: user.contacts_limit,
+        remaining_contacts: user.contacts_limit - statsQuery.rows[0].total_contacts,
+        tier: user.subscription_tier
+      }
+    });
+
+  } catch (error) {
+    console.error('Get contact stats error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch contact statistics'
+    });
+  }
+});
+
 // Get all contacts for user
 router.get('/', authenticate, async (req, res) => {
   try {
@@ -329,45 +373,7 @@ router.delete('/:id', authenticate, async (req, res) => {
   }
 });
 
-// Get contact statistics
-router.get('/stats', authenticate, async (req, res) => {
-  try {
-    const statsQuery = await pool.query(
-      `SELECT 
-        COUNT(*) as total_contacts,
-        COUNT(CASE WHEN is_beneficiary THEN 1 END) as beneficiaries,
-        COUNT(CASE WHEN can_receive_messages THEN 1 END) as can_receive_messages
-       FROM contacts 
-       WHERE user_id = $1`,
-      [req.user.id]
-    );
 
-    // Get user's contact limit
-    const userQuery = await pool.query(
-      'SELECT contacts_limit, subscription_tier FROM users WHERE id = $1',
-      [req.user.id]
-    );
-
-    const user = userQuery.rows[0];
-
-    res.json({
-      success: true,
-      data: {
-        ...statsQuery.rows[0],
-        contact_limit: user.contacts_limit,
-        remaining_contacts: user.contacts_limit - statsQuery.rows[0].total_contacts,
-        tier: user.subscription_tier
-      }
-    });
-
-  } catch (error) {
-    console.error('Get contact stats error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to fetch contact statistics'
-    });
-  }
-});
 
 // Get beneficiaries (for voice wills)
 router.get('/beneficiaries', authenticate, async (req, res) => {
