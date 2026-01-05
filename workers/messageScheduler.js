@@ -4,7 +4,7 @@ const { Pool } = require('pg');
 const nodemailer = require('nodemailer');
 // const twilio = require('twilio'); // omit for now
 const { generateDownloadUrl } = require('../utils/s3Storage');
-const { logger } = require('../server'); // Import logger safely
+const logger = require('../utils/logger');
 
 // Database connection
 const pool = new Pool({

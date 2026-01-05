@@ -7,6 +7,7 @@ const slowDown = require('express-slow-down');
 const { createLogger, format, transports } = require('winston');
 const AWS = require('aws-sdk');
 const WebSocket = require('ws');
+const logger = require('./utils/logger');
 
 const settingsRoutes = require('./routes/settings');
 const devicesRoutes = require('./routes/devices');
@@ -19,26 +20,7 @@ AWS.config.update({
   secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
 });
 
-// Create Winston logger
-const logger = createLogger({
-  level: 'info',
-  format: format.combine(
-    format.timestamp(),
-    format.errors({ stack: true }),
-    format.json()
-  ),
-  defaultMeta: { service: 'suretalk-api' },
-  transports: [
-    new transports.File({ filename: 'logs/error.log', level: 'error' }),
-    new transports.File({ filename: 'logs/combined.log' }),
-    new transports.Console({
-      format: format.combine(
-        format.colorize(),
-        format.simple()
-      )
-    })
-  ]
-});
+
 
 // Initialize Express
 const app = express();
