@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
+const slowDown = require('express-slow-down');
 const { createLogger, format, transports } = require('winston');
 const AWS = require('aws-sdk');
 const WebSocket = require('ws');
@@ -17,13 +18,6 @@ AWS.config.update({
   accessKeyId: process.env.AWS_ACCESS_KEY_ID,
   secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
 });
-
-// Add after WebSocket initialization
-if (process.env.NODE_ENV === 'production' || process.env.ENABLE_SCHEDULER === 'true') {
-  const { startScheduler } = require('./workers/messageScheduler');
-  startScheduler();
-  logger.info('Message scheduler started');
-}
 
 // Create Winston logger
 const logger = createLogger({
@@ -46,8 +40,8 @@ const logger = createLogger({
   ]
 });
 
+// Initialize Express
 const app = express();
-
 
 // Security middleware
 app.use(helmet({
@@ -63,37 +57,32 @@ app.use(helmet({
 
 // Rate limiting
 const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // limit each IP to 100 requests per windowMs
+  windowMs: 15 * 60 * 1000,
+  max: 100,
   message: 'Too many requests from this IP, please try again later.'
 });
 app.use('/api/', limiter);
 
 const adminRateLimit = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 5, // 5 attempts per window for admin
+  windowMs: 15 * 60 * 1000,
+  max: 5,
   skipSuccessfulRequests: true,
   message: 'Too many login attempts. Please try again later.',
   standardHeaders: true,
   legacyHeaders: false
 });
 
-// Add slow down for brute force protection
-const slowDown = require('express-slow-down');
 const adminSlowDown = slowDown({
   windowMs: 15 * 60 * 1000,
   delayAfter: 3,
-  delayMs: (used, req) => {
-    const delayAfter = req.slowDown.limit;
-    return (used - delayAfter) * 1000;
-  },
+  delayMs: (used, req) => (used - req.slowDown.limit) * 1000,
   maxDelayMs: 10000
 });
 app.use('/api/admin/login', adminSlowDown);
 
 // CORS configuration
 const corsOptions = {
-  origin: process.env.NODE_ENV === 'production' 
+  origin: process.env.NODE_ENV === 'production'
     ? ['https://suretalk.com', 'https://www.suretalk.com', 'https://admin.suretalk.com', process.env.FRONTEND_URL].filter(Boolean)
     : ['http://localhost:3000', 'http://localhost:3001'],
   credentials: true,
@@ -101,11 +90,11 @@ const corsOptions = {
 };
 app.use(cors(corsOptions));
 
-// Body parsing middleware
+// Body parsing
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
-// Request logging middleware
+// Request logging
 app.use((req, res, next) => {
   logger.info({
     method: req.method,
@@ -154,8 +143,8 @@ app.use((err, req, res, next) => {
   });
 
   const statusCode = err.statusCode || 500;
-  const message = process.env.NODE_ENV === 'production' && statusCode === 500 
-    ? 'Internal server error' 
+  const message = process.env.NODE_ENV === 'production' && statusCode === 500
+    ? 'Internal server error'
     : err.message;
 
   res.status(statusCode).json({
@@ -175,8 +164,6 @@ app.use((req, res) => {
 
 // Database connection
 const { pool } = require('./config/database');
-
-// Test database connection
 pool.connect((err, client, release) => {
   if (err) {
     logger.error('Database connection error:', err);
@@ -186,14 +173,21 @@ pool.connect((err, client, release) => {
   release();
 });
 
+// Start message scheduler (after logger is ready)
+if (process.env.NODE_ENV === 'production' || process.env.ENABLE_SCHEDULER === 'true') {
+  const { startScheduler } = require('./workers/messageScheduler');
+  startScheduler();
+  logger.info('Message scheduler started');
+}
 
-
+// Start server
 const PORT = process.env.PORT || 5000;
 const server = app.listen(PORT, () => {
   logger.info(`Server running on port ${PORT}`);
   logger.info(`Environment: ${process.env.NODE_ENV || 'development'}`);
 });
 
+// WebSocket server
 const wss = new WebSocket.Server({ server });
 
 wss.on('connection', (ws) => {
@@ -202,20 +196,16 @@ wss.on('connection', (ws) => {
   ws.on('message', (message) => {
     try {
       const data = JSON.parse(message);
-      
+
       if (data.type === 'subscribe') {
-        // Store subscription
         ws.subscriptions = ws.subscriptions || new Set();
         ws.subscriptions.add(data.data.channel);
-        
-        // Send initial data
+
         if (data.data.channel === 'storage') {
           sendStorageUpdate(ws, data.data.bucket);
         }
       } else if (data.type === 'unsubscribe') {
-        if (ws.subscriptions) {
-          ws.subscriptions.delete(data.data.channel);
-        }
+        if (ws.subscriptions) ws.subscriptions.delete(data.data.channel);
       }
     } catch (error) {
       console.error('WebSocket message error:', error);
@@ -227,23 +217,14 @@ wss.on('connection', (ws) => {
   });
 });
 
-// Function to send storage updates
+// Send storage updates
 async function sendStorageUpdate(ws, bucket = null) {
   try {
-    const { pool } = require('./config/database');
-    
-    // Get real-time storage metrics
-    const query = bucket 
-      ? `SELECT s3_bucket, COUNT(*) as file_count, 
-                COALESCE(SUM(file_size_bytes), 0) as total_bytes
-         FROM voice_notes 
-         WHERE s3_bucket = $1 AND deleted_at IS NULL
-         GROUP BY s3_bucket`
-      : `SELECT s3_bucket, COUNT(*) as file_count, 
-                COALESCE(SUM(file_size_bytes), 0) as total_bytes
-         FROM voice_notes 
-         WHERE deleted_at IS NULL
-         GROUP BY s3_bucket`;
+    const query = bucket
+      ? `SELECT s3_bucket, COUNT(*) as file_count, COALESCE(SUM(file_size_bytes),0) as total_bytes
+         FROM voice_notes WHERE s3_bucket = $1 AND deleted_at IS NULL GROUP BY s3_bucket`
+      : `SELECT s3_bucket, COUNT(*) as file_count, COALESCE(SUM(file_size_bytes),0) as total_bytes
+         FROM voice_notes WHERE deleted_at IS NULL GROUP BY s3_bucket`;
 
     const params = bucket ? [bucket] : [];
     const result = await pool.query(query, params);
@@ -258,29 +239,24 @@ async function sendStorageUpdate(ws, bucket = null) {
           size: row.total_bytes,
           sizeGB: Math.round(row.total_bytes / (1024 * 1024 * 1024))
         })),
-        bucket: bucket
+        bucket
       }
     };
 
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify(update));
-    }
+    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(update));
   } catch (error) {
     console.error('Storage update error:', error);
   }
 }
 
-// Broadcast updates periodically
+// Broadcast updates every 30 seconds
 setInterval(() => {
-  wss.clients.forEach((client) => {
-    if (client.readyState === WebSocket.OPEN && client.subscriptions) {
-      if (client.subscriptions.has('storage')) {
-        // You could determine which bucket this client is subscribed to
-        sendStorageUpdate(client);
-      }
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN && client.subscriptions?.has('storage')) {
+      sendStorageUpdate(client);
     }
   });
-}, 30000); // Update every 30 seconds
+}, 30000);
 
 // Graceful shutdown
 process.on('SIGTERM', () => {

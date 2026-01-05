@@ -2,6 +2,7 @@ const { Pool } = require('pg');
 const nodemailer = require('nodemailer');
 const twilio = require('twilio');
 const { generateDownloadUrl } = require('../utils/s3Storage');
+const { logger } = require('../server'); // Import logger safely
 
 // Database connection
 const pool = new Pool({
@@ -232,6 +233,21 @@ Sent via SureTalk
     to
   });
 };
+
+function startScheduler() {
+  logger.info('Message scheduler initialized');
+
+  // Example: run every 30 seconds
+  setInterval(async () => {
+    try {
+      const result = await pool.query('SELECT COUNT(*) AS pending_messages FROM scheduled_messages WHERE sent_at IS NULL');
+      logger.info(`Pending messages: ${result.rows[0].pending_messages}`);
+    } catch (err) {
+      logger.error('Scheduler error:', err);
+    }
+  }, 30000); // 30 seconds
+}
+
 
 // Start scheduler
 const startScheduler = () => {
