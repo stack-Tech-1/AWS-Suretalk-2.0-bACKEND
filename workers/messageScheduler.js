@@ -1,6 +1,8 @@
+// messageScheduler.js
+
 const { Pool } = require('pg');
 const nodemailer = require('nodemailer');
-//const twilio = require('twilio');
+// const twilio = require('twilio'); // omit for now
 const { generateDownloadUrl } = require('../utils/s3Storage');
 const { logger } = require('../server'); // Import logger safely
 
@@ -21,20 +23,13 @@ const emailTransporter = nodemailer.createTransport({
   }
 });
 
-// Twilio client
-const twilioClient = twilio(
-  process.env.TWILIO_ACCOUNT_SID,
-  process.env.TWILIO_AUTH_TOKEN
-);
-
 // Process scheduled messages
 const processScheduledMessages = async () => {
   const client = await pool.connect();
-  
+
   try {
     await client.query('BEGIN');
-    
-    // Get messages scheduled for delivery now
+
     const now = new Date();
     const messages = await client.query(
       `SELECT sm.*, vn.title as voice_note_title, vn.s3_key, vn.s3_bucket,
@@ -54,16 +49,14 @@ const processScheduledMessages = async () => {
 
     for (const message of messages.rows) {
       try {
-        // Generate download URL
         const downloadUrl = await generateDownloadUrl(
           message.s3_key,
           message.s3_bucket,
-          7 * 24 * 3600 // 7 days
+          7 * 24 * 3600
         );
 
         let deliverySuccess = false;
 
-        // Send email
         if (message.recipient_email && message.delivery_method.includes('email')) {
           try {
             await sendEmail(
@@ -79,23 +72,8 @@ const processScheduledMessages = async () => {
           }
         }
 
-        // Send SMS
-        if (message.recipient_phone && message.delivery_method.includes('sms')) {
-          try {
-            await sendSMS(
-              message.recipient_phone,
-              message.voice_note_title,
-              message.custom_message || `Voice note from ${message.sender_name}`,
-              downloadUrl,
-              message.sender_name
-            );
-            deliverySuccess = true;
-          } catch (smsError) {
-            console.error(`SMS delivery failed for message ${message.id}:`, smsError);
-          }
-        }
+        // You can re-add SMS later if needed
 
-        // Update message status
         if (deliverySuccess) {
           await client.query(
             `UPDATE scheduled_messages 
@@ -106,27 +84,7 @@ const processScheduledMessages = async () => {
              WHERE id = $2`,
             [now, message.id]
           );
-
-          // Record analytics
-          await client.query(
-            `INSERT INTO analytics_events (
-              user_id, event_type, voice_note_id, contact_id, event_data
-            ) VALUES ($1, 'scheduled_message_sent', $2, $3, $4)`,
-            [
-              message.user_id,
-              message.voice_note_id,
-              message.recipient_contact_id,
-              JSON.stringify({
-                scheduledFor: message.scheduled_for,
-                deliveredAt: now,
-                deliveryMethod: message.delivery_method,
-                noteTitle: message.voice_note_title
-              })
-            ]
-          );
-
         } else {
-          // Increment delivery attempts
           await client.query(
             `UPDATE scheduled_messages 
              SET delivery_attempts = delivery_attempts + 1,
@@ -136,39 +94,15 @@ const processScheduledMessages = async () => {
              WHERE id = $2`,
             [now, message.id]
           );
-
-          // Mark as failed if max attempts reached
-          if (message.delivery_attempts + 1 >= 3) {
-            await client.query(
-              `UPDATE scheduled_messages 
-               SET delivery_status = 'failed',
-                   updated_at = $1
-               WHERE id = $2`,
-              [now, message.id]
-            );
-          }
         }
-
       } catch (error) {
         console.error(`Error processing message ${message.id}:`, error);
-        
-        // Log error but continue with other messages
-        await client.query(
-          `UPDATE scheduled_messages 
-           SET delivery_attempts = delivery_attempts + 1,
-               last_attempt_at = $1,
-               error_message = $2,
-               updated_at = $1
-           WHERE id = $3`,
-          [now, error.message, message.id]
-        );
       }
     }
 
     await client.query('COMMIT');
-    
     console.log(`Processed ${messages.rows.length} scheduled messages`);
-    
+
   } catch (error) {
     await client.query('ROLLBACK');
     console.error('Error processing scheduled messages:', error);
@@ -196,10 +130,6 @@ const sendEmail = async (to, title, message, downloadUrl, senderName) => {
           Listen to Voice Note
         </a>
         <p><small>This link will expire in 7 days.</small></p>
-        <div style="margin-top: 30px; padding-top: 20px; border-top: 1px solid #eee; color: #666; font-size: 12px;">
-          <p>Sent via SureTalk - Your Voice, Preserved Forever</p>
-          <p>If you didn't expect this message, please ignore it.</p>
-        </div>
       </div>
     </div>
   `;
@@ -213,25 +143,6 @@ const sendEmail = async (to, title, message, downloadUrl, senderName) => {
   };
 
   await emailTransporter.sendMail(mailOptions);
-};
-
-// SMS sending function
-const sendSMS = async (to, title, message, downloadUrl, senderName) => {
-  const smsMessage = `
-${message}
-
-Voice note "${title}" from ${senderName}
-Listen here: ${downloadUrl}
-
-Link expires in 7 days.
-Sent via SureTalk
-  `.trim();
-
-  await twilioClient.messages.create({
-    body: smsMessage,
-    from: process.env.TWILIO_PHONE_NUMBER,
-    to
-  });
 };
 
 // Start scheduler
