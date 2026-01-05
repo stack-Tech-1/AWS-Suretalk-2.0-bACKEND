@@ -1,4 +1,3 @@
-// C:\Users\SMC\Documents\GitHub\AWS-Suretalk-2.0-fRONTEND\surechat-backend\config\database.js
 const { Pool } = require('pg');
 require('dotenv').config();
 

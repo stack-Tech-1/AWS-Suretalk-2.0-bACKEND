@@ -1,16 +1,12 @@
 // messageScheduler.js
 
-const { Pool } = require('pg');
+const { pool } = require('../config/database');
+
 const nodemailer = require('nodemailer');
 // const twilio = require('twilio'); // omit for now
 const { generateDownloadUrl } = require('../utils/s3Storage');
 const logger = require('../utils/logger');
 
-// Database connection
-const pool = new Pool({
-  connectionString: process.env.DB_URL,
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
-});
 
 // Email transporter
 const emailTransporter = nodemailer.createTransport({
