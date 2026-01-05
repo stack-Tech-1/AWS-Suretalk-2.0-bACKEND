@@ -12,7 +12,7 @@ const logger = require('./utils/logger');
 const settingsRoutes = require('./routes/settings');
 const devicesRoutes = require('./routes/devices');
 const backupRoutes = require('./routes/backup');
-app.set('trust proxy', 1);
+
 
 
 // Initialize AWS SDK
@@ -38,6 +38,8 @@ app.use(helmet({
     }
   }
 }));
+
+app.set('trust proxy', 1);
 
 app.use((req, res, next) => {
   if (req.method === 'OPTIONS') return next();
@@ -68,7 +70,6 @@ const adminSlowDown = slowDown({
   delayMs: (used, req) => (used - req.slowDown.limit) * 1000,
   maxDelayMs: 10000
 });
-app.use('/api/admin/login', adminSlowDown);
 
 // CORS configuration
 const corsOptions = {
@@ -106,7 +107,8 @@ app.get('/health', (req, res) => {
 });
 
 // API Routes
-app.use('/api/admin/login', adminRateLimit);
+
+app.use('/api/admin/login', adminSlowDown, adminRateLimit);
 app.use('/api/auth', require('./routes/auth'));
 app.use('/api/users', require('./routes/users'));
 app.use('/api/voice-notes', require('./routes/voiceNotes'));
