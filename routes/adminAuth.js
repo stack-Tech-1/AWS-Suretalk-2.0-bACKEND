@@ -28,31 +28,33 @@ const logLoginAttempt = async (email, ip, userAgent, success, failureReason = nu
   }
 };
 
-// Check if IP is allowed (whitelist)
 const isIPAllowed = (ip) => {
 
-    if (process.env.NODE_ENV === 'development') {
-        return true;
-      }
-  // Add your admin IP whitelist here
+  // 🔓 TEMPORARY BYPASS
+  if (process.env.DISABLE_ADMIN_IP_CHECK === 'true') {
+    return true;
+  }
+
+  if (process.env.NODE_ENV === 'development') {
+    return true;
+  }
+
   const allowedIPs = [
-    '127.0.0.1', // localhost
-    '192.168.1.0/24', // Office network
-    // Add more IPs as needed
-  ]; 
-    
-  
-  // Simple IP check - in production, use ip-range or similar
+    '127.0.0.1',
+    '192.168.1.0/24'
+  ];
+
   return allowedIPs.some(allowed => {
     if (allowed.includes('/')) {
-      // Handle CIDR notation
       const [network, prefix] = allowed.split('/');
-      // Implement CIDR check here or use ip-range library
-      return ip.startsWith(network.split('.').slice(0, parseInt(prefix)/8).join('.'));
+      return ip.startsWith(
+        network.split('.').slice(0, parseInt(prefix) / 8).join('.')
+      );
     }
     return ip === allowed;
   });
 };
+
 
 // Check if account is locked
 const isAccountLocked = async (userId) => {
