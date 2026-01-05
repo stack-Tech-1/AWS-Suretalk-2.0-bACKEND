@@ -12,6 +12,8 @@ const logger = require('./utils/logger');
 const settingsRoutes = require('./routes/settings');
 const devicesRoutes = require('./routes/devices');
 const backupRoutes = require('./routes/backup');
+app.set('trust proxy', 1);
+
 
 // Initialize AWS SDK
 AWS.config.update({
@@ -37,6 +39,12 @@ app.use(helmet({
   }
 }));
 
+app.use((req, res, next) => {
+  if (req.method === 'OPTIONS') return next();
+  next();
+});
+
+
 // Rate limiting
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -47,7 +55,7 @@ app.use('/api/', limiter);
 
 const adminRateLimit = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 5,
+  max: 10 ,
   skipSuccessfulRequests: true,
   message: 'Too many login attempts. Please try again later.',
   standardHeaders: true,
@@ -99,7 +107,6 @@ app.get('/health', (req, res) => {
 
 // API Routes
 app.use('/api/admin/login', adminRateLimit);
-app.use('/api/auth/admin*', adminRateLimit);
 app.use('/api/auth', require('./routes/auth'));
 app.use('/api/users', require('./routes/users'));
 app.use('/api/voice-notes', require('./routes/voiceNotes'));
