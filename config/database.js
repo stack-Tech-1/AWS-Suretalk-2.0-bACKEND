@@ -1,23 +1,20 @@
 const { Pool } = require('pg');
-require('dotenv').config();
+//require('dotenv').config();
+
+const dbSecret = JSON.parse(process.env.DB_SECRET);
 
 const pool = new Pool({
-  host: process.env.DB_HOST,
-  port: process.env.DB_PORT || 5432,
-  database: process.env.DB_NAME,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  ssl: process.env.NODE_ENV === 'production' ? {
-    rejectUnauthorized: false
-  } : false,
-  max: 20, // Maximum number of clients in the pool
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 30000,
-  keepAlive: true,
-  keepAliveInitialDelayMillis: 20000,
+  host: dbSecret.host,
+  port: Number(dbSecret.port),
+  database: dbSecret.dbname,
+  user: dbSecret.username,
+  password: dbSecret.password,
   ssl: {
     rejectUnauthorized: false
-  }
+  },
+  max: 20,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 30000
 });
 
 // Test connection
