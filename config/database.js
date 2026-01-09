@@ -12,7 +12,9 @@ const pool = new Pool({
   } : false,
   max: 20, // Maximum number of clients in the pool
   idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 2000,
+  connectionTimeoutMillis: 30000,
+  keepAlive: true,
+  keepAliveInitialDelayMillis: 20000,
   ssl: {
     rejectUnauthorized: false
   }
@@ -20,7 +22,7 @@ const pool = new Pool({
 
 // Test connection
 pool.on('connect', () => {
-  console.log('Database connected successfully');
+  console.log('✅ Database connected successfully');
 });
 
 pool.on('error', (err) => {

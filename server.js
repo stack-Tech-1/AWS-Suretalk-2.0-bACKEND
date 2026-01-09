@@ -169,7 +169,7 @@ pool.connect((err, client, release) => {
     logger.error('Database connection error:', err);
     process.exit(1);
   }
-  logger.info('Database connected successfully');
+  logger.info('✅ Database connected successfully');
   release();
 });
 

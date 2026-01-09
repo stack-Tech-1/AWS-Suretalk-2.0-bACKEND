@@ -6,6 +6,8 @@ const jwt = require('jsonwebtoken');
 const { body, validationResult } = require('express-validator');
 const { pool } = require('../config/database');
 const { authenticate } = require('../middleware/auth');
+const tokenService = require('../utils/tokens');
+const emailService = require('../utils/emailService');
 
 // Validation middleware
 const validateRegister = [
@@ -21,7 +23,7 @@ const validateLogin = [
   body('password').notEmpty()
 ];
 
-// Register new user
+// Register new user - UPDATED VERSION
 router.post('/register', validateRegister, async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -63,12 +65,12 @@ router.post('/register', validateRegister, async (req, res) => {
       case 'ESSENTIAL':
         storageLimitGb = 5;
         contactsLimit = 9;
-        voiceNotesLimit = 100; // Unlimited for practical purposes
+        voiceNotesLimit = 100;
         break;
       case 'LEGACY_VAULT_PREMIUM':
-        storageLimitGb = 50; // More storage for premium
-        contactsLimit = 50; // More contacts for premium
-        voiceNotesLimit = 1000; // Even more notes
+        storageLimitGb = 50;
+        contactsLimit = 50;
+        voiceNotesLimit = 1000;
         break;
       default:
         storageLimitGb = 5;
@@ -76,16 +78,16 @@ router.post('/register', validateRegister, async (req, res) => {
         voiceNotesLimit = 100;
     }
 
-    // Create user with selected tier and appropriate limits
+    // Create user with email_verified = false
     const newUser = await pool.query(
       `INSERT INTO users (
         email, phone, password_hash, full_name, 
         subscription_tier, storage_limit_gb, contacts_limit, voice_notes_limit,
-        subscription_status
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'active')
+        subscription_status, email_verified
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'active', false)
       RETURNING id, email, phone, full_name, subscription_tier, 
                 storage_limit_gb, contacts_limit, voice_notes_limit,
-                created_at`,
+                created_at, email_verified`,
       [
         email, 
         phone, 
@@ -97,40 +99,46 @@ router.post('/register', validateRegister, async (req, res) => {
         voiceNotesLimit
       ]
     );
-    
-    // Generate JWT token with tier info
+
     const createdUser = newUser.rows[0];
 
-    const token = jwt.sign(
-      { 
-        userId: createdUser.id,
-        email: createdUser.email,
-        isAdmin: false,
-        tier: createdUser.subscription_tier
-      },
-      process.env.JWT_SECRET,
-      { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
+    // Generate email verification token
+    const verificationToken = tokenService.generateEmailVerificationToken(
+      createdUser.id,
+      createdUser.email
     );
 
-    // Generate refresh token
-    const refreshToken = jwt.sign(
-      { userId: newUser.rows[0].id },
-      process.env.JWT_REFRESH_SECRET,
-      { expiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '30d' }
-    );
+    // Send verification email
+    try {
+      await emailService.sendVerificationEmail(
+        createdUser.email,
+        verificationToken,
+        createdUser.full_name
+      );
+    } catch (emailError) {
+      console.error('Failed to send verification email:', emailError);
+      // Don't fail registration if email fails, but log it
+      console.error('Email sending failed:', emailError);
+    }
+
+    // IMPORTANT: DO NOT AUTO-LOGIN
+    // DO NOT generate JWT token here
+    // User must verify email first
 
     res.status(201).json({
       success: true,
-      message: `User registered successfully with ${createdUser.subscription_tier} tier`,
+      message: 'Account created successfully. Please check your email to verify your account.',
       data: {
-        user: newUser.rows[0],
-        token,
-        refreshToken,
-        limits: {
-          storageGb: createdUser.storage_limit_gb,
-          contacts: createdUser.contacts_limit,
-          voiceNotes: createdUser.voice_notes_limit
-        }
+        user: {
+          id: createdUser.id,
+          email: createdUser.email,
+          full_name: createdUser.full_name,
+          email_verified: createdUser.email_verified
+        },
+        // Include verification token for development/testing
+        ...(process.env.NODE_ENV === 'development' && { 
+          verificationToken 
+        })
       }
     });
 
@@ -138,12 +146,15 @@ router.post('/register', validateRegister, async (req, res) => {
     console.error('Registration error:', error);
     res.status(500).json({
       success: false,
-      error: 'Registration failed'
+      error: 'Registration failed. Please try again.'
     });
   }
 });
 
-// Login user
+
+
+
+// routes/auth.js - Update login endpoint
 router.post('/login', validateLogin, async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -156,13 +167,13 @@ router.post('/login', validateLogin, async (req, res) => {
 
     const { email, password } = req.body;
 
-    // Find user
+    // Find user with email_verified field
     const userQuery = await pool.query(
-        `SELECT id, email, phone, full_name, password_hash, subscription_tier, subscription_status, 
-        profile_image_url, last_login, is_admin, admin_status
+      `SELECT id, email, phone, full_name, password_hash, subscription_tier, subscription_status, 
+        profile_image_url, last_login, is_admin, admin_status, email_verified
         FROM users WHERE email = $1 AND deleted_at IS NULL`,
-        [email]
-      );
+      [email]
+    );
 
     if (userQuery.rows.length === 0) {
       return res.status(401).json({
@@ -182,13 +193,25 @@ router.post('/login', validateLogin, async (req, res) => {
       });
     }
 
+    // IMPORTANT: Check if user is admin - admins bypass email verification
     if (user.is_admin && user.admin_status !== 'approved') {
-        return res.status(403).json({
-          success: false,
-          error: 'Admin access pending approval'
-        });
-      }
-      
+      return res.status(403).json({
+        success: false,
+        error: 'Admin access pending approval'
+      });
+    }
+
+    // Check email verification for regular users
+    // Admins should not be blocked by email verification
+    if (!user.is_admin && !user.email_verified) {
+      return res.status(403).json({
+        success: false,
+        error: 'Please verify your email address before logging in.',
+        requiresVerification: true,
+        email: user.email
+      });
+    }
+
     // Check subscription status
     if (user.subscription_status !== 'active') {
       return res.status(403).json({
@@ -204,15 +227,15 @@ router.post('/login', validateLogin, async (req, res) => {
     );
 
     const token = jwt.sign(
-        { 
-          userId: user.id,
-          email: user.email,    
-          tier: user.subscription_tier,
-          isAdmin: user.is_admin || false  // ADD THIS LINE
-        },
-        process.env.JWT_SECRET,
-        { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
-      );
+      { 
+        userId: user.id,
+        email: user.email,    
+        tier: user.subscription_tier,
+        isAdmin: user.is_admin || false
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
+    );
 
     const refreshToken = jwt.sign(
       { userId: user.id },
@@ -238,6 +261,138 @@ router.post('/login', validateLogin, async (req, res) => {
     res.status(500).json({
       success: false,
       error: 'Login failed'
+    });
+  }
+});
+
+// Verify email address
+router.get('/verify-email', async (req, res) => {
+  try {
+    const { token } = req.query;
+
+    if (!token) {
+      return res.status(400).json({
+        success: false,
+        error: 'Verification token is required'
+      });
+    }
+
+    // Verify the token
+    const decoded = tokenService.verifyEmailVerificationToken(token);
+    
+    // Update user's email_verified status
+    const result = await pool.query(
+      `UPDATE users 
+       SET email_verified = true, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1 AND email = $2 AND email_verified = false
+       RETURNING id, email, full_name, email_verified`,
+      [decoded.userId, decoded.email]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid verification token or email already verified'
+      });
+    }
+
+    const user = result.rows[0];
+
+    // Send welcome email
+    try {
+      await emailService.sendWelcomeEmail(user.email, user.full_name);
+    } catch (emailError) {
+      console.error('Failed to send welcome email:', emailError);
+      // Don't fail verification if welcome email fails
+    }
+
+    res.json({
+      success: true,
+      message: 'Email verified successfully! You can now log in to your account.',
+      data: {
+        user: {
+          id: user.id,
+          email: user.email,
+          email_verified: user.email_verified
+        }
+      }
+    });
+
+  } catch (error) {
+    console.error('Email verification error:', error);
+    res.status(400).json({
+      success: false,
+      error: error.message || 'Invalid or expired verification token'
+    });
+  }
+});
+
+// Resend verification email
+router.post('/resend-verification', [
+  body('email').isEmail().normalizeEmail()
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        errors: errors.array()
+      });
+    }
+
+    const { email } = req.body;
+
+    // Check if user exists and email is not verified
+    const userQuery = await pool.query(
+      `SELECT id, email, full_name, email_verified
+       FROM users WHERE email = $1 AND deleted_at IS NULL`,
+      [email]
+    );
+
+    if (userQuery.rows.length === 0) {
+      // Don't reveal if user exists for security
+      return res.json({
+        success: true,
+        message: 'If an account exists with this email, a verification link has been sent'
+      });
+    }
+
+    const user = userQuery.rows[0];
+
+    // Check if already verified
+    if (user.email_verified) {
+      return res.status(400).json({
+        success: false,
+        error: 'Email is already verified'
+      });
+    }
+
+    // Generate new verification token
+    const verificationToken = tokenService.generateEmailVerificationToken(
+      user.id,
+      user.email
+    );
+
+    // Send verification email
+    await emailService.sendVerificationEmail(
+      user.email,
+      verificationToken,
+      user.full_name
+    );
+
+    res.json({
+      success: true,
+      message: 'Verification email sent successfully',
+      data: {
+        email: user.email
+      }
+    });
+
+  } catch (error) {
+    console.error('Resend verification error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to resend verification email'
     });
   }
 });
