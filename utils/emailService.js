@@ -6,13 +6,13 @@ class EmailService {
   constructor() {
     // AWS SES configuration
     this.ses = new AWS.SES({
-      region: process.env.AWS_REGION || 'us-east-1',
+      region: process.env.AWS_REGION,
       accessKeyId: process.env.AWS_ACCESS_KEY_ID,
       secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
     });
     
     this.fromEmail = process.env.SES_FROM_EMAIL;
-    this.siteUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+    this.siteUrl = process.env.FRONTEND_URL;
   }
 
   async sendVerificationEmail(toEmail, verificationToken, userName) {
