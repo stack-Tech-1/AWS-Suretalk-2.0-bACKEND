@@ -11,9 +11,9 @@ try {
   // Use static env vars for connection details + RDS secret for credentials
   dbConfig = {
     // Static connection details from environment variables
-    host: process.env.DB_HOST,  // Your RDS cluster endpoint
+    host: process.env.DB_HOST,  
     port: Number(process.env.DB_PORT) || 5432,
-    database: process.env.DB_NAME,  // Your database name
+    database: process.env.DB_NAME,  
     
     // Rotating credentials from RDS secret
     user: dbSecret.username || process.env.DB_USER || 'postgres',
