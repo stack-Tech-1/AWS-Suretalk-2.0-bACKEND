@@ -301,6 +301,16 @@ router.post('/', authenticate, [
       isPermanent,
       scheduledFor 
     } = req.body;
+    
+    // Process tags - handle both array and string formats
+    let processedTags = [];
+    if (tags) {
+      if (Array.isArray(tags)) {
+        processedTags = tags.map(tag => tag.trim()).filter(tag => tag !== '');
+      } else if (typeof tags === 'string') {
+        processedTags = tags.split(',').map(tag => tag.trim()).filter(tag => tag !== '');
+      }
+    }
 
     // Validate tier for permanent storage
     if (isPermanent && req.user.subscription_tier !== 'LEGACY_VAULT_PREMIUM') {
@@ -326,52 +336,54 @@ router.post('/', authenticate, [
         parseInt(fileSize),
         parseInt(duration),
         isPermanent || false,
-        tags ? tags.split(',').map(tag => tag.trim()) : [],
+        processedTags,  // Use processedTags here
         scheduledFor || null
       ]
-    );
+    );    
 
-    // Add analytics event
-      try {
-        await pool.query(
-          `INSERT INTO analytics_events (user_id, event_type, voice_note_id, event_data)
-          VALUES ($1, 'voice_note_created', $2, $3)`,
-          [req.user.id, note.id, JSON.stringify({
-            title: note.title,
-            duration: note.duration_seconds,
-            size: note.file_size_bytes,
-            is_permanent: note.is_permanent
-          })]
-        );
-      } catch (analyticsError) {
-        console.warn('Failed to record analytics event:', analyticsError);
-        // Don't fail the main request if analytics fails
-      }
-
+    
 
     const note = result.rows[0];
-    const downloadUrl = await generateDownloadUrl(note.s3_key, note.s3_bucket, 3600);
-    // Create notification
-  await createNotification(req.user.id, 'voice_note', 
-    'Voice Note Created', 
-    `"${voiceNote.title}" has been successfully recorded`,
-    {
-      voiceNoteId: voiceNote.id,
-      title: voiceNote.title,
-      duration: voiceNote.duration_seconds,
-      url: `/usersDashboard/voice-notes/${voiceNote.id}`
-    },
-    '/icons/voice-note.png'
-  );
 
-    res.status(201).json({
-      success: true,
-      message: 'Voice note created successfully',
-      data: {
-        ...note,
-        downloadUrl
-      }
-    });
+    // Add analytics event
+try {
+  await pool.query(
+    `INSERT INTO analytics_events (user_id, event_type, voice_note_id, event_data)
+    VALUES ($1, 'voice_note_created', $2, $3)`,
+    [req.user.id, note.id, JSON.stringify({
+      title: note.title,
+      duration: note.duration_seconds,
+      size: note.file_size_bytes,
+      is_permanent: note.is_permanent
+    })]
+  );
+} catch (analyticsError) {
+  console.warn('Failed to record analytics event:', analyticsError);
+}
+
+const downloadUrl = await generateDownloadUrl(note.s3_key, note.s3_bucket, 3600);
+
+// Create notification - FIXED: Use 'note' instead of 'voiceNote'
+await createNotification(req.user.id, 'voice_note', 
+  'Voice Note Created', 
+  `"${note.title}" has been successfully recorded`, // Changed voiceNote to note
+  {
+    voiceNoteId: note.id, // Changed voiceNote to note
+    title: note.title, // Changed voiceNote to note
+    duration: note.duration_seconds, // Changed voiceNote to note
+    url: `/usersDashboard/voice-notes/${note.id}` // Changed voiceNote to note
+  },
+  '/icons/voice-note.png'
+);
+
+res.status(201).json({
+  success: true,
+  message: 'Voice note created successfully',
+  data: {
+    ...note,
+    downloadUrl
+  }
+});
 
   } catch (error) {
     console.error('Create voice note error:', error);
@@ -425,7 +437,15 @@ router.put('/:id', authenticate, async (req, res) => {
 
     if (tags !== undefined) {
       updates.push(`tags = $${paramCount}`);
-      values.push(tags.split(',').map(tag => tag.trim()));
+      let processedTags;
+      if (Array.isArray(tags)) {
+        processedTags = tags.map(tag => tag.trim()).filter(tag => tag !== '');
+      } else if (typeof tags === 'string') {
+        processedTags = tags.split(',').map(tag => tag.trim()).filter(tag => tag !== '');
+      } else {
+        processedTags = [];
+      }
+      values.push(processedTags);
       paramCount++;
     }
 
