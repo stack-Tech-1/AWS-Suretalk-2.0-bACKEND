@@ -131,13 +131,14 @@ router.get('/:id', authenticate, async (req, res) => {
   }
 });
 
-// Create new contact
+// Create new contact - Updated version
 router.post('/', authenticate, [
-  body('name').notEmpty().trim(),
-  body('phone').isMobilePhone(),
-  body('email').optional().isEmail().normalizeEmail(),
+  body('name').notEmpty().trim().withMessage('Name is required'),
+  body('phone').isMobilePhone().withMessage('Valid phone number is required'),
+  body('email').optional().isEmail().normalizeEmail().withMessage('Valid email is required'),
   body('relationship').optional().trim(),
-  body('isBeneficiary').optional().isBoolean()
+  body('isBeneficiary').optional().isBoolean().withMessage('isBeneficiary must be boolean'),
+  body('canReceiveMessages').optional().isBoolean().withMessage('canReceiveMessages must be boolean')
 ], async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -148,9 +149,12 @@ router.post('/', authenticate, [
       });
     }
 
-    const { name, phone, email, relationship, isBeneficiary, notes } = req.body;
+    const { name, phone, email, relationship, isBeneficiary, canReceiveMessages, notes } = req.body;
 
-    // Check user's contact limit based on tier
+    // Log the received data for debugging
+    console.log('Received contact data:', req.body);
+
+    // Check user's contact limit
     const userQuery = await pool.query(
       `SELECT subscription_tier, contacts_limit,
               (SELECT COUNT(*) FROM contacts WHERE user_id = $1) as contact_count
@@ -192,8 +196,9 @@ router.post('/', authenticate, [
     // Create contact
     const result = await pool.query(
       `INSERT INTO contacts (
-        user_id, name, phone, email, relationship, is_beneficiary, notes
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+        user_id, name, phone, email, relationship, 
+        is_beneficiary, can_receive_messages, notes
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
       RETURNING *`,
       [
         req.user.id,
@@ -202,6 +207,7 @@ router.post('/', authenticate, [
         email || null,
         relationship || null,
         isBeneficiary || false,
+        canReceiveMessages !== undefined ? canReceiveMessages : true, // Default to true
         notes || null
       ]
     );

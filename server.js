@@ -116,7 +116,6 @@ app.get('/health', (req, res) => {
 });
 
 // API Routes
-
 app.use('/api/admin/login', adminSlowDown, adminRateLimit);
 app.use('/api/auth', require('./routes/auth'));
 app.use('/api/users', require('./routes/users'));
