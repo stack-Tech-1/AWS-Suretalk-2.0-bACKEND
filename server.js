@@ -62,11 +62,10 @@ const corsOptions = {
 app.options('*', cors(corsOptions));
 app.use(cors(corsOptions));
 
-
 // Rate limiting
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: process.env.NODE_ENV === 'development' ? 1000 : 300, // Higher limit for dev
+  max: process.env.NODE_ENV === 'development' ? 1000 : 300,
   message: 'Too many requests from this IP, please try again later.',
   standardHeaders: true,
   legacyHeaders: false,
@@ -76,7 +75,7 @@ app.use('/api/', limiter);
 
 const adminRateLimit = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 10 ,
+  max: 10,
   skipSuccessfulRequests: true,
   message: 'Too many login attempts. Please try again later.',
   standardHeaders: true,
@@ -90,8 +89,17 @@ const adminSlowDown = slowDown({
   maxDelayMs: 10000
 });
 
-// Body parsing
-app.use(express.json({ limit: '50mb' }));
+// IMPORTANT: Custom body parser that excludes webhook routes
+app.use((req, res, next) => {
+  if (req.originalUrl === '/api/billing/webhook') {
+    // Don't parse webhook requests as JSON - Stripe needs raw body
+    next();
+  } else {
+    // Parse all other requests as JSON
+    express.json({ limit: '50mb' })(req, res, next);
+  }
+});
+
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 // Request logging
@@ -115,7 +123,10 @@ app.get('/health', (req, res) => {
   });
 });
 
-// API Routes
+// API Routes - IMPORTANT: Webhook route must be defined BEFORE routes that need JSON
+app.use('/api/billing', require('./routes/billing')); // This includes the webhook
+
+// Other API Routes
 app.use('/api/admin/login', adminSlowDown, adminRateLimit);
 app.use('/api/auth', require('./routes/auth'));
 app.use('/api/users', require('./routes/users'));
@@ -124,7 +135,6 @@ app.use('/api/contacts', require('./routes/contacts'));
 app.use('/api/vault', require('./routes/vault'));
 app.use('/api/scheduled', require('./routes/scheduled'));
 app.use('/api/admin', require('./routes/admin'));
-app.use('/api/billing', require('./routes/billing'));
 app.use('/api/settings', settingsRoutes);
 app.use('/api/devices', devicesRoutes);
 app.use('/api/backup', backupRoutes);

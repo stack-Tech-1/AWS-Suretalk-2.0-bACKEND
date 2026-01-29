@@ -84,20 +84,30 @@ const validateTier = (requiredTier) => async (req, res, next) => {
     // Define tier hierarchy
     const tierHierarchy = {
       'LITE': 1,
-      'ESSENTIAL': 2,
-      'PREMIUM': 3,
-      'LEGACY_VAULT_PREMIUM': 4
+      'ESSENTIAL': 2,      
+      'LEGACY_VAULT_PREMIUM': 3
     };
 
+    // If user tier doesn't exist in hierarchy, deny access
+    if (!tierHierarchy[userTier]) {
+      return res.status(403).json({
+        success: false,
+        error: `LEGACY_VAULT_PREMIUM subscription required`
+      });
+    }
+
     if (tierHierarchy[userTier] < tierHierarchy[requiredTier]) {
-      throw new Error(`Feature requires ${requiredTier} tier or higher`);
+      return res.status(403).json({
+        success: false,
+        error: `LEGACY_VAULT_PREMIUM subscription required`
+      });
     }
 
     next();
   } catch (error) {
     res.status(403).json({
       success: false,
-      error: error.message
+      error: `LEGACY_VAULT_PREMIUM subscription required`
     });
   }
 };

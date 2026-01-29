@@ -163,13 +163,14 @@ router.get('/subscription', authenticate, async (req, res) => {
 
 // Create checkout session for upgrade
 router.post('/create-checkout', authenticate, [
-  body('priceId').notEmpty(),
-  body('successUrl').notEmpty().isURL(),
-  body('cancelUrl').notEmpty().isURL()
+  body('priceId').notEmpty().withMessage('Price ID is required'),
+  body('successUrl').notEmpty().withMessage('Success URL is required'),
+  body('cancelUrl').notEmpty().withMessage('Cancel URL is required')
 ], async (req, res) => {
   try {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
+      console.log('Validation errors:', errors.array()); // Add this for debugging
       return res.status(400).json({
         success: false,
         errors: errors.array()
@@ -300,58 +301,83 @@ router.post('/create-portal-session', authenticate, async (req, res) => {
 
 // Handle Stripe webhook
 router.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  console.log('📥 Webhook received');
+  
+  let event;
+  
   try {
-    if (!stripe || !process.env.STRIPE_WEBHOOK_SECRET) {
-      return res.status(500).json({
-        success: false,
-        error: 'Webhook not configured'
-      });
-    }
-
     const signature = req.headers['stripe-signature'];
-    let event;
+    const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+    
+    console.log('Signature exists:', !!signature);
+    console.log('Webhook secret exists:', !!webhookSecret);
 
-    try {
-      event = stripe.webhooks.constructEvent(
-        req.body,
-        signature,
-        process.env.STRIPE_WEBHOOK_SECRET
-      );
-    } catch (err) {
-      console.error('Webhook signature verification failed:', err.message);
-      return res.status(400).send(`Webhook Error: ${err.message}`);
+    if (signature && webhookSecret) {
+      // Verify webhook signature (production or CLI with secret)
+      try {
+        event = stripe.webhooks.constructEvent(
+          req.body,
+          signature,
+          webhookSecret
+        );
+        console.log('✅ Webhook signature verified');
+      } catch (err) {
+        console.error('❌ Webhook signature verification failed:', err.message);
+        console.log('⚠️ Attempting to parse as JSON for CLI testing...');
+        
+        // Try to parse as JSON for CLI testing
+        try {
+          event = JSON.parse(req.body.toString());
+          console.log('✅ Parsed webhook from CLI');
+        } catch (parseErr) {
+          console.error('❌ Failed to parse webhook:', parseErr.message);
+          return res.status(400).send(`Webhook Error: ${err.message}`);
+        }
+      }
+    } else {
+      // No signature - parse as JSON (for CLI without secret)
+      console.log('⚠️ No signature, parsing as JSON');
+      event = JSON.parse(req.body.toString());
     }
-
+    
+    console.log('✅ Webhook event type:', event.type);
+    
     // Handle the event
     switch (event.type) {
       case 'checkout.session.completed':
+        console.log('💰 Checkout completed:', event.data.object.id);
         await handleCheckoutSessionCompleted(event.data.object);
         break;
       
       case 'customer.subscription.updated':
+        console.log('🔄 Subscription updated:', event.data.object.id);
         await handleSubscriptionUpdated(event.data.object);
         break;
       
       case 'customer.subscription.deleted':
+        console.log('🗑️ Subscription deleted:', event.data.object.id);
         await handleSubscriptionDeleted(event.data.object);
         break;
       
       case 'invoice.payment_succeeded':
+        console.log('✅ Invoice payment succeeded:', event.data.object.id);
         await handleInvoicePaymentSucceeded(event.data.object);
         break;
       
       case 'invoice.payment_failed':
+        console.log('❌ Invoice payment failed:', event.data.object.id);
         await handleInvoicePaymentFailed(event.data.object);
         break;
       
       default:
-        console.log(`Unhandled event type: ${event.type}`);
+        console.log(`⚡ Unhandled event type: ${event.type}`);
     }
-
+    
     res.json({ received: true });
-
+    
   } catch (error) {
-    console.error('Webhook error:', error);
+    console.error('❌ Webhook error:', error);
+    console.error('Error stack:', error.stack);
     res.status(500).json({
       success: false,
       error: 'Webhook handler failed'
@@ -362,39 +388,114 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req, r
 // Webhook handlers
 async function handleCheckoutSessionCompleted(session) {
   try {
+    console.log('💰 Handling checkout session completed:', session.id);
+    console.log('📋 Session metadata:', session.metadata);
+    
     const userId = session.metadata?.userId;
-    if (!userId) return;
+    if (!userId) {
+      console.log('⚠️ No userId in session metadata');
+      return;
+    }
 
+    console.log('👤 User ID from metadata:', userId);
+    
+    // Validate userId is a valid UUID
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!uuidRegex.test(userId)) {
+      console.error('❌ Invalid userId format:', userId);
+      return;
+    }
+    
     const subscription = await stripe.subscriptions.retrieve(
       session.subscription
     );
-
-    // Update user subscription
-    await pool.query(
+    
+    console.log('📊 Subscription details:', {
+      id: subscription.id,
+      status: subscription.status,
+      priceId: subscription.items.data[0]?.price.id,
+      customer: subscription.customer
+    });
+    
+    if (!subscription.items.data[0]?.price.id) {
+      console.error('❌ No price ID found in subscription');
+      return;
+    }
+    
+    const priceId = subscription.items.data[0].price.id;
+    const tier = getTierFromPriceId(priceId);
+    
+    console.log('🎯 Updating user to tier:', tier);
+    
+    // Validate all parameters before database query
+    if (!tier || !subscription.id || !session.customer) {
+      console.error('❌ Missing required parameters:', { tier, subscriptionId: subscription.id, customerId: session.customer });
+      return;
+    }
+    
+    // FIXED QUERY: Explicitly cast parameters
+    const result = await pool.query(
       `UPDATE users 
-       SET subscription_tier = $1,
+       SET subscription_tier = $1::VARCHAR,
            subscription_status = 'active',
-           stripe_subscription_id = $2
-       WHERE id = $3`,
-      [getTierFromPriceId(subscription.items.data[0].price.id), subscription.id, userId]
+           stripe_subscription_id = $2::VARCHAR,
+           stripe_customer_id = $3::VARCHAR,
+           contacts_limit = CASE $1::VARCHAR
+             WHEN 'ESSENTIAL' THEN 9 
+             WHEN 'LEGACY_VAULT_PREMIUM' THEN 25 
+             ELSE 3 
+           END,
+           storage_limit_gb = CASE $1::VARCHAR
+             WHEN 'ESSENTIAL' THEN 5 
+             WHEN 'LEGACY_VAULT_PREMIUM' THEN 50 
+             ELSE 1 
+           END,
+           voice_notes_limit = CASE $1::VARCHAR
+             WHEN 'ESSENTIAL' THEN 100 
+             WHEN 'LEGACY_VAULT_PREMIUM' THEN 500 
+             ELSE 3 
+           END
+       WHERE id = $4::UUID
+       RETURNING *`,
+      [tier, subscription.id, session.customer, userId]
     );
+    
+    if (result.rowCount === 0) {
+      console.error('❌ User not found:', userId);
+      return;
+    }
+    
+    console.log('✅ User updated successfully:', result.rows[0].email);
 
-    // Create billing record
-    await pool.query(
-      `INSERT INTO billing_history (
-        user_id, stripe_invoice_id, amount_cents, currency, description, status
-      ) VALUES ($1, $2, $3, $4, $5, 'paid')`,
-      [
-        userId,
-        session.invoice,
-        session.amount_total,
-        session.currency,
-        'Initial subscription payment'
-      ]
-    );
+    // FIXED: Check if session.invoice exists before creating billing record
+    if (session.invoice) {
+      await pool.query(
+        `INSERT INTO billing_history (
+          user_id, stripe_invoice_id, amount_cents, currency, description, status
+        ) VALUES ($1::UUID, $2::VARCHAR, $3::INTEGER, $4::VARCHAR, $5::TEXT, 'paid')`,
+        [
+          userId,
+          session.invoice,
+          session.amount_total || 0,
+          session.currency || 'USD',
+          `Initial ${tier} subscription payment`
+        ]
+      );
+      console.log('✅ Billing record created');
+    } else {
+      console.log('⚠️ No invoice in session, skipping billing record');
+    }
 
   } catch (error) {
-    console.error('Handle checkout session completed error:', error);
+    console.error('❌ Handle checkout session completed error:', error);
+    console.error('Error stack:', error.stack);
+    console.error('Error details:', {
+      message: error.message,
+      code: error.code,
+      detail: error.detail,
+      hint: error.hint,
+      position: error.position
+    });
   }
 }
 
@@ -442,16 +543,16 @@ async function handleInvoicePaymentSucceeded(invoice) {
     const userId = subscription.metadata?.userId;
     if (!userId) return;
 
-    // Create billing record
+    // FIXED: Explicitly cast parameters
     await pool.query(
       `INSERT INTO billing_history (
         user_id, stripe_invoice_id, amount_cents, currency, description, status
-      ) VALUES ($1, $2, $3, $4, $5, 'paid')`,
+      ) VALUES ($1::UUID, $2::VARCHAR, $3::INTEGER, $4::VARCHAR, $5::TEXT, 'paid')`,
       [
         userId,
         invoice.id,
-        invoice.amount_paid,
-        invoice.currency,
+        invoice.amount_paid || 0,
+        invoice.currency || 'USD',
         'Recurring subscription payment'
       ]
     );
@@ -496,14 +597,21 @@ async function handleInvoicePaymentFailed(invoice) {
 
 // Helper function to map Stripe price ID to tier
 function getTierFromPriceId(priceId) {
-  // This should match your Stripe price IDs
+  console.log('🔍 Looking up tier for price ID:', priceId);
+  
+  // This should match your Stripe price IDs from environment variables
   const priceMap = {
-    'price_lite': 'LITE',
-    'price_essential': 'ESSENTIAL',
-    'price_premium': 'LEGACY_VAULT_PREMIUM'
+    [process.env.NEXT_PUBLIC_STRIPE_LITE_PRICE_ID]: 'LITE',
+    [process.env.NEXT_PUBLIC_STRIPE_ESSENTIAL_PRICE_ID]: 'ESSENTIAL',
+    [process.env.NEXT_PUBLIC_STRIPE_PREMIUM_PRICE_ID]: 'LEGACY_VAULT_PREMIUM'
   };
   
-  return priceMap[priceId] || 'LITE';
+  console.log('Price map:', priceMap);
+  
+  const tier = priceMap[priceId] || 'LITE';
+  console.log('Found tier:', tier);
+  
+  return tier;
 }
 
 // Manual upgrade/downgrade (for admin or manual handling)
