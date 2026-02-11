@@ -28,7 +28,7 @@ function getDBConfig() {
     port: Number(process.env.DB_PORT) || 5432,
     database: process.env.DB_NAME || 'suretalk-database-1', 
     user: dbSecret.username || process.env.DB_USER || 'postgres',
-    password: dbSecret.password || process.env.DB_PASSWORD || 'X:bQC<Oad6Ji[sveDaM1-NJ1Km)v',
+    password: dbSecret.password || process.env.DB_PASSWORD || 'X:bQC<Oad6Ji[sveDaM1-NJ1Km)varn:aws:secretsmanager:eu-central-1:470727824408:secret:rds!db-74d13851-4d9e-494f-9f47-5f795b9889ff-BfVpyw',
   };
   
   // Convert password to string if it exists
