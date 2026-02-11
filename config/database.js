@@ -1,71 +1,62 @@
 const { Pool } = require('pg');
 
-/*
-// Function to parse DB_SECRET safely
-function parseDBSecret() {
-  try {
-    if (!process.env.DB_SECRET) {
-      console.log('⚠️ DB_SECRET environment variable is not set');
-      return {};
-    }
-    return JSON.parse(process.env.DB_SECRET);
-  } catch (error) {
-    console.error('❌ Failed to parse DB_SECRET:', error.message);
-    console.error('DB_SECRET value (first 50 chars):', process.env.DB_SECRET?.substring(0, 50));
-    return {};
-  }
-}
-*/
-// Function to get database configuration
+// Function to get database configuration - works with or without DB_SECRET
 function getDBConfig() {
-  //const dbSecret = parseDBSecret();
+  let dbSecret = {};
   
-  //console.log('RDS Secret keys available:', Object.keys(dbSecret));
-  
-  
-  // Default values that might work for Aurora
-  // IMPORTANT: You need to replace these with your actual values!
-  const defaultConfig = {
-    host: process.env.DB_HOST || 'suretalk-database-1.cbw8msgksr4u.eu-central-1.rds.amazonaws.com', 
-    port: Number(process.env.DB_PORT) || 5432,
-    database: process.env.DB_NAME || 'suretalk-database-1', 
-    user: process.env.DB_USER || 'postgres',
-    password: process.env.DB_PASSWORD || 'X:bQC<Oad6Ji[sveDaM1-NJ1Km)v',
-  };
-  
-  // Convert password to string if it exists
-  if (defaultConfig.password !== undefined && defaultConfig.password !== null) {
-    defaultConfig.password = String(defaultConfig.password);
+  // Try to parse DB_SECRET if it exists, but don't fail if it's invalid
+  if (process.env.DB_SECRET) {
+    try {
+      dbSecret = JSON.parse(process.env.DB_SECRET);
+      console.log('✅ Successfully parsed DB_SECRET');
+    } catch (error) {
+      console.log('⚠️ DB_SECRET exists but is not valid JSON, ignoring it');
+      // If it's not JSON, it might be the old password string - ignore it
+      dbSecret = {};
+    }
+  } else {
+    console.log('ℹ️ DB_SECRET not set, using individual environment variables');
   }
+
+  // Build config from multiple sources, with clear priority:
+  // 1. Individual env vars (DB_HOST, DB_USER, etc.) - highest priority
+  // 2. Parsed DB_SECRET (if valid) - medium priority
+  // 3. Hardcoded defaults - lowest priority
   
+  const config = {
+    host: process.env.DB_HOST || dbSecret.host || 'suretalk-database-1.cbw8msgksr4u.eu-central-1.rds.amazonaws.com',
+    port: Number(process.env.DB_PORT) || dbSecret.port || 5432,
+    database: process.env.DB_NAME || dbSecret.dbname || dbSecret.database || 'suretalk-database-1',
+    user: process.env.DB_USER || dbSecret.username || 'postgres',
+    password: process.env.DB_PASSWORD || 'X:bQC<Oad6Ji[sveDaM1-NJ1Km)v' || dbSecret.password
+  };
+
+  // CRITICAL: Remove any fallback password! If no password is found, it should be undefined
+  if (!config.password) {
+    console.error('❌ NO DATABASE PASSWORD FOUND!');
+    console.error('   Please set either:');
+    console.error('   - DB_PASSWORD environment variable');
+    console.error('   - Or a valid DB_SECRET with a password field');
+  }
+
   console.log('Database configuration:', {
-    host: defaultConfig.host,
-    port: defaultConfig.port,
-    database: defaultConfig.database,
-    user: defaultConfig.user,
-    password: defaultConfig.password ? '[HIDDEN]' : 'MISSING'
+    host: config.host,
+    port: config.port,
+    database: config.database,
+    user: config.user,
+    password: config.password ? '[SET]' : '[MISSING]',
+    source: process.env.DB_PASSWORD ? 'env vars' : (dbSecret.password ? 'secret' : 'none')
   });
-  
-  return defaultConfig;
+
+  return config;
 }
 
 const dbConfig = getDBConfig();
 
-// Log warnings but don't crash
-const required = ['host', 'database', 'user', 'password'];
-const missing = required.filter(field => !dbConfig[field]);
-
+// Validate required fields
+const missing = ['host', 'database', 'user', 'password'].filter(field => !dbConfig[field]);
 if (missing.length > 0) {
-  console.error(`⚠️ WARNING: Missing database configuration: ${missing.join(', ')}`);
-  console.error('The application will start but database connections will fail.');
-  console.error('');
-  console.error('TO FIX THIS:');
-  console.error('1. Get your RDS endpoint from AWS RDS Console');
-  console.error('2. Update the "host" default in this file');
-  console.error('3. Update the "database" default in this file');
-  console.error('Or add these environment variables to App Runner:');
-  console.error('  - DB_HOST: your-rds-endpoint.cluster-xxx.region.rds.amazonaws.com');
-  console.error('  - DB_NAME: your_database_name');
+  console.error(`❌ CRITICAL: Missing database configuration: ${missing.join(', ')}`);
 }
 
 const pool = new Pool({
@@ -86,7 +77,7 @@ const maxConnectionAttempts = 5;
 
 pool.on('connect', () => {
   console.log('✅ Database connected successfully to:', dbConfig.host);
-  connectionAttempts = 0; // Reset on successful connection
+  connectionAttempts = 0;
 });
 
 pool.on('error', (err) => {
@@ -97,13 +88,11 @@ pool.on('error', (err) => {
   if (connectionAttempts >= maxConnectionAttempts) {
     console.error('💀 Too many database connection failures. Please check:');
     console.error('   1. Is DB_HOST correct? Current:', dbConfig.host);
-    console.error('   2. Is App Runner in same VPC as RDS?');
-    console.error('   3. Do security groups allow port 5432?');
-    console.error('   4. Is the database name correct? Current:', dbConfig.database);
+    console.error('   2. Is the password correct?');
+    console.error('   3. Is the database name correct? Current:', dbConfig.database);
   }
 });
 
-// Add a test query function that won't crash the app
 async function testDatabaseConnection() {
   try {
     const client = await pool.connect();
@@ -117,5 +106,4 @@ async function testDatabaseConnection() {
   }
 }
 
-// Export both pool and test function
 module.exports = { pool, testDatabaseConnection };
