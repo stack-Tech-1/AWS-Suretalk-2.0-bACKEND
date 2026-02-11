@@ -24,9 +24,9 @@ function getDBConfig() {
   // Default values that might work for Aurora
   // IMPORTANT: You need to replace these with your actual values!
   const defaultConfig = {
-    host: process.env.DB_HOST || 'suretalk-v2.cluster-cbw8msgksr4u.eu-central-1.rds.amazonaws.com', 
+    host: process.env.DB_HOST || 'suretalk-database-1.cbw8msgksr4u.eu-central-1.rds.amazonaws.com', 
     port: Number(process.env.DB_PORT) || 5432,
-    database: process.env.DB_NAME || 'suretalk_v2', 
+    database: process.env.DB_NAME || 'suretalk-database-1', 
     user: dbSecret.username || process.env.DB_USER || 'postgres',
     password: dbSecret.password || process.env.DB_PASSWORD || '',
   };
