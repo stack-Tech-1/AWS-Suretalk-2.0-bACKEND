@@ -15,13 +15,13 @@ function parseDBSecret() {
     return {};
   }
 }
-
+*/
 // Function to get database configuration
 function getDBConfig() {
-  const dbSecret = parseDBSecret();
+  //const dbSecret = parseDBSecret();
   
-  console.log('RDS Secret keys available:', Object.keys(dbSecret));
-  */
+  //console.log('RDS Secret keys available:', Object.keys(dbSecret));
+  
   
   // Default values that might work for Aurora
   // IMPORTANT: You need to replace these with your actual values!
@@ -47,7 +47,7 @@ function getDBConfig() {
   });
   
   return defaultConfig;
-
+}
 
 const dbConfig = getDBConfig();
 
