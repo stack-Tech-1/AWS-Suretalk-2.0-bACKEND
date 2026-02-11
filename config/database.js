@@ -1,5 +1,6 @@
 const { Pool } = require('pg');
 
+/*
 // Function to parse DB_SECRET safely
 function parseDBSecret() {
   try {
@@ -20,6 +21,7 @@ function getDBConfig() {
   const dbSecret = parseDBSecret();
   
   console.log('RDS Secret keys available:', Object.keys(dbSecret));
+  */
   
   // Default values that might work for Aurora
   // IMPORTANT: You need to replace these with your actual values!
@@ -27,8 +29,8 @@ function getDBConfig() {
     host: process.env.DB_HOST || 'suretalk-database-1.cbw8msgksr4u.eu-central-1.rds.amazonaws.com', 
     port: Number(process.env.DB_PORT) || 5432,
     database: process.env.DB_NAME || 'suretalk-database-1', 
-    user: dbSecret.username || process.env.DB_USER || 'postgres',
-    password: dbSecret.password || process.env.DB_PASSWORD || '',
+    user: process.env.DB_USER || 'postgres',
+    password: process.env.DB_PASSWORD || 'X:bQC<Oad6Ji[sveDaM1-NJ1Km)v',
   };
   
   // Convert password to string if it exists
@@ -45,7 +47,7 @@ function getDBConfig() {
   });
   
   return defaultConfig;
-}
+
 
 const dbConfig = getDBConfig();
 
