@@ -31,14 +31,14 @@ const processScheduledMessages = async () => {
       `SELECT sm.*, vn.title as voice_note_title, vn.s3_key, vn.s3_bucket,
               u.full_name as sender_name, u.email as sender_email,
               c.name as recipient_name
-       FROM scheduled_messages sm
+              FROM scheduled_messages sm
        JOIN voice_notes vn ON sm.voice_note_id = vn.id
        JOIN users u ON sm.user_id = u.id
        LEFT JOIN contacts c ON sm.recipient_contact_id = c.id
        WHERE sm.delivery_status = 'scheduled'
          AND sm.scheduled_for <= $1
          AND sm.delivery_attempts < 3
-       FOR UPDATE SKIP LOCKED
+       FOR UPDATE OF sm SKIP LOCKED
        LIMIT 50`,
       [now]
     );
