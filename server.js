@@ -1,3 +1,4 @@
+// C:\Users\SMC\Documents\GitHub\AWS-Suretalk-2.0-bACKEND\server.js
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -141,6 +142,140 @@ app.use('/api/backup', backupRoutes);
 app.use('/api/notifications', require('./routes/notifications').router);
 app.use('/api/storage', require('./routes/storage'));
 app.use('/api/auth', require('./routes/adminAuth'));
+
+
+
+
+
+// ==================== Sync Routes - Handle incoming payloads from IVR Lambdas ====================
+const axios = require('axios');  // Ensure axios is available
+
+/**
+ * Fire-and-forget sync to IVR backend via API Gateway
+ * @param {Object} payload - Data to send
+ * @param {string} endpointPath - API endpoint path (e.g., 'sync-slot')
+ */
+const syncToIvr = (payload, endpointPath) => {
+  const url = `${process.env.IVR_API_URL}/${endpointPath}`;
+  const headers = {
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${process.env.IVR_SYNC_TOKEN}`
+  };
+
+  axios.post(url, payload, { headers, timeout: 3000 })
+    .then(() => {
+      logger.info(`Synced to IVR: ${endpointPath}`);
+    })
+    .catch(err => {
+      logger.error(`Sync to IVR failed (non-fatal): ${err.message}`);
+    });
+};
+
+// Auth middleware for sync routes (use shared token, not user auth)
+const syncAuth = (req, res, next) => {
+  const auth = req.headers.authorization;
+  if (!auth || auth !== `Bearer ${process.env.IVR_SYNC_TOKEN}`) {
+    return res.status(401).json({ success: false, error: 'Unauthorized' });
+  }
+  next();
+};
+
+// Receive new/updated user from IVR
+app.post('/api/sync/user', syncAuth, async (req, res) => {
+  const { userId, subscription_tier, verified, status, createdAt, action } = req.body;
+
+  try {
+    if (action === 'unsubscribe') {
+      await pool.query(
+        `UPDATE users SET verified = $1, subscription_status = $2, updated_at = NOW() WHERE phone = $3`,
+        [false, 'inactive', userId]
+      );
+    } else if (action === 'create' || action === 'update') {
+      await pool.query(
+        `INSERT INTO users (phone, subscription_tier, verified, status, created_at, source)
+         VALUES ($1, $2, $3, $4, $5, 'ivr')
+         ON CONFLICT (phone) DO UPDATE SET
+           subscription_tier = EXCLUDED.subscription_tier,
+           verified = EXCLUDED.verified,
+           status = EXCLUDED.status,
+           updated_at = NOW()`,
+        [userId, subscription_tier || 'LITE', verified, status || 'active', createdAt || new Date()]
+      );
+    } else {
+      return res.status(400).json({ success: false, error: 'Invalid action' });
+    }
+
+    res.status(200).json({ success: true });
+  } catch (err) {
+    console.error('Sync user error:', err);
+    res.status(500).json({ success: false });
+  }
+});
+
+// Receive new/updated slot from IVR
+app.post('/api/sync/slot', syncAuth, async (req, res) => {
+  const { userId, slotNumber, contact, voiceMessage, createdAt, action, source } = req.body;
+
+  try {
+    if (action === 'delete') {
+      await pool.query(
+        `DELETE FROM voice_notes WHERE user_id = (SELECT id FROM users WHERE phone = $1) AND slot_number = $2`,
+        [userId, slotNumber]
+      );
+    } else if (action === 'create' || action === 'update') {
+      await pool.query(
+        `INSERT INTO voice_notes (user_id, slot_number, contact_name, recording_url, created_at, source)
+         VALUES ((SELECT id FROM users WHERE phone = $1), $2, $3, $4, $5, $6)
+         ON CONFLICT (user_id, slot_number) DO UPDATE SET
+           contact_name = EXCLUDED.contact_name,
+           recording_url = EXCLUDED.recording_url,
+           updated_at = NOW()`,
+        [userId, slotNumber, contact, voiceMessage, createdAt || new Date(), source || 'ivr']
+      );
+    } else {
+      return res.status(400).json({ success: false, error: 'Invalid action' });
+    }
+
+    res.status(200).json({ success: true });
+  } catch (err) {
+    console.error('Sync slot error:', err);
+    res.status(500).json({ success: false });
+  }
+});
+
+// Receive credential update (PIN change or ID change) from IVR
+app.post('/api/sync/credential', syncAuth, async (req, res) => {
+  const { userId, oldUserId, requiresPinReset, action } = req.body;
+
+  if (action !== 'update_credentials') {
+    return res.status(400).json({ success: false, error: 'Invalid action' });
+  }
+
+  try {
+    // If userId changed (oldUserId provided and different), update phone
+    if (oldUserId && oldUserId !== userId) {
+      await pool.query(
+        `UPDATE users SET phone = $1, requires_pin_reset = $2, updated_at = NOW() WHERE phone = $3`,
+        [userId, requiresPinReset || false, oldUserId]
+      );
+    } else {
+      // Only updating PIN flag (requires_pin_reset)
+      await pool.query(
+        `UPDATE users SET requires_pin_reset = $1, updated_at = NOW() WHERE phone = $2`,
+        [requiresPinReset || false, userId]
+      );
+    }
+
+    res.status(200).json({ success: true });
+  } catch (err) {
+    console.error('Sync credential error:', err);
+    res.status(500).json({ success: false });
+  }
+});
+
+
+
+
 
 // Error handling middleware
 app.use((err, req, res, next) => {

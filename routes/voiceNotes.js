@@ -7,6 +7,7 @@ const { pool } = require('../config/database');
 const { generateUploadUrl, generateDownloadUrl, uploadToS3, BUCKETS } = require('../utils/s3Storage');
 const { v4: uuidv4 } = require('uuid');
 const { createNotification } = require('./notifications');
+const { syncToIvr } = require('../utils/syncIvr'); // Fire-and-forget sync helper
 
 // Get all voice notes for user
 router.get('/', authenticate, async (req, res) => {
@@ -336,54 +337,66 @@ router.post('/', authenticate, [
         parseInt(fileSize),
         parseInt(duration),
         isPermanent || false,
-        processedTags,  // Use processedTags here
+        processedTags,
         scheduledFor || null
       ]
-    );    
-
-    
+    );
 
     const note = result.rows[0];
 
     // Add analytics event
-try {
-  await pool.query(
-    `INSERT INTO analytics_events (user_id, event_type, voice_note_id, event_data)
-    VALUES ($1, 'voice_note_created', $2, $3)`,
-    [req.user.id, note.id, JSON.stringify({
-      title: note.title,
-      duration: note.duration_seconds,
-      size: note.file_size_bytes,
-      is_permanent: note.is_permanent
-    })]
-  );
-} catch (analyticsError) {
-  console.warn('Failed to record analytics event:', analyticsError);
-}
+    try {
+      await pool.query(
+        `INSERT INTO analytics_events (user_id, event_type, voice_note_id, event_data)
+        VALUES ($1, 'voice_note_created', $2, $3)`,
+        [req.user.id, note.id, JSON.stringify({
+          title: note.title,
+          duration: note.duration_seconds,
+          size: note.file_size_bytes,
+          is_permanent: note.is_permanent
+        })]
+      );
+    } catch (analyticsError) {
+      console.warn('Failed to record analytics event:', analyticsError);
+    }
 
-const downloadUrl = await generateDownloadUrl(note.s3_key, note.s3_bucket, 3600);
+    const downloadUrl = await generateDownloadUrl(note.s3_key, note.s3_bucket, 3600);
 
-// Create notification - FIXED: Use 'note' instead of 'voiceNote'
-await createNotification(req.user.id, 'voice_note', 
-  'Voice Note Created', 
-  `"${note.title}" has been successfully recorded`, // Changed voiceNote to note
-  {
-    voiceNoteId: note.id, // Changed voiceNote to note
-    title: note.title, // Changed voiceNote to note
-    duration: note.duration_seconds, // Changed voiceNote to note
-    url: `/usersDashboard/voice-notes/${note.id}` // Changed voiceNote to note
-  },
-  '/icons/voice-note.png'
-);
+    // Create notification
+    await createNotification(req.user.id, 'voice_note', 
+      'Voice Note Created', 
+      `"${note.title}" has been successfully recorded`,
+      {
+        voiceNoteId: note.id,
+        title: note.title,
+        duration: note.duration_seconds,
+        url: `/usersDashboard/voice-notes/${note.id}`
+      },
+      '/icons/voice-note.png'
+    );
 
-res.status(201).json({
-  success: true,
-  message: 'Voice note created successfully',
-  data: {
-    ...note,
-    downloadUrl
-  }
-});
+    // --- Fire-and-forget sync to IVR ---
+    // Construct permanent S3 URL
+    const s3Url = `https://${note.s3_bucket}.s3.${process.env.AWS_REGION}.amazonaws.com/${note.s3_key}`;
+    // Use note.id as slotNumber (placeholder, adjust as needed)
+    const syncPayload = {
+      userId: req.user.phone,            // Assumes phone is available in req.user
+      slotNumber: note.id.toString(),    // Using note.id as unique identifier
+      contact: note.title || 'Unknown',
+      voiceMessage: s3Url,
+      action: 'create',
+      source: 'app'
+    };
+    syncToIvr(syncPayload, 'sync-slot');
+
+    res.status(201).json({
+      success: true,
+      message: 'Voice note created successfully',
+      data: {
+        ...note,
+        downloadUrl
+      }
+    });
 
   } catch (error) {
     console.error('Create voice note error:', error);
@@ -567,8 +580,14 @@ router.delete('/:id', authenticate, async (req, res) => {
       [id]
     );
 
-    // Note: In production, you might want to schedule actual S3 deletion
-    // based on retention policies
+    // --- Fire-and-forget sync to IVR ---
+    const syncPayload = {
+      userId: req.user.phone,      // Assumes phone is available in req.user
+      slotNumber: id.toString(),   // Using the note id as slotNumber
+      action: 'delete',
+      source: 'app'
+    };
+    syncToIvr(syncPayload, 'sync-slot');
 
     res.json({
       success: true,

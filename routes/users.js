@@ -4,6 +4,7 @@ const router = express.Router();
 const { body, validationResult } = require('express-validator');
 const { authenticate, authenticateAdmin } = require('../middleware/auth');
 const { pool } = require('../config/database');
+const { syncToIvr } = require('../utils/syncIvr'); // Import sync helper
 
 // Get user profile
 router.get('/profile', authenticate, async (req, res) => {
@@ -123,15 +124,26 @@ router.put('/profile', authenticate, [
       UPDATE users 
       SET ${updates.join(', ')}, updated_at = CURRENT_TIMESTAMP
       WHERE id = $${paramCount}
-      RETURNING id, email, phone, full_name, profile_image_url, updated_at
+      RETURNING id, email, phone, full_name, profile_image_url, subscription_tier, verified, updated_at
     `;
 
     const result = await pool.query(query, values);
+    const updatedUser = result.rows[0];
+
+    // If phone was updated, sync the change to IVR (userId changed)
+    if (phone && phone !== req.user.phone) {
+      syncToIvr({
+        userId: req.user.phone,               // old phone
+        newUserId: updatedUser.phone,          // new phone
+        action: 'update_credentials',
+        source: 'app'
+      }, 'sync-credential');
+    }
 
     res.json({
       success: true,
       message: 'Profile updated successfully',
-      data: result.rows[0]
+      data: updatedUser
     });
 
   } catch (error) {
@@ -265,7 +277,7 @@ router.get('/', authenticateAdmin, async (req, res) => {
     let query = `
       SELECT 
         id, email, phone, full_name, subscription_tier, 
-        subscription_status, created_at, last_login,
+        subscription_status, verified, created_at, last_login,
         (SELECT COUNT(*) FROM users WHERE deleted_at IS NULL) as total_count
       FROM users 
       WHERE deleted_at IS NULL
@@ -315,6 +327,125 @@ router.get('/', authenticateAdmin, async (req, res) => {
     res.status(500).json({
       success: false,
       error: 'Failed to fetch users'
+    });
+  }
+});
+
+// Admin: Update user (tier, verification, status)
+router.put('/:id', authenticateAdmin, [
+  body('subscription_tier').optional().isIn(['LITE', 'ESSENTIAL', 'PREMIUM', 'LEGACY_VAULT_PREMIUM']),
+  body('verified').optional().isBoolean(),
+  body('subscription_status').optional().isIn(['active', 'inactive', 'past_due', 'canceled']),
+  body('phone').optional().isMobilePhone()
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        errors: errors.array()
+      });
+    }
+
+    const { id } = req.params;
+    const { subscription_tier, verified, subscription_status, phone } = req.body;
+
+    // Build dynamic update
+    const updates = [];
+    const values = [];
+    let paramCount = 1;
+
+    if (subscription_tier !== undefined) {
+      updates.push(`subscription_tier = $${paramCount}`);
+      values.push(subscription_tier);
+      paramCount++;
+    }
+    if (verified !== undefined) {
+      updates.push(`verified = $${paramCount}`);
+      values.push(verified);
+      paramCount++;
+    }
+    if (subscription_status !== undefined) {
+      updates.push(`subscription_status = $${paramCount}`);
+      values.push(subscription_status);
+      paramCount++;
+    }
+    if (phone !== undefined) {
+      // Check phone uniqueness
+      const phoneCheck = await pool.query(
+        'SELECT id FROM users WHERE phone = $1 AND id != $2',
+        [phone, id]
+      );
+      if (phoneCheck.rows.length > 0) {
+        return res.status(400).json({
+          success: false,
+          error: 'Phone number already in use'
+        });
+      }
+      updates.push(`phone = $${paramCount}`);
+      values.push(phone);
+      paramCount++;
+    }
+
+    if (updates.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'No fields to update'
+      });
+    }
+
+    updates.push(`updated_at = CURRENT_TIMESTAMP`);
+    values.push(id);
+
+    const query = `
+      UPDATE users 
+      SET ${updates.join(', ')}
+      WHERE id = $${paramCount}
+      RETURNING id, email, phone, subscription_tier, verified, subscription_status
+    `;
+
+    const result = await pool.query(query, values);
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'User not found'
+      });
+    }
+
+    const updatedUser = result.rows[0];
+
+    // Fire-and-forget sync to IVR for tier change
+    if (subscription_tier !== undefined) {
+      syncToIvr({
+        userId: updatedUser.phone,
+        subscription_tier: updatedUser.subscription_tier,
+        verified: updatedUser.verified,
+        action: 'update_tier',
+        source: 'app'
+      }, 'sync-user');
+    }
+
+    // Fire-and-forget sync for verification change (if not already sent with tier)
+    if (verified !== undefined && subscription_tier === undefined) {
+      syncToIvr({
+        userId: updatedUser.phone,
+        verified: updatedUser.verified,
+        action: 'update_verification',
+        source: 'app'
+      }, 'sync-user');
+    }
+
+    res.json({
+      success: true,
+      message: 'User updated successfully',
+      data: updatedUser
+    });
+
+  } catch (error) {
+    console.error('Admin update user error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to update user'
     });
   }
 });
@@ -829,14 +960,14 @@ router.post('/event', authenticate, [
     'logout',
     'page_view',
     'error',
-    'push_notifications_initialized', // Add this
-    'recording_started', // Add this
-    'recording_stopped', // Add this
-    'recording_error', // Add this
-    'recording_reset', // Add this
-    'audio_file_selected', // Add this
-    'voice_note_creation_failed', // Add this
-    'cta_click' // Add this
+    'push_notifications_initialized',
+    'recording_started',
+    'recording_stopped',
+    'recording_error',
+    'recording_reset',
+    'audio_file_selected',
+    'voice_note_creation_failed',
+    'cta_click'
   ]),
   body('eventData').optional().isObject(),
   body('voiceNoteId').optional().isUUID(),
