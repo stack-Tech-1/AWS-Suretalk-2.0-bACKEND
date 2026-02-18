@@ -220,7 +220,7 @@ app.post('/api/sync/slot', syncAuth, async (req, res) => {
     voiceMessage,     // this is the s3_key or full URL — use as unique identifier
     createdAt, 
     action, 
-    source 
+    source = 'ivr' 
   } = req.body;
 
   try {
@@ -252,29 +252,37 @@ app.post('/api/sync/slot', syncAuth, async (req, res) => {
       // Insert or update using user_id + s3_key as conflict target
       await pool.query(
         `INSERT INTO voice_notes (
-           user_id, 
+           user_id,
+           slot_number, 
            title,               -- if no title sent, use placeholder
            description,         -- optional
            s3_key, 
            s3_bucket,           -- hardcode or extract from voiceMessage if needed
+           recording_url,
            file_size_bytes,     -- optional: set to 0 or require in payload
            duration_seconds,    -- optional: set to 0            
            created_at, 
            source
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-         ON CONFLICT (user_id, s3_key) DO UPDATE SET           
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         ON CONFLICT (user_id, slot_number) DO UPDATE SET
+           title = EXCLUDED.title,
+           description = EXCLUDED.description,
+           s3_key = EXCLUDED.s3_key,
+           recording_url = EXCLUDED.recording_url,
+           source = EXCLUDED.source,
            updated_at = NOW()`,
-        [
-          dbUserId,
-          `Voice Note ${slotNumber || 'Imported'}`,  // fallback title
-          null,                                      // description
-          voiceMessage,                              // s3_key
-          'voice-notes-bucket',                      // adjust to your real bucket name
-          0,                                         // file_size_bytes (update later if needed)
-          0,                                         // duration_seconds          
-          createdAt || new Date(),
-          source || 'ivr'
-        ]
+           [
+            dbUserId,
+            slotNumber,
+            `Voice Note ${slotNumber || '(imported)'}`,            
+            voiceMessage,                             // s3_key
+            'suretalk-voicenotes-prod',               // CHANGE TO YOUR REAL BUCKET
+            voiceMessage,                             // recording_url (same as s3_key for now)
+            0,                                        // file_size_bytes
+            0,                                        // duration_seconds
+            source,
+            createdAt || new Date()
+          ]
       );
     } else {
       return res.status(400).json({ success: false, error: 'Invalid action' });
