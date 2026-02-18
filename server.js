@@ -272,16 +272,17 @@ app.post('/api/sync/slot', syncAuth, async (req, res) => {
            source = EXCLUDED.source,
            updated_at = NOW()`,
            [
-            dbUserId,
-            slotNumber,
-            `Voice Note ${slotNumber || '(imported)'}`,            
-            voiceMessage,                             // s3_key
-            'suretalk-voicenotes-prod',               // CHANGE TO YOUR REAL BUCKET
-            voiceMessage,                             // recording_url (same as s3_key for now)
-            0,                                        // file_size_bytes
-            0,                                        // duration_seconds
-            source,
-            createdAt || new Date()
+            dbUserId,                                   // $1  user_id
+            slotNumber,                                 // $2  slot_number
+            `Voice Note ${slotNumber || '(imported)'}`, // $3  title
+            null,                                       // $4  description (or an empty string if you prefer)
+            voiceMessage,                               // $5  s3_key (the S3 object key)
+            'suretalk-voicenotes-prod',                 // $6  s3_bucket
+            voiceMessage,                               // $7  recording_url (or construct a full URL)
+            0,                                          // $8  file_size_bytes
+            0,                                          // $9  duration_seconds
+            createdAt || new Date(),                    // $10 created_at
+            source                                      // $11 source
           ]
       );
     } else {
