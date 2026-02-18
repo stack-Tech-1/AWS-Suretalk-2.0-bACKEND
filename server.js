@@ -216,8 +216,7 @@ app.post('/api/sync/user', syncAuth, async (req, res) => {
 app.post('/api/sync/slot', syncAuth, async (req, res) => {
   const { 
     userId,           // phone number from IVR
-    slotNumber,       // we can log it but won't use it for uniqueness
-    contact, 
+    slotNumber,       // we can log it but won't use it for uniqueness     
     voiceMessage,     // this is the s3_key or full URL — use as unique identifier
     createdAt, 
     action, 
@@ -259,13 +258,11 @@ app.post('/api/sync/slot', syncAuth, async (req, res) => {
            s3_key, 
            s3_bucket,           -- hardcode or extract from voiceMessage if needed
            file_size_bytes,     -- optional: set to 0 or require in payload
-           duration_seconds,    -- optional: set to 0
-           contact_name, 
+           duration_seconds,    -- optional: set to 0            
            created_at, 
            source
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-         ON CONFLICT (user_id, s3_key) DO UPDATE SET
-           contact_name = EXCLUDED.contact_name,
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         ON CONFLICT (user_id, s3_key) DO UPDATE SET           
            updated_at = NOW()`,
         [
           dbUserId,
@@ -274,8 +271,7 @@ app.post('/api/sync/slot', syncAuth, async (req, res) => {
           voiceMessage,                              // s3_key
           'voice-notes-bucket',                      // adjust to your real bucket name
           0,                                         // file_size_bytes (update later if needed)
-          0,                                         // duration_seconds
-          contact || null,
+          0,                                         // duration_seconds          
           createdAt || new Date(),
           source || 'ivr'
         ]
