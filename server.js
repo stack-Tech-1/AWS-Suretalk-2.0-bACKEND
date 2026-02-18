@@ -182,24 +182,23 @@ const syncAuth = (req, res, next) => {
 
 // Receive new/updated user from IVR
 app.post('/api/sync/user', syncAuth, async (req, res) => {
-  const { userId, subscription_tier, verified, status, createdAt, action } = req.body;
+  const { userId, subscription_tier, status, createdAt, action } = req.body;
 
   try {
     if (action === 'unsubscribe') {
       await pool.query(
-        `UPDATE users SET verified = $1, subscription_status = $2, updated_at = NOW() WHERE phone = $3`,
-        [false, 'inactive', userId]
+        `UPDATE users SET subscription_status = $1, updated_at = NOW() WHERE phone = $2`,
+        ['inactive', userId]
       );
     } else if (action === 'create' || action === 'update') {
       await pool.query(
-        `INSERT INTO users (phone, subscription_tier, verified, status, created_at, source)
-         VALUES ($1, $2, $3, $4, $5, 'ivr')
+        `INSERT INTO users (phone, subscription_tier, status, created_at, source)
+         VALUES ($1, $2, $3, $4, 'ivr')
          ON CONFLICT (phone) DO UPDATE SET
            subscription_tier = EXCLUDED.subscription_tier,
-           verified = EXCLUDED.verified,
            status = EXCLUDED.status,
            updated_at = NOW()`,
-        [userId, subscription_tier || 'LITE', verified, status || 'active', createdAt || new Date()]
+        [userId, subscription_tier || 'LITE', status || 'active', createdAt || new Date()]
       );
     } else {
       return res.status(400).json({ success: false, error: 'Invalid action' });
