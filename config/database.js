@@ -2,6 +2,7 @@ const { Pool } = require('pg');
 
 // Function to get database configuration - works with or without DB_SECRET
 function getDBConfig() {
+ /*
   let dbSecret = {};
   
   // Try to parse DB_SECRET if it exists, but don't fail if it's invalid
@@ -17,7 +18,7 @@ function getDBConfig() {
   } else {
     console.log('ℹ️ DB_SECRET not set, using individual environment variables');
   }
-
+    */
   // Build config from multiple sources, with clear priority:
   // 1. Individual env vars (DB_HOST, DB_USER, etc.) - highest priority
   // 2. Parsed DB_SECRET (if valid) - medium priority
@@ -36,7 +37,7 @@ function getDBConfig() {
     console.error('❌ NO DATABASE PASSWORD FOUND!');
     console.error('   Please set either:');
     console.error('   - DB_PASSWORD environment variable');
-    console.error('   - Or a valid DB_SECRET with a password field');
+   // console.error('   - Or a valid DB_SECRET with a password field');
   }
 
   console.log('Database configuration:', {
