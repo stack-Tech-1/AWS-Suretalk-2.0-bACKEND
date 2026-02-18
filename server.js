@@ -214,23 +214,71 @@ app.post('/api/sync/user', syncAuth, async (req, res) => {
 
 // Receive new/updated slot from IVR
 app.post('/api/sync/slot', syncAuth, async (req, res) => {
-  const { userId, slotNumber, contact, voiceMessage, createdAt, action, source } = req.body;
+  const { 
+    userId,           // phone number from IVR
+    slotNumber,       // we can log it but won't use it for uniqueness
+    contact, 
+    voiceMessage,     // this is the s3_key or full URL — use as unique identifier
+    createdAt, 
+    action, 
+    source 
+  } = req.body;
 
   try {
+    // 1. Find internal user_id from phone
+    const userResult = await pool.query(
+      'SELECT id FROM users WHERE phone = $1',
+      [userId]
+    );
+
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+
+    const dbUserId = userResult.rows[0].id;
+
     if (action === 'delete') {
-      await pool.query(
-        `DELETE FROM voice_notes WHERE user_id = (SELECT id FROM users WHERE phone = $1) AND slot_number = $2`,
-        [userId, slotNumber]
+      // Delete by user_id + voiceMessage (s3_key)
+      const deleteResult = await pool.query(
+        `DELETE FROM voice_notes 
+         WHERE user_id = $1 AND s3_key = $2
+         RETURNING id`,
+        [dbUserId, voiceMessage]
       );
+
+      if (deleteResult.rowCount === 0) {
+        console.warn(`No voice note found to delete for user ${userId}, s3_key ${voiceMessage}`);
+      }
     } else if (action === 'create' || action === 'update') {
+      // Insert or update using user_id + s3_key as conflict target
       await pool.query(
-        `INSERT INTO voice_notes (user_id, slot_number, contact_name, recording_url, created_at, source)
-         VALUES ((SELECT id FROM users WHERE phone = $1), $2, $3, $4, $5, $6)
-         ON CONFLICT (user_id, slot_number) DO UPDATE SET
+        `INSERT INTO voice_notes (
+           user_id, 
+           title,               -- if no title sent, use placeholder
+           description,         -- optional
+           s3_key, 
+           s3_bucket,           -- hardcode or extract from voiceMessage if needed
+           file_size_bytes,     -- optional: set to 0 or require in payload
+           duration_seconds,    -- optional: set to 0
+           contact_name, 
+           created_at, 
+           source
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+         ON CONFLICT (user_id, s3_key) DO UPDATE SET
            contact_name = EXCLUDED.contact_name,
-           recording_url = EXCLUDED.recording_url,
            updated_at = NOW()`,
-        [userId, slotNumber, contact, voiceMessage, createdAt || new Date(), source || 'ivr']
+        [
+          dbUserId,
+          `Voice Note ${slotNumber || 'Imported'}`,  // fallback title
+          null,                                      // description
+          voiceMessage,                              // s3_key
+          'voice-notes-bucket',                      // adjust to your real bucket name
+          0,                                         // file_size_bytes (update later if needed)
+          0,                                         // duration_seconds
+          contact || null,
+          createdAt || new Date(),
+          source || 'ivr'
+        ]
       );
     } else {
       return res.status(400).json({ success: false, error: 'Invalid action' });
