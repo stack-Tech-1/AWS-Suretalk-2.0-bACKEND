@@ -9,6 +9,26 @@ const { uploadToS3 } = require('../utils/s3Storage');
 const multer = require('multer');
 //const upload = multer({ storage: multer.memoryStorage() });
 
+// Non-blocking admin audit log helper
+async function logAdminAudit({ userId, action, targetId = null, oldValue = null, newValue = null, ipAddress = null }) {
+  try {
+    await pool.query(
+      `INSERT INTO admin_audit_log (admin_user_id, action, target_id, old_value, new_value, ip_address)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [
+        userId,
+        action,
+        targetId,
+        oldValue  ? JSON.stringify(oldValue)  : null,
+        newValue  ? JSON.stringify(newValue)  : null,
+        ipAddress
+      ]
+    );
+  } catch (err) {
+    console.warn('Admin audit log failed (non-fatal):', err.message);
+  }
+}
+
 
 // Get system overview stats
 router.get('/overview', authenticateAdmin, async (req, res) => {
@@ -308,6 +328,8 @@ router.put('/users/:id', authenticateAdmin, async (req, res) => {
 
     const result = await pool.query(query, values);
 
+    logAdminAudit({ userId: req.user.id, action: 'UPDATE_USER', targetId: id, newValue: req.body, ipAddress: req.ip });
+
     res.json({
       success: true,
       message: 'User updated successfully',
@@ -450,6 +472,8 @@ router.post('/wills/:id/release', authenticateAdmin, async (req, res) => {
     // TODO: Send notifications to beneficiaries/executors
     // TODO: Provide access to the voice recording
 
+    logAdminAudit({ userId: req.user.id, action: 'RELEASE_WILL', targetId: id, oldValue: { is_released: false }, newValue: { is_released: true, releaseNotes }, ipAddress: req.ip });
+
     res.json({
       success: true,
       message: 'Voice will released successfully',
@@ -574,6 +598,8 @@ router.delete('/users/:id', authenticateAdmin, async (req, res) => {
       [req.user.id, JSON.stringify({ deletedUserId: id })]
     );
 
+    logAdminAudit({ userId: req.user.id, action: 'DELETE_USER', targetId: id, ipAddress: req.ip });
+
     res.json({
       success: true,
       message: 'User deleted successfully'
@@ -671,11 +697,13 @@ router.post('/users', authenticateAdmin, [
     await pool.query(
       `INSERT INTO system_logs (user_id, level, service, message, metadata)
        VALUES ($1, 'info', 'admin', 'User created by admin', $2)`,
-      [req.user.id, JSON.stringify({ 
+      [req.user.id, JSON.stringify({
         createdUserId: newUser.rows[0].id,
-        email: email 
+        email: email
       })]
     );
+
+    logAdminAudit({ userId: req.user.id, action: 'CREATE_USER', targetId: newUser.rows[0].id, newValue: { email, subscriptionTier, subscriptionStatus, isAdmin }, ipAddress: req.ip });
 
     // TODO: Send welcome email with temporary password if sendWelcomeEmail is true
     if (sendWelcomeEmail) {
@@ -808,13 +836,15 @@ router.post('/users/bulk-update', authenticateAdmin, [
     await pool.query(
       `INSERT INTO system_logs (user_id, level, service, message, metadata)
        VALUES ($1, 'info', 'admin', 'Bulk action performed', $2)`,
-      [req.user.id, JSON.stringify({ 
+      [req.user.id, JSON.stringify({
         action: action,
         userIds: userIds,
         data: data,
         affectedCount: result.rowCount
       })]
     );
+
+    logAdminAudit({ userId: req.user.id, action: 'BULK_UPDATE_USERS', newValue: { action, userIds, data, affectedCount: result.rowCount }, ipAddress: req.ip });
 
     res.json({
       success: true,
@@ -1838,12 +1868,14 @@ router.put('/scheduled-messages/:id/status', authenticateAdmin, [
     await pool.query(
       `INSERT INTO system_logs (user_id, level, service, message, metadata)
        VALUES ($1, 'info', 'admin', 'Scheduled message status updated', $2)`,
-      [req.user.id, JSON.stringify({ 
+      [req.user.id, JSON.stringify({
         messageId: id,
         newStatus: status,
-        notes: notes 
+        notes: notes
       })]
     );
+
+    logAdminAudit({ userId: req.user.id, action: 'UPDATE_SCHEDULED_MSG_STATUS', targetId: id, newValue: { status, notes }, ipAddress: req.ip });
 
     res.json({
       success: true,
@@ -1905,6 +1937,8 @@ router.delete('/scheduled-messages/:id', authenticateAdmin, async (req, res) => 
        VALUES ($1, 'warn', 'admin', 'Scheduled message cancelled', $2)`,
       [req.user.id, JSON.stringify({ messageId: id })]
     );
+
+    logAdminAudit({ userId: req.user.id, action: 'DELETE_SCHEDULED_MSG', targetId: id, ipAddress: req.ip });
 
     res.json({
       success: true,
@@ -2236,6 +2270,8 @@ router.post('/storage/lifecycle-rules', authenticateAdmin, [
       })]
     );
 
+    logAdminAudit({ userId: req.user.id, action: 'CREATE_LIFECYCLE_RULE', targetId: result.rows[0].id, newValue: req.body, ipAddress: req.ip });
+
     res.status(201).json({
       success: true,
       message: 'Lifecycle rule created successfully',
@@ -2387,6 +2423,8 @@ router.put('/storage/config', authenticateAdmin, [
       [req.user.id, JSON.stringify(req.body)]
     );
 
+    logAdminAudit({ userId: req.user.id, action: 'UPDATE_STORAGE_CONFIG', newValue: req.body, ipAddress: req.ip });
+
     res.json({
       success: true,
       message: 'Storage configuration updated successfully',
@@ -2518,6 +2556,8 @@ router.post('/storage/upload-report', authenticateAdmin, async (req, res) => {
         }
       }, 1000); // Simulate async processing
 
+      logAdminAudit({ userId: req.user.id, action: 'UPLOAD_STORAGE_REPORT', targetId: report.rows[0].id, newValue: { filename: originalname, mimetype, size }, ipAddress: req.ip });
+
       res.json({
         success: true,
         message: 'Report uploaded and processing started',
@@ -2606,6 +2646,8 @@ router.post('/requests/bulk-approve', authenticateAdmin, async (req, res) => {
         approvedBy: req.user.id
       })]
     );
+
+    logAdminAudit({ userId: req.user.id, action: 'BULK_APPROVE_REQUESTS', newValue: { approvedCount: result.rowCount }, ipAddress: req.ip });
 
     res.json({
       success: true,
@@ -2713,6 +2755,8 @@ router.post('/logs/clear-old', authenticateAdmin, [
         deletedCount: deletedCount
       })]
     );
+
+    logAdminAudit({ userId: req.user.id, action: 'CLEAR_OLD_LOGS', newValue: { days, deletedCount }, ipAddress: req.ip });
 
     res.json({
       success: true,
@@ -2849,6 +2893,8 @@ router.put('/settings', authenticateAdmin, [
       })]
     );
 
+    logAdminAudit({ userId: req.user.id, action: 'UPDATE_SETTINGS', newValue: { category, key, value: settingValue }, ipAddress: req.ip });
+
     res.json({
       success: true,
       message: 'Setting updated successfully',
@@ -2920,6 +2966,8 @@ router.put('/settings/bulk', authenticateAdmin, [
       })]
     );
 
+    logAdminAudit({ userId: req.user.id, action: 'BULK_UPDATE_SETTINGS', newValue: { updateCount: updates.length }, ipAddress: req.ip });
+
     res.json({
       success: true,
       message: `${updates.length} settings updated successfully`,
@@ -2968,6 +3016,8 @@ router.post('/settings/reset', authenticateAdmin, async (req, res) => {
         [setting.category, setting.key, setting.value.toString(), setting.type, req.user.id]
       );
     }
+
+    logAdminAudit({ userId: req.user.id, action: 'RESET_SETTINGS', ipAddress: req.ip });
 
     res.json({
       success: true,
@@ -3258,6 +3308,8 @@ router.post('/support/tickets/:id/respond', authenticateAdmin, [
       [id]
     );
 
+    logAdminAudit({ userId: req.user.id, action: 'RESPOND_TICKET', targetId: id, newValue: { message, isInternal }, ipAddress: req.ip });
+
     res.status(201).json({
       success: true,
       message: 'Response added successfully',
@@ -3313,6 +3365,8 @@ router.put('/support/tickets/:id/status', authenticateAdmin, [
 
     const result = await pool.query(query, values);
 
+    logAdminAudit({ userId: req.user.id, action: 'UPDATE_TICKET_STATUS', targetId: id, newValue: { status }, ipAddress: req.ip });
+
     res.json({
       success: true,
       message: `Ticket status updated to ${status}`,
@@ -3363,6 +3417,8 @@ router.put('/support/tickets/:id/assign', authenticateAdmin, [
 
     const message = adminId ? 'Ticket assigned successfully' : 'Ticket unassigned successfully';
 
+    logAdminAudit({ userId: req.user.id, action: 'ASSIGN_TICKET', targetId: id, newValue: { adminId: assignValue }, ipAddress: req.ip });
+
     res.json({
       success: true,
       message: message,
@@ -3400,6 +3456,8 @@ router.put('/support/tickets/:id/notes', authenticateAdmin, [
         error: 'Ticket not found'
       });
     }
+
+    logAdminAudit({ userId: req.user.id, action: 'UPDATE_TICKET_NOTES', targetId: id, newValue: { notes }, ipAddress: req.ip });
 
     res.json({
       success: true,
@@ -3564,6 +3622,8 @@ router.post('/support/knowledge-base', authenticateAdmin, [
       [title, content, category, tags, published, req.user.id]
     );
 
+    logAdminAudit({ userId: req.user.id, action: 'CREATE_KB_ARTICLE', targetId: article.rows[0].id, newValue: { title, category, published }, ipAddress: req.ip });
+
     res.status(201).json({
       success: true,
       message: 'Article created successfully',
@@ -3667,6 +3727,8 @@ router.put('/support/knowledge-base/:id', authenticateAdmin, [
       });
     }
 
+    logAdminAudit({ userId: req.user.id, action: 'UPDATE_KB_ARTICLE', targetId: id, newValue: req.body, ipAddress: req.ip });
+
     res.json({
       success: true,
       message: 'Article updated successfully',
@@ -3698,6 +3760,8 @@ router.delete('/support/knowledge-base/:id', authenticateAdmin, async (req, res)
         error: 'Article not found'
       });
     }
+
+    logAdminAudit({ userId: req.user.id, action: 'DELETE_KB_ARTICLE', targetId: id, ipAddress: req.ip });
 
     res.json({
       success: true,

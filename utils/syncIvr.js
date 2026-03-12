@@ -1,3 +1,6 @@
+const axios = require('axios');
+const logger = require('./logger');
+
 // Helper: Fire-and-forget sync to IVR DynamoDB via API Gateway
 const syncToIvr = async (payload, endpoint) => {
     try {
@@ -17,3 +20,5 @@ const syncToIvr = async (payload, endpoint) => {
       logger.error(`Sync to IVR failed (non-fatal): ${err.message}`);
     }
   };
+
+module.exports = { syncToIvr };

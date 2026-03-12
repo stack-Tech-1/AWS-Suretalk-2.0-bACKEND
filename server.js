@@ -9,6 +9,7 @@ const { createLogger, format, transports } = require('winston');
 const AWS = require('aws-sdk');
 const WebSocket = require('ws');
 const logger = require('./utils/logger');
+const { v4: uuidv4 } = require('uuid');
 
 const settingsRoutes = require('./routes/settings');
 const devicesRoutes = require('./routes/devices');
@@ -42,6 +43,13 @@ app.use(helmet({
 
 app.set('trust proxy', 1);
 
+// Attach a unique request ID to every request for tracing
+app.use((req, res, next) => {
+  req.requestId = uuidv4();
+  res.setHeader('X-Request-ID', req.requestId);
+  next();
+});
+
 app.use((req, res, next) => {
   if (req.method === 'OPTIONS') return next();
   next();
@@ -56,7 +64,7 @@ const corsOptions = {
   optionsSuccessStatus: 200,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
-  exposedHeaders: ['Content-Length', 'X-Request-Id']
+  exposedHeaders: ['Content-Length', 'X-Request-Id', 'X-Request-ID']
 };
 
 // Handle preflight requests explicitly
@@ -90,6 +98,13 @@ const adminSlowDown = slowDown({
   maxDelayMs: 10000
 });
 
+// Auth route slow-down: 500ms fixed delay after 50 requests per 15 minutes
+const authSlowDown = slowDown({
+  windowMs: 15 * 60 * 1000,
+  delayAfter: 50,
+  delayMs: () => 500
+});
+
 // IMPORTANT: Custom body parser that excludes webhook routes
 app.use((req, res, next) => {
   if (req.originalUrl === '/api/billing/webhook') {
@@ -97,11 +112,11 @@ app.use((req, res, next) => {
     next();
   } else {
     // Parse all other requests as JSON
-    express.json({ limit: '50mb' })(req, res, next);
+    express.json({ limit: '10mb' })(req, res, next);
   }
 });
 
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // Request logging
 app.use((req, res, next) => {
@@ -125,11 +140,13 @@ app.get('/health', (req, res) => {
 });
 
 // API Routes - IMPORTANT: Webhook route must be defined BEFORE routes that need JSON
-app.use('/api/billing', require('./routes/billing')); // This includes the webhook
+// Dedicated Stripe webhook handler — registered before billing router so it takes priority
+app.use('/api/billing/webhook', express.raw({ type: 'application/json' }), require('./routes/stripeWebhook'));
+app.use('/api/billing', require('./routes/billing'));
 
 // Other API Routes
 app.use('/api/admin/login', adminSlowDown, adminRateLimit);
-app.use('/api/auth', require('./routes/auth'));
+app.use('/api/auth', authSlowDown, require('./routes/auth'));
 app.use('/api/users', require('./routes/users'));
 app.use('/api/voice-notes', require('./routes/voiceNotes'));
 app.use('/api/contacts', require('./routes/contacts'));

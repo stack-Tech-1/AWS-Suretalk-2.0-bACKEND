@@ -8,6 +8,12 @@ const { pool } = require('../config/database');
 const { authenticate } = require('../middleware/auth');
 const tokenService = require('../utils/tokens');
 const emailService = require('../utils/emailService');
+const twilio = require('twilio');
+const { syncToIvr } = require('../utils/syncIvr');
+
+const twilioClient = process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN
+  ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
+  : null;
 
 // Validation middleware
 const validateRegister = [
@@ -811,5 +817,202 @@ router.post(
   );
   
   
+
+// ─── IVR Account Claiming Flow ───────────────────────────────────────────────
+
+const validateCheckPhone = [
+  body('phone').notEmpty().isLength({ min: 10 })
+];
+
+const validateClaimAccount = [
+  body('phone').notEmpty().isLength({ min: 10 }),
+  body('otp').notEmpty().isLength({ min: 6, max: 6 }),
+  body('fullName').notEmpty().trim(),
+  body('email').isEmail().normalizeEmail(),
+  body('password').isLength({ min: 8 })
+];
+
+// POST /api/auth/check-phone
+// Check if a phone number belongs to an IVR-created (unclaimed) user
+router.post('/check-phone', validateCheckPhone, async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, errors: errors.array() });
+    }
+
+    const { phone } = req.body;
+    const result = await pool.query(
+      'SELECT id FROM users WHERE phone = $1 AND password_hash IS NULL AND deleted_at IS NULL',
+      [phone]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'No IVR account found for this phone number'
+      });
+    }
+
+    return res.json({ success: true, exists: true, isIvrUser: true });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
+// POST /api/auth/send-claim-otp
+// Generate a 6-digit OTP, store hashed, send via Twilio SMS
+router.post('/send-claim-otp', validateCheckPhone, async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, errors: errors.array() });
+    }
+
+    if (!twilioClient) {
+      return res.status(503).json({ success: false, error: 'SMS service unavailable' });
+    }
+
+    const { phone } = req.body;
+
+    // Verify account is IVR-created before sending OTP (prevents spam)
+    const userResult = await pool.query(
+      'SELECT id FROM users WHERE phone = $1 AND password_hash IS NULL AND deleted_at IS NULL',
+      [phone]
+    );
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'No IVR account found for this phone number'
+      });
+    }
+
+    const otp = String(Math.floor(100000 + Math.random() * 900000));
+    const otpHash = await bcrypt.hash(otp, 10);
+
+    await pool.query(
+      `INSERT INTO phone_otps (phone, otp_hash, expires_at)
+       VALUES ($1, $2, NOW() + INTERVAL '10 minutes')`,
+      [phone, otpHash]
+    );
+
+    await twilioClient.messages.create({
+      body: `Your SureTalk verification code is: ${otp}. Valid for 10 minutes.`,
+      from: process.env.TWILIO_PHONE_NUMBER,
+      to: phone
+    });
+
+    return res.json({ success: true, message: 'OTP sent to your phone number' });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
+// POST /api/auth/claim-account
+// Verify OTP and complete account setup; returns JWT on success
+router.post('/claim-account', validateClaimAccount, async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, errors: errors.array() });
+    }
+
+    const { phone, otp, fullName, email, password } = req.body;
+
+    // 1. Verify user is IVR-created (unclaimed)
+    const userResult = await pool.query(
+      `SELECT id, subscription_tier, is_admin FROM users
+       WHERE phone = $1 AND password_hash IS NULL AND deleted_at IS NULL`,
+      [phone]
+    );
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'No IVR account found for this phone number'
+      });
+    }
+    const ivrUser = userResult.rows[0];
+
+    // 2. Find latest valid, unused OTP
+    const otpResult = await pool.query(
+      `SELECT id, otp_hash FROM phone_otps
+       WHERE phone = $1 AND expires_at > NOW() AND used_at IS NULL
+       ORDER BY created_at DESC LIMIT 1`,
+      [phone]
+    );
+    if (otpResult.rows.length === 0) {
+      return res.status(400).json({ success: false, error: 'OTP expired or not found' });
+    }
+    const otpRow = otpResult.rows[0];
+
+    // 3. Verify OTP
+    const otpValid = await bcrypt.compare(otp, otpRow.otp_hash);
+    if (!otpValid) {
+      return res.status(400).json({ success: false, error: 'Invalid OTP' });
+    }
+
+    // 4. Mark OTP as used
+    await pool.query('UPDATE phone_otps SET used_at = NOW() WHERE id = $1', [otpRow.id]);
+
+    // 5. Check email uniqueness
+    const emailCheck = await pool.query(
+      'SELECT id FROM users WHERE email = $1 AND id != $2',
+      [email, ivrUser.id]
+    );
+    if (emailCheck.rows.length > 0) {
+      return res.status(409).json({ success: false, error: 'Email already in use' });
+    }
+
+    // 6. Hash password and update user record
+    const passwordHash = await bcrypt.hash(password, 10);
+    const updatedUser = await pool.query(
+      `UPDATE users
+       SET full_name = $1, email = $2, password_hash = $3,
+           email_verified = TRUE, source = 'app', updated_at = NOW()
+       WHERE id = $4
+       RETURNING id, email, full_name, subscription_tier, is_admin`,
+      [fullName, email, passwordHash, ivrUser.id]
+    );
+    const user = updatedUser.rows[0];
+
+    // 7. Fire-and-forget sync to IVR DynamoDB
+    syncToIvr({ userId: user.id, email, fullName, phone, source: 'app' }, 'sync-user');
+
+    // 8. Generate JWT (same pattern as login)
+    const token = jwt.sign(
+      {
+        userId: user.id,
+        email: user.email,
+        tier: user.subscription_tier,
+        isAdmin: user.is_admin || false
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
+    );
+    const refreshToken = jwt.sign(
+      { userId: user.id },
+      process.env.JWT_REFRESH_SECRET,
+      { expiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '30d' }
+    );
+
+    return res.json({
+      success: true,
+      message: 'Account claimed successfully',
+      data: {
+        user: {
+          id: user.id,
+          email: user.email,
+          fullName: user.full_name,
+          subscriptionTier: user.subscription_tier,
+          isAdmin: user.is_admin
+        },
+        token,
+        refreshToken
+      }
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
 
 module.exports = router;

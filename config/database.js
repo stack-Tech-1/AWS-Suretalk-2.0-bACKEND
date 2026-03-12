@@ -27,9 +27,9 @@ function getDBConfig() {
   const config = {
     host: process.env.DB_HOST || 'suretalk-database-1.cbw8msgksr4u.eu-central-1.rds.amazonaws.com',
     port: Number(process.env.DB_PORT) || 5432,
-    database: process.env.DB_NAME || 'suretalk-database-1',
+    database: process.env.DB_NAME || 'suretalk-v2-Latest',
     user: process.env.DB_USER || 'postgres',
-    password: process.env.DB_PASSWORD || 'X:bQC<Oad6Ji[sveDaM1-NJ1Km)v'
+    password: process.env.DB_PASSWORD || '~)n.i*nYjsiA9(>b70IuuZDlQi2('
   };
 
   // CRITICAL: Remove any fallback password! If no password is found, it should be undefined
@@ -46,7 +46,7 @@ function getDBConfig() {
     database: config.database,
     user: config.user,
     password: config.password ? '[SET]' : '[MISSING]',
-    source: process.env.DB_PASSWORD ? 'env vars' : (dbSecret.password ? 'secret' : 'none')
+    source: process.env.DB_PASSWORD ? 'env vars' : 'none'
   });
 
   return config;
@@ -67,7 +67,7 @@ const pool = new Pool({
   },
   max: 20,
   idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 30000,
+  connectionTimeoutMillis: 2000,
   keepAlive: true,
   keepAliveInitialDelayMillis: 20000
 });

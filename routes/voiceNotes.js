@@ -16,9 +16,12 @@ router.get('/', authenticate, async (req, res) => {
     const offset = (page - 1) * limit;
 
     let query = `
-      SELECT vn.*, 
+      SELECT vn.*,
+             c.name  AS contact_name,
+             c.phone AS contact_phone,
              (SELECT COUNT(*) FROM voice_notes WHERE user_id = $1 AND deleted_at IS NULL) as total_count
       FROM voice_notes vn
+      LEFT JOIN contacts c ON vn.contact_id = c.id
       WHERE vn.user_id = $1 AND vn.deleted_at IS NULL
     `;
 
@@ -92,10 +95,13 @@ router.get('/:id', authenticate, async (req, res) => {
     const { id } = req.params;
 
     const result = await pool.query(
-      `SELECT vn.*, 
-              u.full_name as user_name
+      `SELECT vn.*,
+              u.full_name  AS user_name,
+              c.name       AS contact_name,
+              c.phone      AS contact_phone
        FROM voice_notes vn
-       LEFT JOIN users u ON vn.user_id = u.id
+       LEFT JOIN users    u ON vn.user_id    = u.id
+       LEFT JOIN contacts c ON vn.contact_id = c.id
        WHERE vn.id = $1 AND vn.user_id = $2 AND vn.deleted_at IS NULL`,
       [id, req.user.id]
     );
@@ -280,7 +286,9 @@ router.post('/', authenticate, [
   body('s3Key').notEmpty(),
   body('s3Bucket').notEmpty(),
   body('fileSize').isInt({ min: 1 }),
-  body('duration').isInt({ min: 1 })
+  body('duration').isInt({ min: 1 }),
+  body('contactId').optional().isUUID(),
+  body('contactPending').optional().isBoolean()
 ], async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -291,16 +299,18 @@ router.post('/', authenticate, [
       });
     }
 
-    const { 
-      title, 
-      description, 
-      s3Key, 
-      s3Bucket, 
-      fileSize, 
+    const {
+      title,
+      description,
+      s3Key,
+      s3Bucket,
+      fileSize,
       duration,
       tags,
       isPermanent,
-      scheduledFor 
+      scheduledFor,
+      contactId,
+      contactPending
     } = req.body;
     
     // Process tags - handle both array and string formats
@@ -321,12 +331,27 @@ router.post('/', authenticate, [
       });
     }
 
+    // Verify contactId belongs to this user (if provided)
+    if (contactId) {
+      const contactCheck = await pool.query(
+        'SELECT id FROM contacts WHERE id = $1 AND user_id = $2',
+        [contactId, req.user.id]
+      );
+      if (contactCheck.rows.length === 0) {
+        return res.status(404).json({
+          success: false,
+          error: 'Contact not found or does not belong to you'
+        });
+      }
+    }
+
     // Create voice note record
     const result = await pool.query(
       `INSERT INTO voice_notes (
         user_id, title, description, s3_key, s3_bucket,
-        file_size_bytes, duration_seconds, is_permanent, tags, scheduled_for
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        file_size_bytes, duration_seconds, is_permanent, tags, scheduled_for,
+        contact_id, contact_pending
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
       RETURNING *`,
       [
         req.user.id,
@@ -338,7 +363,9 @@ router.post('/', authenticate, [
         parseInt(duration),
         isPermanent || false,
         processedTags,
-        scheduledFor || null
+        scheduledFor || null,
+        contactId || null,
+        contactPending === true || contactPending === 'true' ? true : false
       ]
     );
 

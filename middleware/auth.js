@@ -1,6 +1,9 @@
 const jwt = require('jsonwebtoken');
 const { pool } = require('../config/database');
 
+// Module-level store for per-user rate limiting (200 req / 15 min)
+const _perUserLimits = new Map();
+
 // Authentication middleware
 const authenticate = async (req, res, next) => {
   try {
@@ -31,6 +34,20 @@ const authenticate = async (req, res, next) => {
 
     req.user = user;
     req.token = token;
+
+    // Per-user rate limit: 200 requests per 15 minutes
+    const _now = Date.now();
+    const _window = 15 * 60 * 1000;
+    let _entry = _perUserLimits.get(user.id);
+    if (!_entry || _now > _entry.resetTime) {
+      _entry = { count: 0, resetTime: _now + _window };
+      _perUserLimits.set(user.id, _entry);
+    }
+    if (_entry.count >= 200) {
+      return res.status(429).json({ success: false, error: 'Rate limit exceeded. Please try again later.' });
+    }
+    _entry.count++;
+
     next();
   } catch (error) {
     res.status(401).json({
@@ -122,7 +139,7 @@ const userRateLimit = () => {
     const userId = req.user.id;
     const now = Date.now();
     const windowMs = 15 * 60 * 1000; // 15 minutes
-    const maxRequests = 100; // Adjust based on tier
+    const maxRequests = 200;
     
     let userData = userLimits.get(userId);
     
