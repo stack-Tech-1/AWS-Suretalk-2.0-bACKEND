@@ -10,6 +10,7 @@ const tokenService = require('../utils/tokens');
 const emailService = require('../utils/emailService');
 const twilio = require('twilio');
 const { syncToIvr } = require('../utils/syncIvr');
+const { normalizeTier, TIERS } = require('../utils/tierMapping');
 
 const twilioClient = process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN
   ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
@@ -21,7 +22,7 @@ const validateRegister = [
   body('phone').notEmpty().isLength({ min: 10 }),
   body('password').isLength({ min: 8 }),
   body('fullName').notEmpty().trim(),
-  body('subscriptionTier').optional().isIn(['LITE', 'ESSENTIAL', 'PREMIUM'])
+  body('subscriptionTier').optional().isIn(['LITE', 'ESSENTIAL', 'PREMIUM', 'LEGACY_VAULT_PREMIUM'])
 ];
 
 const validateLogin = [
@@ -61,19 +62,19 @@ router.post('/register', validateRegister, async (req, res) => {
 
     // Set default limits based on tier
     let storageLimitGb, contactsLimit, voiceNotesLimit;
-    
-    switch(subscriptionTier || 'ESSENTIAL') {
-      case 'LITE':
+    const normalizedTier = normalizeTier(subscriptionTier || 'ESSENTIAL');
+    switch (normalizedTier) {
+      case TIERS.LITE:
         storageLimitGb = 1;
         contactsLimit = 3;
         voiceNotesLimit = 3;
         break;
-      case 'ESSENTIAL':
+      case TIERS.ESSENTIAL:
         storageLimitGb = 5;
         contactsLimit = 9;
         voiceNotesLimit = 100;
         break;
-      case 'LEGACY_VAULT_PREMIUM':
+      case TIERS.PREMIUM:
         storageLimitGb = 50;
         contactsLimit = 50;
         voiceNotesLimit = 1000;
@@ -95,11 +96,11 @@ router.post('/register', validateRegister, async (req, res) => {
                 storage_limit_gb, contacts_limit, voice_notes_limit,
                 created_at, email_verified`,
       [
-        email, 
-        phone, 
-        passwordHash, 
-        fullName, 
-        subscriptionTier, 
+        email,
+        phone,
+        passwordHash,
+        fullName,
+        normalizedTier,
         storageLimitGb,
         contactsLimit,
         voiceNotesLimit

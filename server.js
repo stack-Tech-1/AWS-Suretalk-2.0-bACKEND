@@ -10,6 +10,7 @@ const AWS = require('aws-sdk');
 const WebSocket = require('ws');
 const logger = require('./utils/logger');
 const { v4: uuidv4 } = require('uuid');
+const { normalizeTier } = require('./utils/tierMapping');
 
 const settingsRoutes = require('./routes/settings');
 const devicesRoutes = require('./routes/devices');
@@ -165,28 +166,6 @@ app.use('/api/auth', require('./routes/adminAuth'));
 
 
 // ==================== Sync Routes - Handle incoming payloads from IVR Lambdas ====================
-const axios = require('axios');  // Ensure axios is available
-
-/**
- * Fire-and-forget sync to IVR backend via API Gateway
- * @param {Object} payload - Data to send
- * @param {string} endpointPath - API endpoint path (e.g., 'sync-slot')
- */
-const syncToIvr = (payload, endpointPath) => {
-  const url = `${process.env.IVR_API_URL}/${endpointPath}`;
-  const headers = {
-    'Content-Type': 'application/json',
-    Authorization: `Bearer ${process.env.IVR_SYNC_TOKEN}`
-  };
-
-  axios.post(url, payload, { headers, timeout: 3000 })
-    .then(() => {
-      logger.info(`Synced to IVR: ${endpointPath}`);
-    })
-    .catch(err => {
-      logger.error(`Sync to IVR failed (non-fatal): ${err.message}`);
-    });
-};
 
 // Auth middleware for sync routes (use shared token, not user auth)
 const syncAuth = (req, res, next) => {
@@ -209,43 +188,74 @@ app.post('/api/sync/user', syncAuth, async (req, res) => {
     stripeSubscriptionId,
     subscriptionStatus
   } = req.body;
+  const normalizedTier = normalizeTier(subscription_tier);
 
   try {
+    // Audit log — record every incoming sync regardless of outcome
+    await pool.query(
+      `INSERT INTO sync_received_log (source, event_type, payload)
+       VALUES ('ivr', $1, $2)`,
+      [action || 'unknown', JSON.stringify(req.body)]
+    );
+
     if (action === 'unsubscribe') {
       await pool.query(
         `UPDATE users SET subscription_status = $1, updated_at = NOW() WHERE phone = $2`,
         ['inactive', userId]
       );
     } else if (action === 'create' || action === 'update') {
-      await pool.query(
-        `INSERT INTO users (
-            phone,
-            subscription_tier,
-            status,
-            created_at,
-            source,
-            stripe_customer_id,
-            stripe_subscription_id,
-            stripe_subscription_status
-         )
-         VALUES ($1, $2, $3, $4, 'ivr', $5, $6, $7)
-         ON CONFLICT (phone) DO UPDATE SET
-           subscription_tier = EXCLUDED.subscription_tier,
-           status = EXCLUDED.status,
-           stripe_customer_id = EXCLUDED.stripe_customer_id,
-           stripe_subscription_id = EXCLUDED.stripe_subscription_id,
-           stripe_subscription_status = EXCLUDED.stripe_subscription_status,
-           updated_at = NOW()`,
-        [
-          userId,
-          subscription_tier || 'LITE',
-          status || 'active',
-          createdAt || new Date(),
-          stripeCustomerId,
-          stripeSubscriptionId,
-          subscriptionStatus
-        ]
+      // Check if user already exists and is claimed (has password_hash set)
+      const existing = await pool.query(
+        `SELECT id, password_hash FROM users WHERE phone = $1`,
+        [userId]
       );
+
+      if (existing.rows.length > 0 && existing.rows[0].password_hash) {
+        // Claimed account — only update subscription fields, never touch name/email/password
+        await pool.query(
+          `UPDATE users
+           SET subscription_tier          = $1,
+               subscription_status        = $2,
+               stripe_customer_id         = COALESCE($3, stripe_customer_id),
+               stripe_subscription_id     = COALESCE($4, stripe_subscription_id),
+               stripe_subscription_status = COALESCE($5, stripe_subscription_status),
+               updated_at                 = NOW()
+           WHERE phone = $6`,
+          [
+            normalizedTier,
+            status || 'active',
+            stripeCustomerId,
+            stripeSubscriptionId,
+            subscriptionStatus,
+            userId
+          ]
+        );
+      } else {
+        // New or unclaimed user — full upsert
+        await pool.query(
+          `INSERT INTO users (
+              phone, subscription_tier, status, created_at,
+              source, stripe_customer_id, stripe_subscription_id, stripe_subscription_status
+           )
+           VALUES ($1, $2, $3, $4, 'ivr', $5, $6, $7)
+           ON CONFLICT (phone) DO UPDATE SET
+             subscription_tier          = EXCLUDED.subscription_tier,
+             status                     = EXCLUDED.status,
+             stripe_customer_id         = EXCLUDED.stripe_customer_id,
+             stripe_subscription_id     = EXCLUDED.stripe_subscription_id,
+             stripe_subscription_status = EXCLUDED.stripe_subscription_status,
+             updated_at                 = NOW()`,
+          [
+            userId,
+            normalizedTier,
+            status || 'active',
+            createdAt || new Date(),
+            stripeCustomerId,
+            stripeSubscriptionId,
+            subscriptionStatus
+          ]
+        );
+      }
     } else {
       return res.status(400).json({ success: false, error: 'Invalid action' });
     }
@@ -269,6 +279,13 @@ app.post('/api/sync/slot', syncAuth, async (req, res) => {
   } = req.body;
 
   try {
+    // Audit log — record every incoming sync regardless of outcome
+    await pool.query(
+      `INSERT INTO sync_received_log (source, event_type, payload)
+       VALUES ('ivr', $1, $2)`,
+      [action || 'unknown', JSON.stringify(req.body)]
+    );
+
     // 1. Find internal user_id from phone
     const userResult = await pool.query(
       'SELECT id FROM users WHERE phone = $1',
@@ -284,7 +301,7 @@ app.post('/api/sync/slot', syncAuth, async (req, res) => {
     if (action === 'delete') {
       // Delete by user_id + voiceMessage (s3_key)
       const deleteResult = await pool.query(
-        `DELETE FROM voice_notes 
+        `DELETE FROM voice_notes
          WHERE user_id = $1 AND s3_key = $2
          RETURNING id`,
         [dbUserId, voiceMessage]
@@ -294,42 +311,43 @@ app.post('/api/sync/slot', syncAuth, async (req, res) => {
         console.warn(`No voice note found to delete for user ${userId}, s3_key ${voiceMessage}`);
       }
     } else if (action === 'create' || action === 'update') {
-      // Insert or update using user_id + s3_key as conflict target
-      await pool.query(
-        `INSERT INTO voice_notes (
-           user_id,
-           slot_number, 
-           title,               -- if no title sent, use placeholder
-           description,         -- optional
-           s3_key, 
-           s3_bucket,           -- hardcode or extract from voiceMessage if needed
-           recording_url,
-           file_size_bytes,     -- optional: set to 0 or require in payload
-           duration_seconds,    -- optional: set to 0            
-           created_at, 
-           source
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-         ON CONFLICT (user_id, slot_number) DO UPDATE SET
-           title = EXCLUDED.title,
-           description = EXCLUDED.description,
-           s3_key = EXCLUDED.s3_key,
-           recording_url = EXCLUDED.recording_url,
-           source = EXCLUDED.source,
-           updated_at = NOW()`,
-           [
-            dbUserId,                                   // $1  user_id
-            slotNumber,                                 // $2  slot_number
-            `Voice Note ${slotNumber || '(imported)'}`, // $3  title
-            null,                                       // $4  description (or an empty string if you prefer)
-            voiceMessage,                               // $5  s3_key (the S3 object key)
-            'suretalk-voicenotes-prod',                 // $6  s3_bucket
-            voiceMessage,                               // $7  recording_url (or construct a full URL)
-            0,                                          // $8  file_size_bytes
-            0,                                          // $9  duration_seconds
-            createdAt || new Date(),                    // $10 created_at
-            source                                      // $11 source
-          ]
+      // Idempotency check: skip INSERT if a note with the same s3_key already exists
+      const existingNote = await pool.query(
+        `SELECT id FROM voice_notes WHERE user_id = $1 AND s3_key = $2`,
+        [dbUserId, voiceMessage]
       );
+
+      if (existingNote.rows.length > 0) {
+        console.log(`Duplicate sync-slot ignored: user ${userId}, s3_key ${voiceMessage}`);
+      } else {
+        await pool.query(
+          `INSERT INTO voice_notes (
+             user_id, slot_number, title, description,
+             s3_key, s3_bucket, recording_url,
+             file_size_bytes, duration_seconds, created_at, source
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+           ON CONFLICT (user_id, slot_number) DO UPDATE SET
+             title         = EXCLUDED.title,
+             description   = EXCLUDED.description,
+             s3_key        = EXCLUDED.s3_key,
+             recording_url = EXCLUDED.recording_url,
+             source        = EXCLUDED.source,
+             updated_at    = NOW()`,
+          [
+            dbUserId,
+            slotNumber,
+            `Voice Note ${slotNumber || '(imported)'}`,
+            null,
+            voiceMessage,
+            'suretalk-voicenotes-prod',
+            voiceMessage,
+            0,
+            0,
+            createdAt || new Date(),
+            source
+          ]
+        );
+      }
     } else {
       return res.status(400).json({ success: false, error: 'Invalid action' });
     }
@@ -420,6 +438,10 @@ if (process.env.NODE_ENV === 'production' || process.env.ENABLE_SCHEDULER === 't
   const { startScheduler } = require('./workers/messageScheduler');
   startScheduler();
   logger.info('Message scheduler started');
+
+  const { startSyncOutboxWorker } = require('./workers/syncOutboxWorker');
+  startSyncOutboxWorker();
+  logger.info('Sync outbox worker started');
 }
 
 // Start server

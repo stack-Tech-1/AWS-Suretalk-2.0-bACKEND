@@ -5,6 +5,7 @@ const { body, validationResult } = require('express-validator');
 const { authenticate, authenticateAdmin } = require('../middleware/auth');
 const { pool } = require('../config/database');
 const { syncToIvr } = require('../utils/syncIvr'); // Import sync helper
+const { ivrTierName } = require('../utils/tierMapping');
 
 // Get user profile
 router.get('/profile', authenticate, async (req, res) => {
@@ -418,7 +419,7 @@ router.put('/:id', authenticateAdmin, [
     if (subscription_tier !== undefined) {
       syncToIvr({
         userId: updatedUser.phone,
-        subscription_tier: updatedUser.subscription_tier,
+        subscription_tier: ivrTierName(updatedUser.subscription_tier),
         verified: updatedUser.verified,
         action: 'update_tier',
         source: 'app'

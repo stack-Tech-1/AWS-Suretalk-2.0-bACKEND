@@ -81,7 +81,7 @@ async function initDatabase() {
           CASE NEW.subscription_tier
             WHEN 'LITE' THEN NEW.contacts_limit := 3;
             WHEN 'ESSENTIAL' THEN NEW.contacts_limit := 9;
-            WHEN 'PREMIUM' THEN NEW.contacts_limit := 15;
+            WHEN 'LEGACY_VAULT_PREMIUM' THEN NEW.contacts_limit := 50;
             ELSE NEW.contacts_limit := 3;
           END CASE;
         END IF;

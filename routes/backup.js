@@ -8,6 +8,7 @@ const AWS = require('aws-sdk');
 const archiver = require('archiver');
 const { Readable } = require('stream');
 const encryptionService = require('../utils/encryption');
+const { TIERS } = require('../utils/tierMapping');
 
 // Initialize S3
 const s3 = new AWS.S3({
@@ -550,7 +551,7 @@ async function performBackup(userId, backupId, backupKey, type, include, encrypt
       [userId]
     );
     
-    if (userTierQuery.rows[0]?.subscription_tier === 'PREMIUM') {
+    if (userTierQuery.rows[0]?.subscription_tier === TIERS.PREMIUM) {
       const willsQuery = await pool.query(
         `SELECT id, title, description, s3_key, s3_bucket,
                 release_condition, release_date, is_released,
