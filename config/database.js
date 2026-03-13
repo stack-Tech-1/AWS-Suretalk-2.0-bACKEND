@@ -25,11 +25,11 @@ function getDBConfig() {
   // 3. Hardcoded defaults - lowest priority
   
   const config = {
-    host: process.env.DB_HOST || 'suretalk-database-1.cbw8msgksr4u.eu-central-1.rds.amazonaws.com',
-    port: Number(process.env.DB_PORT) || 5432,
-    database: process.env.DB_NAME || 'suretalk-v2-Latest',
-    user: process.env.DB_USER || 'postgres',
-    password: process.env.DB_PASSWORD || '~)n.i*nYjsiA9(>b70IuuZDlQi2('
+    host: process.env.DB_HOST,
+    port: Number(process.env.DB_PORT),
+    database: process.env.DB_NAME,
+    user: process.env.DB_USER,
+    password: process.env.DB_PASSWORD
   };
 
   // CRITICAL: Remove any fallback password! If no password is found, it should be undefined

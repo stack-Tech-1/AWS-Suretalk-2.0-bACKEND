@@ -141,8 +141,8 @@ router.post('/register', validateRegister, async (req, res) => {
           full_name: createdUser.full_name,
           email_verified: createdUser.email_verified
         },
-        // Include verification token for development/testing
-        ...(process.env.NODE_ENV === 'development' && { 
+        // Include verification token for production/testing
+        ...(process.env.NODE_ENV === 'production' && { 
           verificationToken 
         })
       }
@@ -904,7 +904,8 @@ router.post('/send-claim-otp', validateCheckPhone, async (req, res) => {
 
     return res.json({ success: true, message: 'OTP sent to your phone number' });
   } catch (err) {
-    return res.status(500).json({ success: false, error: 'Server error' });
+    console.error('send-claim-otp error:', err);
+    return res.status(500).json({ success: false, error: err.message, stack: process.env.NODE_ENV !== 'production' ? err.stack : undefined });
   }
 });
 

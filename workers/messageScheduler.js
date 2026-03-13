@@ -27,24 +27,50 @@ const processScheduledMessages = async () => {
     await client.query('BEGIN');
 
     const now = new Date();
-    const messages = await client.query(
-      `SELECT sm.*, vn.title as voice_note_title, vn.s3_key, vn.s3_bucket,
-              u.full_name as sender_name, u.email as sender_email,
-              c.name as recipient_name
-       FROM scheduled_messages sm
-       JOIN voice_notes vn ON sm.voice_note_id = vn.id
-       JOIN users u ON sm.user_id = u.id
-       LEFT JOIN contacts c ON sm.recipient_contact_id = c.id
-       WHERE sm.delivery_status = 'scheduled'
-         AND sm.scheduled_for <= $1
-         AND sm.delivery_attempts < 3
+
+    // Step 1: Lock only scheduled_messages rows — no JOINs allowed with FOR UPDATE SKIP LOCKED
+    const lockedRows = await client.query(
+      `SELECT id, voice_note_id, user_id, recipient_contact_id,
+              recipient_email, delivery_method, custom_message,
+              delivery_attempts
+       FROM scheduled_messages
+       WHERE delivery_status = 'scheduled'
+         AND scheduled_for <= $1
+         AND delivery_attempts < 3
        FOR UPDATE SKIP LOCKED
        LIMIT 50`,
       [now]
     );
 
-    for (const message of messages.rows) {
+    for (const sm of lockedRows.rows) {
       try {
+        // Step 2: Fetch enrichment data using IDs from the locked row
+        const detailResult = await client.query(
+          `SELECT vn.title as voice_note_title, vn.s3_key, vn.s3_bucket,
+                  u.full_name as sender_name, u.email as sender_email,
+                  c.name as recipient_name
+           FROM voice_notes vn
+           JOIN users u ON u.id = $2
+           LEFT JOIN contacts c ON c.id = $3
+           WHERE vn.id = $1`,
+          [sm.voice_note_id, sm.user_id, sm.recipient_contact_id]
+        );
+
+        if (detailResult.rows.length === 0) {
+          await client.query(
+            `UPDATE scheduled_messages
+             SET delivery_attempts = delivery_attempts + 1,
+                 last_attempt_at = $1,
+                 error_message = 'Voice note or user not found',
+                 updated_at = $1
+             WHERE id = $2`,
+            [now, sm.id]
+          );
+          continue;
+        }
+
+        const message = { ...sm, ...detailResult.rows[0] };
+
         const downloadUrl = await generateDownloadUrl(
           message.s3_key,
           message.s3_bucket,
@@ -92,12 +118,12 @@ const processScheduledMessages = async () => {
           );
         }
       } catch (error) {
-        console.error(`Error processing message ${message.id}:`, error);
+        console.error(`Error processing message ${sm.id}:`, error);
       }
     }
 
     await client.query('COMMIT');
-    console.log(`Processed ${messages.rows.length} scheduled messages`);
+    console.log(`Processed ${lockedRows.rows.length} scheduled messages`);
 
   } catch (error) {
     await client.query('ROLLBACK');
