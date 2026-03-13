@@ -359,6 +359,82 @@ app.post('/api/sync/slot', syncAuth, async (req, res) => {
   }
 });
 
+// Receive voice will creation/deletion from IVR
+app.post('/api/sync/will', syncAuth, async (req, res) => {
+  const {
+    userId,           // phone number from IVR
+    willSlotNumber,   // will slot number
+    voiceMessage,     // S3 key or recording SID
+    contact,          // contact phone number
+    action,           // 'create' or 'delete'
+    createdAt,
+    source = 'ivr'
+  } = req.body;
+
+  if (!userId || !action) {
+    return res.status(400).json({ success: false, error: 'Missing userId or action' });
+  }
+
+  try {
+    // 1. Find the user by phone number
+    const userResult = await pool.query(
+      'SELECT id FROM users WHERE phone = $1',
+      [userId]
+    );
+
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+
+    const dbUserId = userResult.rows[0].id;
+
+    if (action === 'create' || action === 'update') {
+      // Check if will already exists (idempotency)
+      const existing = await pool.query(
+        `SELECT id FROM voice_wills 
+         WHERE user_id = $1 AND will_slot_number = $2 AND deleted_at IS NULL`,
+        [dbUserId, willSlotNumber]
+      );
+
+      if (existing.rows.length > 0) {
+        // Already exists — update it instead
+        await pool.query(
+          `UPDATE voice_wills 
+           SET s3_key = $1, contact_phone = $2, updated_at = NOW()
+           WHERE user_id = $3 AND will_slot_number = $4 AND deleted_at IS NULL`,
+          [voiceMessage, contact, dbUserId, willSlotNumber]
+        );
+      } else {
+        // Insert new will
+        await pool.query(
+          `INSERT INTO voice_wills 
+            (user_id, will_slot_number, s3_key, contact_phone, source, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6)
+           ON CONFLICT DO NOTHING`,
+          [dbUserId, willSlotNumber, voiceMessage, contact, source, createdAt || new Date()]
+        );
+      }
+
+    } else if (action === 'delete') {
+      await pool.query(
+        `UPDATE voice_wills 
+         SET deleted_at = NOW() 
+         WHERE user_id = $1 AND will_slot_number = $2`,
+        [dbUserId, willSlotNumber]
+      );
+
+    } else {
+      return res.status(400).json({ success: false, error: 'Invalid action' });
+    }
+
+    res.status(200).json({ success: true });
+
+  } catch (err) {
+    console.error('Sync will error:', err);
+    res.status(500).json({ success: false, error: 'Internal error' });
+  }
+});
+
 // Receive credential update (PIN change or ID change) from IVR
 app.post('/api/sync/credential', syncAuth, async (req, res) => {
   const { userId, oldUserId, requiresPinReset, action } = req.body;
