@@ -10,7 +10,7 @@
         "db:migrate-limits": "node scripts/updateUserLimits.js",
         "db:add-notifications": "node scripts/addNotificationsTables.js",
         "db:migrate-Db": "node scripts/migrateDatabase.js",
-        "db:migrate-otps": "node scripts/runMigration.js",
+        "db:migrate-otps": "node scripts/runMigration.js 002_phone_otps_table.sql",
         "db:reset": "node scripts/resetDatabase.js",
         "db:seed": "node scripts/seed.js",
         "setup": "npm run db:init && npm run db:seed",

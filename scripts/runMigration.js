@@ -3,7 +3,13 @@ const fs   = require('fs');
 const path = require('path');
 const { pool } = require('../config/database');
 
-const MIGRATION_FILE = path.join(__dirname, 'migrations', '002_phone_otps_table.sql');
+const filename = process.argv[2];
+if (!filename) {
+  console.error('Usage: node scripts/runMigration.js <migration-filename.sql>');
+  process.exit(1);
+}
+
+const MIGRATION_FILE = path.join(__dirname, 'migrations', filename);
 
 async function runMigration() {
   const sql = fs.readFileSync(MIGRATION_FILE, 'utf8');

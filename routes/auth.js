@@ -896,11 +896,22 @@ router.post('/send-claim-otp', validateCheckPhone, async (req, res) => {
       [phone, otpHash]
     );
 
-    await twilioClient.messages.create({
-      body: `Your SureTalk verification code is: ${otp}. Valid for 10 minutes.`,
-      from: process.env.TWILIO_PHONE_NUMBER,
-      to: phone
-    });
+    // NOTE: If this times out in production, the App Runner service needs outbound internet access
+    // — check VPC NAT Gateway or App Runner network settings.
+    try {
+      await twilioClient.messages.create({
+        body: `Your SureTalk verification code is: ${otp}. Valid for 10 minutes.`,
+        from: process.env.TWILIO_PHONE_NUMBER,
+        to: phone
+      });
+    } catch (twilioErr) {
+      const connectivityCodes = ['ECONNABORTED', 'ECONNREFUSED', 'ETIMEDOUT'];
+      if (connectivityCodes.includes(twilioErr.code)) {
+        console.error('Twilio connectivity error:', twilioErr.code, twilioErr.message);
+        return res.status(503).json({ success: false, error: 'SMS gateway unreachable. Please contact support.' });
+      }
+      throw twilioErr;
+    }
 
     return res.json({ success: true, message: 'OTP sent to your phone number' });
   } catch (err) {
