@@ -7,54 +7,15 @@ const { pool } = require('../config/database');
 const {
   generateUploadUrl,
   generateDownloadUrl,
+  deleteFromS3,
   BUCKETS
 } = require('../utils/s3Storage');
 const { syncToIvr } = require('../utils/syncIvr');
-const { syncRecordingToTwilio } = require('../utils/twilioMediaSync');
-
-// Resolve the best available audio URL for a voice will
-async function resolveWillAudioUrl(will) {
-  // Priority 1: Use twilio_recording_sid if available and synced
-  if (will.twilio_recording_sid && will.twilio_sync_status === 'synced') {
-    const accountSid = process.env.TWILIO_ACCOUNT_SID;
-    const authToken = process.env.TWILIO_AUTH_TOKEN;
-    if (accountSid && authToken) {
-      return `https://${accountSid}:${authToken}@api.twilio.com/2010-04-01/Accounts/${accountSid}/Recordings/${will.twilio_recording_sid}.mp3`;
-    }
-  }
-
-  // Priority 2: s3_key looks like a Twilio SID (starts with RE and is ~34 chars)
-  // This handles wills where the IVR sent the SID as the voiceMessage
-  if (will.s3_key && will.s3_key.startsWith('RE') && will.s3_key.length > 30 && !will.s3_bucket) {
-    const accountSid = process.env.TWILIO_ACCOUNT_SID;
-    const authToken = process.env.TWILIO_AUTH_TOKEN;
-    if (accountSid && authToken) {
-      // Self-heal: migrate misplaced SID to the correct column
-      pool.query(
-        `UPDATE voice_wills SET twilio_recording_sid = $1, twilio_sync_status = 'synced' WHERE id = $2 AND twilio_recording_sid IS NULL`,
-        [will.s3_key, will.id]
-      ).catch(err => console.warn('Could not migrate SID for will', will.id, err.message));
-
-      return `https://${accountSid}:${authToken}@api.twilio.com/2010-04-01/Accounts/${accountSid}/Recordings/${will.s3_key}.mp3`;
-    }
-  }
-
-  // Priority 3: Proper S3 key with a bucket — generate signed URL
-  if (will.s3_key && will.s3_bucket) {
-    try {
-      return await generateDownloadUrl(will.s3_key, will.s3_bucket, 3600);
-    } catch (err) {
-      console.warn(`Could not generate S3 URL for will ${will.id}:`, err.message);
-    }
-  }
-
-  // Priority 4: s3_key is already a full URL
-  if (will.s3_key && will.s3_key.startsWith('https://')) {
-    return will.s3_key;
-  }
-
-  return null;
-}
+const { resolveIvrPlaybackUrl } = require('../utils/resolveAudioUrl');
+const Twilio = require('twilio');
+const twilioClient = process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN
+  ? new Twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
+  : null;
 
 // Get all vault items (permanent voice notes)
 router.get('/', authenticate, validateTier('LEGACY_VAULT_PREMIUM'), async (req, res) => {
@@ -151,7 +112,21 @@ router.get('/wills', authenticate, validateTier('LEGACY_VAULT_PREMIUM'), async (
     // Generate download URLs and get beneficiary names
     const willsWithDetails = await Promise.all(
       result.rows.map(async (will) => {
-        const downloadUrl = await resolveWillAudioUrl(will);
+        let downloadUrl = null;
+        const ivrPlaybackUrl = resolveIvrPlaybackUrl(will);
+
+        try {
+          const source = will.source || 'app';
+          if (source === 'ivr') {
+            const sid = will.twilio_recording_sid ||
+              (will.s3_key?.startsWith('RE') && !will.s3_key?.includes('/') ? will.s3_key : null);
+            if (sid) downloadUrl = `${process.env.EC2_STREAM_URL || 'https://test-api.suretalknow.com'}/api/stream-recording/${sid}`;
+          } else if (will.s3_key && will.s3_bucket) {
+            downloadUrl = await generateDownloadUrl(will.s3_key, will.s3_bucket, 3600);
+          }
+        } catch (err) {
+          console.warn('Could not resolve audio URL for will', will.id, err.message);
+        }
 
         // Get beneficiary names
         let beneficiaryNames = [];
@@ -166,6 +141,9 @@ router.get('/wills', authenticate, validateTier('LEGACY_VAULT_PREMIUM'), async (
         return {
           ...will,
           downloadUrl,
+          ivrPlaybackUrl,
+          has_audio: !!downloadUrl,
+          source: will.source || 'app',
           canDownload: !will.is_released,
           beneficiaryNames,
           isEncrypted: true
@@ -249,29 +227,26 @@ router.post('/wills', authenticate, validateTier('LEGACY_VAULT_PREMIUM'), [
     );
 
     const will = result.rows[0];
-    const downloadUrl = await resolveWillAudioUrl(will);
+    const ivrPlaybackUrl = resolveIvrPlaybackUrl(will);
 
     // --- Fire-and-forget sync to IVR ---
-    const s3Url = `https://${will.s3_bucket}.s3.${process.env.AWS_REGION}.amazonaws.com/${will.s3_key}`;
     syncToIvr({
       userId: req.user.phone,
-      willSlotNumber: will.id.toString(),
-      contact: will.title || 'Unknown',
-      voiceMessage: s3Url,
-      recordingSid: will.twilio_recording_sid || null,
+      willSlotNumber: will.will_slot_number?.toString() || will.id.toString(),
+      contact: will.contact_phone || will.title || 'Unknown',
+      voiceMessage: ivrPlaybackUrl,
       action: 'create',
       source: 'app'
     }, 'sync-will');
-
-    // --- Fire-and-forget Twilio SID registration ---
-    syncRecordingToTwilio(will.id, s3Url, req.user.phone, 'voice_wills');
 
     res.status(201).json({
       success: true,
       message: 'Voice will created successfully',
       data: {
         ...will,
-        downloadUrl,
+        ivrPlaybackUrl,
+        has_audio: !!ivrPlaybackUrl,
+        source: will.source || 'app',
         canDownload: false // Wills cannot be downloaded by creator
       }
     });
@@ -534,6 +509,101 @@ router.get('/scheduled-messages', authenticate, validateTier('LEGACY_VAULT_PREMI
       success: false,
       error: 'Failed to fetch scheduled messages'
     });
+  }
+});
+
+// Get single voice will
+router.get('/wills/:id', authenticate, async (req, res) => {
+  try {
+    const willResult = await pool.query(
+      'SELECT * FROM voice_wills WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL',
+      [req.params.id, req.user.id]
+    );
+
+    if (!willResult.rows.length) {
+      return res.status(404).json({ success: false, error: 'Not found' });
+    }
+
+    const will = willResult.rows[0];
+    let downloadUrl = null;
+    const ivrPlaybackUrl = resolveIvrPlaybackUrl(will);
+
+    try {
+      const source = will.source || 'app';
+      if (source === 'ivr') {
+        const sid = will.twilio_recording_sid ||
+          (will.s3_key?.startsWith('RE') && !will.s3_key?.includes('/') ? will.s3_key : null);
+        if (sid) downloadUrl = `${process.env.EC2_STREAM_URL || 'https://test-api.suretalknow.com'}/api/stream-recording/${sid}`;
+      } else if (will.s3_key && will.s3_bucket) {
+        downloadUrl = await generateDownloadUrl(will.s3_key, will.s3_bucket, 3600);
+      }
+    } catch (err) {
+      console.warn('Could not resolve audio URL for will', will.id, err.message);
+    }
+
+    res.json({
+      success: true,
+      data: {
+        ...will,
+        downloadUrl,
+        ivrPlaybackUrl,
+        has_audio: !!downloadUrl,
+        source: will.source || 'app'
+      }
+    });
+
+  } catch (error) {
+    console.error('Get voice will error:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch voice will' });
+  }
+});
+
+// Delete voice will
+router.delete('/wills/:id', authenticate, async (req, res) => {
+  try {
+    const willResult = await pool.query(
+      'SELECT * FROM voice_wills WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL',
+      [req.params.id, req.user.id]
+    );
+
+    if (!willResult.rows.length) {
+      return res.status(404).json({ success: false, error: 'Not found' });
+    }
+
+    const will = willResult.rows[0];
+
+    // Soft delete in database
+    await pool.query('UPDATE voice_wills SET deleted_at = NOW() WHERE id = $1', [will.id]);
+
+    // Fire-and-forget: sync delete to IVR
+    syncToIvr({
+      userId: req.user.phone,
+      willSlotNumber: will.will_slot_number?.toString() || will.id.toString(),
+      action: 'delete',
+      source: 'app'
+    }, 'sync-will');
+
+    // Fire-and-forget: delete from Twilio if IVR recording
+    if (will.source === 'ivr' && twilioClient) {
+      const sid = will.twilio_recording_sid ||
+        (will.s3_key?.startsWith('RE') && !will.s3_key?.includes('/') ? will.s3_key : null);
+      if (sid) {
+        twilioClient.recordings(sid).remove()
+          .catch(err => console.warn('Twilio delete failed for', sid, err.message));
+      }
+    }
+
+    // Fire-and-forget: delete from S3 if app recording
+    if (will.source !== 'ivr' && will.s3_key && will.s3_bucket) {
+      deleteFromS3(will.s3_key, will.s3_bucket)
+        .catch(err => console.warn('S3 delete failed for will', will.id, err.message));
+    }
+
+    res.json({ success: true, message: 'Voice will deleted' });
+
+  } catch (error) {
+    console.error('Delete voice will error:', error);
+    res.status(500).json({ success: false, error: 'Failed to delete voice will' });
   }
 });
 

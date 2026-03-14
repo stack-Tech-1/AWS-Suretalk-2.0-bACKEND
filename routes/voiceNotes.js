@@ -4,11 +4,15 @@ const router = express.Router();
 const { body, validationResult } = require('express-validator');
 const { authenticate, validateTier, recordAnalyticsEvent } = require('../middleware/auth');
 const { pool } = require('../config/database');
-const { generateUploadUrl, generateDownloadUrl, uploadToS3, BUCKETS } = require('../utils/s3Storage');
+const { generateUploadUrl, generateDownloadUrl, deleteFromS3, uploadToS3, BUCKETS } = require('../utils/s3Storage');
 const { v4: uuidv4 } = require('uuid');
 const { createNotification } = require('./notifications');
-const { syncToIvr } = require('../utils/syncIvr'); // Fire-and-forget sync helper
-const { syncRecordingToTwilio } = require('../utils/twilioMediaSync');
+const { syncToIvr } = require('../utils/syncIvr');
+const { resolveIvrPlaybackUrl } = require('../utils/resolveAudioUrl');
+const Twilio = require('twilio');
+const twilioClient = process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN
+  ? new Twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
+  : null;
 
 // Get all voice notes for user
 router.get('/', authenticate, async (req, res) => {
@@ -404,20 +408,14 @@ router.post('/', authenticate, [
     );
 
     // --- Fire-and-forget sync to IVR ---
-    const s3Url = `https://${note.s3_bucket}.s3.${process.env.AWS_REGION}.amazonaws.com/${note.s3_key}`;
-    const syncPayload = {
+    syncToIvr({
       userId: req.user.phone,
       slotNumber: note.id.toString(),
       contact: note.title || 'Unknown',
-      voiceMessage: s3Url,
-      recordingSid: note.twilio_recording_sid || null, // null on creation; populated later by retry worker
+      voiceMessage: resolveIvrPlaybackUrl(note),
       action: 'create',
       source: 'app'
-    };
-    syncToIvr(syncPayload, 'sync-slot');
-
-    // --- Fire-and-forget Twilio SID registration ---
-    syncRecordingToTwilio(note.id, s3Url, req.user.phone);
+    }, 'sync-slot');
 
     res.status(201).json({
       success: true,
@@ -593,7 +591,7 @@ router.delete('/:id', authenticate, async (req, res) => {
 
     // Check ownership
     const ownershipCheck = await pool.query(
-      'SELECT id, s3_key, s3_bucket FROM voice_notes WHERE id = $1 AND user_id = $2',
+      'SELECT id, s3_key, s3_bucket, source, twilio_recording_sid FROM voice_notes WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL',
       [id, req.user.id]
     );
 
@@ -604,20 +602,38 @@ router.delete('/:id', authenticate, async (req, res) => {
       });
     }
 
+    const note = ownershipCheck.rows[0];
+
     // Soft delete
     await pool.query(
       'UPDATE voice_notes SET deleted_at = CURRENT_TIMESTAMP WHERE id = $1',
       [id]
     );
 
-    // --- Fire-and-forget sync to IVR ---
-    const syncPayload = {
-      userId: req.user.phone,      // Assumes phone is available in req.user
-      slotNumber: id.toString(),   // Using the note id as slotNumber
+    // Fire-and-forget: sync delete to IVR
+    syncToIvr({
+      userId: req.user.phone,
+      voiceMessage: note.s3_key,
+      slotNumber: id.toString(),
       action: 'delete',
       source: 'app'
-    };
-    syncToIvr(syncPayload, 'sync-slot');
+    }, 'sync-slot');
+
+    // Fire-and-forget: delete from Twilio if IVR recording
+    if (note.source === 'ivr' && twilioClient) {
+      const sid = note.twilio_recording_sid ||
+        (note.s3_key?.startsWith('RE') && !note.s3_key?.includes('/') ? note.s3_key : null);
+      if (sid) {
+        twilioClient.recordings(sid).remove()
+          .catch(err => console.warn('Twilio delete failed', sid, err.message));
+      }
+    }
+
+    // Fire-and-forget: delete from S3 if app recording
+    if (note.source === 'app' && note.s3_key && note.s3_bucket) {
+      deleteFromS3(note.s3_key, note.s3_bucket)
+        .catch(err => console.warn('S3 delete failed for note', note.id, err.message));
+    }
 
     res.json({
       success: true,

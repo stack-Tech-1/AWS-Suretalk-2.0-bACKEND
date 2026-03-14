@@ -389,29 +389,61 @@ app.post('/api/sync/will', syncAuth, async (req, res) => {
     const dbUserId = userResult.rows[0].id;
 
     if (action === 'create' || action === 'update') {
+      // Detect whether voiceMessage is a Twilio Recording SID or a URL/S3 key
+      const isTwilioSid = voiceMessage &&
+        typeof voiceMessage === 'string' &&
+        voiceMessage.startsWith('RE') &&
+        voiceMessage.length > 30 &&
+        !voiceMessage.includes('/') &&
+        !voiceMessage.includes('http');
+
+      const s3KeyValue            = isTwilioSid ? null : (voiceMessage || null);
+      const twilioRecordingSid    = isTwilioSid ? voiceMessage : null;
+      const twilioSyncStatus      = isTwilioSid ? 'synced' : 'pending';
+
+      // One-time self-heal: migrate any existing rows where SID was stored in s3_key
+      pool.query(`
+        UPDATE voice_wills
+        SET twilio_recording_sid = s3_key,
+            s3_key = null,
+            twilio_sync_status = 'synced'
+        WHERE s3_key LIKE 'RE%'
+          AND length(s3_key) > 30
+          AND s3_key NOT LIKE '%/%'
+          AND s3_key NOT LIKE 'http%'
+          AND twilio_recording_sid IS NULL
+          AND deleted_at IS NULL
+      `).catch(err => console.warn('SID migration:', err.message));
+
       // Check if will already exists (idempotency)
       const existing = await pool.query(
-        `SELECT id FROM voice_wills 
+        `SELECT id FROM voice_wills
          WHERE user_id = $1 AND will_slot_number = $2 AND deleted_at IS NULL`,
         [dbUserId, willSlotNumber]
       );
 
       if (existing.rows.length > 0) {
-        // Already exists — update it instead
+        // Already exists — update it
         await pool.query(
-          `UPDATE voice_wills 
-           SET s3_key = $1, contact_phone = $2, updated_at = NOW()
-           WHERE user_id = $3 AND will_slot_number = $4 AND deleted_at IS NULL`,
-          [voiceMessage, contact, dbUserId, willSlotNumber]
+          `UPDATE voice_wills
+           SET s3_key = $1,
+               twilio_recording_sid = $2,
+               twilio_sync_status = $3,
+               contact_phone = $4,
+               updated_at = NOW()
+           WHERE user_id = $5 AND will_slot_number = $6 AND deleted_at IS NULL`,
+          [s3KeyValue, twilioRecordingSid, twilioSyncStatus, contact, dbUserId, willSlotNumber]
         );
       } else {
         // Insert new will
         await pool.query(
-          `INSERT INTO voice_wills 
-            (user_id, will_slot_number, s3_key, contact_phone, source, created_at)
-           VALUES ($1, $2, $3, $4, $5, $6)
+          `INSERT INTO voice_wills
+            (user_id, will_slot_number, s3_key, twilio_recording_sid, twilio_sync_status,
+             contact_phone, source, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
            ON CONFLICT DO NOTHING`,
-          [dbUserId, willSlotNumber, voiceMessage, contact, source, createdAt || new Date()]
+          [dbUserId, willSlotNumber, s3KeyValue, twilioRecordingSid, twilioSyncStatus,
+           contact, source, createdAt || new Date()]
         );
       }
 

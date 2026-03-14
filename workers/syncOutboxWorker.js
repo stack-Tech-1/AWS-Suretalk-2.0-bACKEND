@@ -1,7 +1,6 @@
 const axios = require('axios');
 const { pool } = require('../config/database');
 const logger = require('../utils/logger');
-const { syncRecordingToTwilio } = require('../utils/twilioMediaSync');
 
 const MAX_ATTEMPTS = 5;
 const POLL_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
@@ -83,45 +82,8 @@ const processOutbox = async () => {
 };
 
 const processTwilioSync = async () => {
-  const fetchAndSync = async (tableName) => {
-    const { rows } = await pool.query(
-      `SELECT id, s3_key, s3_bucket
-       FROM ${tableName}
-       WHERE twilio_sync_status IN ('pending', 'failed')
-         AND twilio_sync_attempts < $1
-       ORDER BY created_at ASC
-       LIMIT 20`,
-      [TWILIO_MAX_ATTEMPTS]
-    );
-    for (const row of rows) {
-      const s3Url = `https://${row.s3_bucket}.s3.${process.env.AWS_REGION}.amazonaws.com/${row.s3_key}`;
-      await syncRecordingToTwilio(row.id, s3Url, null, tableName);
-    }
-    return rows.length;
-  };
-
-  try {
-    const [notesResult, willsResult] = await Promise.allSettled([
-      fetchAndSync('voice_notes'),
-      fetchAndSync('voice_wills')
-    ]);
-
-    const notesCount = notesResult.status === 'fulfilled' ? notesResult.value : 0;
-    const willsCount = willsResult.status === 'fulfilled' ? willsResult.value : 0;
-
-    if (notesResult.status === 'rejected') {
-      logger.error('twilio_sync: voice_notes batch failed:', notesResult.reason?.message);
-    }
-    if (willsResult.status === 'rejected') {
-      logger.error('twilio_sync: voice_wills batch failed:', willsResult.reason?.message);
-    }
-
-    if (notesCount + willsCount > 0) {
-      logger.info(`twilio_sync: processed ${notesCount} voice_note(s), ${willsCount} voice_will(s)`);
-    }
-  } catch (err) {
-    logger.error('twilio_sync worker error:', err.message);
-  }
+  // Disabled: app recordings use S3 directly, no Twilio SID needed
+  return;
 };
 
 const startSyncOutboxWorker = () => {
