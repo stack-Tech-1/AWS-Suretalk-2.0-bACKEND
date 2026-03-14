@@ -3,7 +3,11 @@
 const { pool } = require('../config/database');
 
 const nodemailer = require('nodemailer');
-// const twilio = require('twilio'); // omit for now
+const Twilio = require('twilio');
+
+const twilioClient = process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN
+  ? new Twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
+  : null;
 const { generateDownloadUrl } = require('../utils/s3Storage');
 const logger = require('../utils/logger');
 
@@ -47,8 +51,9 @@ const processScheduledMessages = async () => {
         // Step 2: Fetch enrichment data using IDs from the locked row
         const detailResult = await client.query(
           `SELECT vn.title as voice_note_title, vn.s3_key, vn.s3_bucket,
+                  vn.twilio_recording_sid,
                   u.full_name as sender_name, u.email as sender_email,
-                  c.name as recipient_name
+                  c.name as recipient_name, c.phone as recipient_phone
            FROM voice_notes vn
            JOIN users u ON u.id = $2
            LEFT JOIN contacts c ON c.id = $3
@@ -78,6 +83,8 @@ const processScheduledMessages = async () => {
         );
 
         let deliverySuccess = false;
+        let twilioCallSid = null;
+        let twilioMessageSid = null;
 
         if (message.recipient_email && message.delivery_method.includes('email')) {
           try {
@@ -94,17 +101,55 @@ const processScheduledMessages = async () => {
           }
         }
 
-        // You can re-add SMS later if needed
+        // Twilio call + SMS delivery
+        if (
+          twilioClient &&
+          message.recipient_phone &&
+          (message.delivery_method === 'sms' || message.delivery_method === 'both')
+        ) {
+          try {
+            const recordingUrl = message.twilio_recording_sid
+              ? `https://${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}@api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_ACCOUNT_SID}/Recordings/${message.twilio_recording_sid}.mp3`
+              : downloadUrl;
+
+            const twiml = `<Response><Say>You have a voice message from ${message.sender_name}.</Say><Play>${recordingUrl}</Play></Response>`;
+
+            const call = await twilioClient.calls.create({
+              twiml,
+              to: message.recipient_phone,
+              from: process.env.TWILIO_PHONE_NUMBER
+            });
+            twilioCallSid = call.sid;
+
+            const sms = await twilioClient.messages.create({
+              body: `You have a voice message from ${message.sender_name}. Listen anytime: ${process.env.FRONTEND_URL}/messages/${message.id}`,
+              to: message.recipient_phone,
+              from: process.env.TWILIO_PHONE_NUMBER
+            });
+            twilioMessageSid = sms.sid;
+
+            deliverySuccess = true;
+            logger.info(`Twilio delivery succeeded for message ${message.id}: call=${twilioCallSid}, sms=${twilioMessageSid}`);
+          } catch (twilioError) {
+            logger.error(`Twilio delivery failed for message ${message.id}:`, twilioError.message);
+          }
+        } else if (message.delivery_method === 'sms' || message.delivery_method === 'both') {
+          if (!twilioClient) {
+            logger.warn(`Twilio not configured — skipping call/SMS for message ${message.id}`);
+          }
+        }
 
         if (deliverySuccess) {
           await client.query(
-            `UPDATE scheduled_messages 
+            `UPDATE scheduled_messages
              SET delivery_status = 'delivered',
                  delivered_at = $1,
                  delivery_attempts = delivery_attempts + 1,
+                 twilio_call_sid = $3,
+                 twilio_message_sid = $4,
                  updated_at = $1
              WHERE id = $2`,
-            [now, message.id]
+            [now, message.id, twilioCallSid, twilioMessageSid]
           );
         } else {
           await client.query(

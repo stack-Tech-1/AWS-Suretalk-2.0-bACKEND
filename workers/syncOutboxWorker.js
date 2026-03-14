@@ -1,9 +1,12 @@
 const axios = require('axios');
 const { pool } = require('../config/database');
 const logger = require('../utils/logger');
+const { syncRecordingToTwilio } = require('../utils/twilioMediaSync');
 
 const MAX_ATTEMPTS = 5;
 const POLL_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
+const TWILIO_RETRY_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+const TWILIO_MAX_ATTEMPTS = 5;
 
 const processOutbox = async () => {
   const client = await pool.connect();
@@ -79,10 +82,57 @@ const processOutbox = async () => {
   }
 };
 
+const processTwilioSync = async () => {
+  const fetchAndSync = async (tableName) => {
+    const { rows } = await pool.query(
+      `SELECT id, s3_key, s3_bucket
+       FROM ${tableName}
+       WHERE twilio_sync_status IN ('pending', 'failed')
+         AND twilio_sync_attempts < $1
+       ORDER BY created_at ASC
+       LIMIT 20`,
+      [TWILIO_MAX_ATTEMPTS]
+    );
+    for (const row of rows) {
+      const s3Url = `https://${row.s3_bucket}.s3.${process.env.AWS_REGION}.amazonaws.com/${row.s3_key}`;
+      await syncRecordingToTwilio(row.id, s3Url, null, tableName);
+    }
+    return rows.length;
+  };
+
+  try {
+    const [notesResult, willsResult] = await Promise.allSettled([
+      fetchAndSync('voice_notes'),
+      fetchAndSync('voice_wills')
+    ]);
+
+    const notesCount = notesResult.status === 'fulfilled' ? notesResult.value : 0;
+    const willsCount = willsResult.status === 'fulfilled' ? willsResult.value : 0;
+
+    if (notesResult.status === 'rejected') {
+      logger.error('twilio_sync: voice_notes batch failed:', notesResult.reason?.message);
+    }
+    if (willsResult.status === 'rejected') {
+      logger.error('twilio_sync: voice_wills batch failed:', willsResult.reason?.message);
+    }
+
+    if (notesCount + willsCount > 0) {
+      logger.info(`twilio_sync: processed ${notesCount} voice_note(s), ${willsCount} voice_will(s)`);
+    }
+  } catch (err) {
+    logger.error('twilio_sync worker error:', err.message);
+  }
+};
+
 const startSyncOutboxWorker = () => {
   logger.info('Sync outbox worker started');
   setInterval(processOutbox, POLL_INTERVAL_MS);
   processOutbox(); // run immediately on startup
+
+  // Twilio SID retry worker — runs every 5 minutes
+  setInterval(processTwilioSync, TWILIO_RETRY_INTERVAL_MS);
+  processTwilioSync(); // run immediately on startup
+  logger.info('Twilio SID sync worker started (5-minute interval)');
 };
 
-module.exports = { startSyncOutboxWorker, processOutbox };
+module.exports = { startSyncOutboxWorker, processOutbox, processTwilioSync };

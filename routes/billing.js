@@ -5,6 +5,7 @@ const { body, validationResult } = require('express-validator');
 const { authenticate } = require('../middleware/auth');
 const { pool } = require('../config/database');
 const Stripe = require('stripe');
+const { normalizeTier } = require('../utils/tierMapping');
 
 // Initialize Stripe
 const stripe = process.env.STRIPE_SECRET_KEY 
@@ -140,7 +141,7 @@ router.get('/subscription', authenticate, async (req, res) => {
     res.json({
       success: true,
       data: {
-        currentTier: user.subscription_tier,
+        currentTier: normalizeTier(user.subscription_tier),
         status: user.subscription_status,
         limits: {
           storageGb: user.storage_limit_gb,

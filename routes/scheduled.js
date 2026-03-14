@@ -491,8 +491,9 @@ router.get('/stats', authenticate, async (req, res) => {
         COUNT(CASE WHEN delivery_status = 'failed' THEN 1 END) as failed,
         COUNT(CASE WHEN delivery_status = 'cancelled' THEN 1 END) as cancelled,
         COUNT(CASE WHEN delivery_method = 'phone' THEN 1 END) as phone_messages,
-        COUNT(CASE WHEN delivery_method = 'email' THEN 1 END) as email_messages
-       FROM scheduled_messages 
+        COUNT(CASE WHEN delivery_method = 'email' THEN 1 END) as email_messages,
+        COUNT(CASE WHEN twilio_call_sid IS NOT NULL THEN 1 END) as twilio_delivered
+       FROM scheduled_messages
        WHERE user_id = $1`,
       [req.user.id]
     );

@@ -1430,7 +1430,11 @@ router.post('/register-request', authenticate, [
       res.json({
         success: true,
         data: {
-          requests: result.rows,
+          requests: result.rows.map(r => ({
+            ...r,
+            status: r.admin_status,
+            reason: r.admin_reason
+          })),
           pagination: {
             page: parseInt(page),
             limit: parseInt(limit),

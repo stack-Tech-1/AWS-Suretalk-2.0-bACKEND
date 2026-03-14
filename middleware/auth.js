@@ -1,5 +1,6 @@
 const jwt = require('jsonwebtoken');
 const { pool } = require('../config/database');
+const { normalizeTier } = require('../utils/tierMapping');
 
 // Module-level store for per-user rate limiting (200 req / 15 min)
 const _perUserLimits = new Map();
@@ -26,7 +27,8 @@ const authenticate = async (req, res, next) => {
     }
 
     const user = userQuery.rows[0];
-    
+    user.subscription_tier = normalizeTier(user.subscription_tier);
+
     // Check subscription status
     if (user.subscription_status !== 'active') {
       throw new Error('Subscription not active');
@@ -101,7 +103,8 @@ const validateTier = (requiredTier) => async (req, res, next) => {
     // Define tier hierarchy
     const tierHierarchy = {
       'LITE': 1,
-      'ESSENTIAL': 2,      
+      'ESSENTIAL': 2,
+      'PREMIUM': 3,
       'LEGACY_VAULT_PREMIUM': 3
     };
 

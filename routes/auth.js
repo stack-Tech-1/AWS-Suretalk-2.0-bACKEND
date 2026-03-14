@@ -252,6 +252,7 @@ router.post('/login', validateLogin, async (req, res) => {
 
     // Remove password hash from response
     const { password_hash, ...userWithoutPassword } = user;
+    userWithoutPassword.subscription_tier = normalizeTier(userWithoutPassword.subscription_tier);
 
     res.json({
       success: true,
@@ -605,7 +606,7 @@ router.post('/forgot-password', [
 
     // Check if user exists
     const userQuery = await pool.query(
-      'SELECT id, email FROM users WHERE email = $1 AND deleted_at IS NULL',
+      'SELECT id, email, full_name FROM users WHERE email = $1 AND deleted_at IS NULL',
       [email]
     );
 
@@ -626,17 +627,21 @@ router.post('/forgot-password', [
       { expiresIn: '1h' }
     );
 
-    // TODO: Send email with reset link
-    // For now, return token (in production, send email)
     const resetLink = `${process.env.FRONTEND_URL}/reset-password?token=${resetToken}`;
 
-    console.log(`Password reset link for ${email}: ${resetLink}`);
+    try {
+      await emailService.sendPasswordResetEmail(user.email, resetLink, user.full_name);
+    } catch (emailErr) {
+      console.error('Failed to send password reset email:', emailErr);
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to send password reset email'
+      });
+    }
 
     res.json({
       success: true,
-      message: 'Password reset link sent to email',
-      // Remove in production - for development only
-      data: { resetLink }
+      message: 'If an account exists with this email, a reset link has been sent'
     });
 
   } catch (error) {
@@ -721,11 +726,13 @@ router.get('/profile', authenticate, async (req, res) => {
         });
       }
   
+      const userData = userQuery.rows[0];
+      userData.subscription_tier = normalizeTier(userData.subscription_tier);
       res.json({
         success: true,
-        data: userQuery.rows[0]
+        data: userData
       });
-  
+
     } catch (error) {
       console.error('Profile error:', error);
       res.status(500).json({

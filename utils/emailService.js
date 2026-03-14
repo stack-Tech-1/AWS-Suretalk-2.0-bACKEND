@@ -110,6 +110,97 @@ class EmailService {
     `;
   }
 
+  async sendPasswordResetEmail(toEmail, resetLink, userName) {
+    try {
+      const params = {
+        Destination: { ToAddresses: [toEmail] },
+        Message: {
+          Body: {
+            Html: {
+              Charset: 'UTF-8',
+              Data: this.getPasswordResetEmailHtml(userName, resetLink, toEmail)
+            },
+            Text: {
+              Charset: 'UTF-8',
+              Data: this.getPasswordResetEmailText(userName, resetLink)
+            }
+          },
+          Subject: {
+            Charset: 'UTF-8',
+            Data: 'Reset Your SureTalk Password'
+          }
+        },
+        Source: this.fromEmail
+      };
+
+      const result = await this.ses.sendEmail(params).promise();
+      logger.info(`Password reset email sent to ${toEmail}: ${result.MessageId}`);
+      return result;
+    } catch (error) {
+      logger.error('Failed to send password reset email:', error);
+      throw error;
+    }
+  }
+
+  getPasswordResetEmailHtml(userName, resetLink, toEmail) {
+    return `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="UTF-8">
+        <style>
+          body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
+          .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+          .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 30px; text-align: center; color: white; }
+          .content { padding: 30px; background: #f9f9f9; }
+          .button { display: inline-block; padding: 12px 30px; background: #667eea; color: white; text-decoration: none; border-radius: 5px; font-weight: bold; }
+          .footer { text-align: center; padding: 20px; color: #666; font-size: 12px; }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <div class="header">
+            <h1>Reset Your Password</h1>
+          </div>
+          <div class="content">
+            <h2>Hi ${userName},</h2>
+            <p>We received a request to reset your SureTalk password. Click the button below to choose a new password:</p>
+            <p style="text-align: center; margin: 30px 0;">
+              <a href="${resetLink}" class="button">Reset Password</a>
+            </p>
+            <p>Or copy and paste this link into your browser:</p>
+            <p style="word-break: break-all; color: #666;">${resetLink}</p>
+            <p>This link will expire in 1 hour.</p>
+            <p>If you did not request a password reset, you can safely ignore this email. Your password will not be changed.</p>
+          </div>
+          <div class="footer">
+            <p>© ${new Date().getFullYear()} SureTalk. All rights reserved.</p>
+            <p>This email was sent to ${toEmail}</p>
+          </div>
+        </div>
+      </body>
+      </html>
+    `;
+  }
+
+  getPasswordResetEmailText(userName, resetLink) {
+    return `
+      Reset Your SureTalk Password
+
+      Hi ${userName},
+
+      We received a request to reset your SureTalk password. Use the link below to choose a new password:
+
+      ${resetLink}
+
+      This link will expire in 1 hour.
+
+      If you did not request a password reset, you can safely ignore this email.
+
+      © ${new Date().getFullYear()} SureTalk. All rights reserved.
+    `;
+  }
+
   async sendWelcomeEmail(toEmail, userName) {
     // Optional: Send welcome email after verification
     try {

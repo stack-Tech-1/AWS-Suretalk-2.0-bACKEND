@@ -5,7 +5,7 @@ const { body, validationResult } = require('express-validator');
 const { authenticate, authenticateAdmin } = require('../middleware/auth');
 const { pool } = require('../config/database');
 const { syncToIvr } = require('../utils/syncIvr'); // Import sync helper
-const { ivrTierName } = require('../utils/tierMapping');
+const { ivrTierName, normalizeTier } = require('../utils/tierMapping');
 
 // Get user profile
 router.get('/profile', authenticate, async (req, res) => {
@@ -41,10 +41,12 @@ router.get('/profile', authenticate, async (req, res) => {
       [req.user.id]
     );
 
+    const userRow = userQuery.rows[0];
+    userRow.subscription_tier = normalizeTier(userRow.subscription_tier);
     res.json({
       success: true,
       data: {
-        ...userQuery.rows[0],
+        ...userRow,
         usage: {
           ...usageQuery.rows[0],
           ...contactsQuery.rows[0]
@@ -190,10 +192,21 @@ router.get('/stats', authenticate, async (req, res) => {
       [req.user.id]
     );
 
+    const s = statsQuery.rows[0];
     res.json({
       success: true,
       data: {
-        stats: statsQuery.rows[0],
+        // Admin-compatible top-level fields (0 for fields not applicable to regular users)
+        users: 0,
+        wills: parseInt(s.wills_total) || 0,
+        scheduledMessages: {
+          total: parseInt(s.scheduled_messages_total) || 0,
+          scheduled: 0
+        },
+        pendingRequests: 0,
+        systemLogs: 0,
+        // Original keys preserved for non-admin hook compatibility
+        stats: s,
         recentActivity: {
           voiceNotes: recentNotes.rows,
           scheduledMessages: recentScheduled.rows
@@ -241,7 +254,7 @@ router.get('/limits', authenticate, async (req, res) => {
     res.json({
       success: true,
       data: {
-        tier: user.subscription_tier,
+        tier: normalizeTier(user.subscription_tier),
         limits: {
           storage: {
             current: usage.storage_bytes,

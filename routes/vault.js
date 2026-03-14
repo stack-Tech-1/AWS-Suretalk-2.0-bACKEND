@@ -4,11 +4,13 @@ const router = express.Router();
 const { body, validationResult } = require('express-validator');
 const { authenticate, validateTier } = require('../middleware/auth');
 const { pool } = require('../config/database');
-const { 
-  generateUploadUrl, 
+const {
+  generateUploadUrl,
   generateDownloadUrl,
-  BUCKETS 
+  BUCKETS
 } = require('../utils/s3Storage');
+const { syncToIvr } = require('../utils/syncIvr');
+const { syncRecordingToTwilio } = require('../utils/twilioMediaSync');
 
 // Get all vault items (permanent voice notes)
 router.get('/', authenticate, validateTier('LEGACY_VAULT_PREMIUM'), async (req, res) => {
@@ -208,6 +210,21 @@ router.post('/wills', authenticate, validateTier('LEGACY_VAULT_PREMIUM'), [
 
     const will = result.rows[0];
     const downloadUrl = await generateDownloadUrl(will.s3_key, will.s3_bucket, 3600);
+
+    // --- Fire-and-forget sync to IVR ---
+    const s3Url = `https://${will.s3_bucket}.s3.${process.env.AWS_REGION}.amazonaws.com/${will.s3_key}`;
+    syncToIvr({
+      userId: req.user.phone,
+      willSlotNumber: will.id.toString(),
+      contact: will.title || 'Unknown',
+      voiceMessage: s3Url,
+      recordingSid: will.twilio_recording_sid || null,
+      action: 'create',
+      source: 'app'
+    }, 'sync-will');
+
+    // --- Fire-and-forget Twilio SID registration ---
+    syncRecordingToTwilio(will.id, s3Url, req.user.phone, 'voice_wills');
 
     res.status(201).json({
       success: true,

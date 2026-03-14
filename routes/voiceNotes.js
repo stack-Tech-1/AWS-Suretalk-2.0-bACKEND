@@ -8,6 +8,7 @@ const { generateUploadUrl, generateDownloadUrl, uploadToS3, BUCKETS } = require(
 const { v4: uuidv4 } = require('uuid');
 const { createNotification } = require('./notifications');
 const { syncToIvr } = require('../utils/syncIvr'); // Fire-and-forget sync helper
+const { syncRecordingToTwilio } = require('../utils/twilioMediaSync');
 
 // Get all voice notes for user
 router.get('/', authenticate, async (req, res) => {
@@ -70,7 +71,7 @@ router.get('/', authenticate, async (req, res) => {
     res.json({
       success: true,
       data: {
-        notes: notesWithUrls,
+        voiceNotes: notesWithUrls,
         pagination: {
           page: parseInt(page),
           limit: parseInt(limit),
@@ -403,18 +404,20 @@ router.post('/', authenticate, [
     );
 
     // --- Fire-and-forget sync to IVR ---
-    // Construct permanent S3 URL
     const s3Url = `https://${note.s3_bucket}.s3.${process.env.AWS_REGION}.amazonaws.com/${note.s3_key}`;
-    // Use note.id as slotNumber (placeholder, adjust as needed)
     const syncPayload = {
-      userId: req.user.phone,            // Assumes phone is available in req.user
-      slotNumber: note.id.toString(),    // Using note.id as unique identifier
+      userId: req.user.phone,
+      slotNumber: note.id.toString(),
       contact: note.title || 'Unknown',
       voiceMessage: s3Url,
+      recordingSid: note.twilio_recording_sid || null, // null on creation; populated later by retry worker
       action: 'create',
       source: 'app'
     };
     syncToIvr(syncPayload, 'sync-slot');
+
+    // --- Fire-and-forget Twilio SID registration ---
+    syncRecordingToTwilio(note.id, s3Url, req.user.phone);
 
     res.status(201).json({
       success: true,
