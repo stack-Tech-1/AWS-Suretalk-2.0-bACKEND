@@ -120,7 +120,7 @@ router.get('/wills', authenticate, validateTier('LEGACY_VAULT_PREMIUM'), async (
           if (source === 'ivr') {
             const sid = will.twilio_recording_sid ||
               (will.s3_key?.startsWith('RE') && !will.s3_key?.includes('/') ? will.s3_key : null);
-            if (sid) downloadUrl = `${process.env.EC2_STREAM_URL || 'https://test-api.suretalknow.com'}/api/stream-recording/${sid}`;
+            if (sid) downloadUrl = `/audio/recording/${sid}`;
           } else if (will.s3_key && will.s3_bucket) {
             downloadUrl = await generateDownloadUrl(will.s3_key, will.s3_bucket, 3600);
           }
@@ -533,7 +533,7 @@ router.get('/wills/:id', authenticate, async (req, res) => {
       if (source === 'ivr') {
         const sid = will.twilio_recording_sid ||
           (will.s3_key?.startsWith('RE') && !will.s3_key?.includes('/') ? will.s3_key : null);
-        if (sid) downloadUrl = `${process.env.EC2_STREAM_URL || 'https://test-api.suretalknow.com'}/api/stream-recording/${sid}`;
+        if (sid) downloadUrl = `/audio/recording/${sid}`;
       } else if (will.s3_key && will.s3_bucket) {
         downloadUrl = await generateDownloadUrl(will.s3_key, will.s3_bucket, 3600);
       }
