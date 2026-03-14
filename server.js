@@ -519,7 +519,7 @@ app.post('/api/sync/credential', syncAuth, async (req, res) => {
 
 
 // Proxy Twilio recording stream (for IVR recordings)
-app.get('/api/audio/recording/:recordingSid', authenticate, async (req, res) => {
+app.get('/api/audio/recording/:recordingSid', async (req, res) => {
   const { recordingSid } = req.params;
 
   if (!recordingSid || !recordingSid.startsWith('RE')) {
@@ -546,7 +546,7 @@ app.get('/api/audio/recording/:recordingSid', authenticate, async (req, res) => 
 });
 
 // Proxy S3 recording stream (for app recordings)
-app.get('/api/audio/s3/:s3Key(*)', authenticate, async (req, res) => {
+app.get('/api/audio/s3/:s3Key(*)', async (req, res) => {
   const { s3Key } = req.params;
 
   if (!s3Key) {
