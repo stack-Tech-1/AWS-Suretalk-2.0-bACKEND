@@ -1,4 +1,4 @@
-const EC2_BASE_URL = process.env.EC2_STREAM_URL || 'https://test-api.suretalknow.com';
+const EC2_BASE_URL = process.env.EC2_STREAM_URL || 'https://tbmvpkvtm2.eu-central-1.awsapprunner.com';
 
 function resolveAudioUrl(record) {
   const source = record.source || 'app';
@@ -29,7 +29,7 @@ function resolveAudioUrl(record) {
 function resolveIvrPlaybackUrl(record) {
   // URL suitable for use in Twilio <Play> tags — must be publicly accessible
   const source = record.source || 'app';
-  const EC2 = process.env.EC2_STREAM_URL || 'https://test-api.suretalknow.com';
+  const EC2 = process.env.EC2_STREAM_URL || 'https://tbmvpkvtm2.eu-central-1.awsapprunner.com';
 
   if (source === 'ivr') {
     const sid = record.twilio_recording_sid ||
