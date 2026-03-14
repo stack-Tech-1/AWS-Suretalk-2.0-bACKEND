@@ -13,7 +13,7 @@ const { v4: uuidv4 } = require('uuid');
 const { normalizeTier } = require('./utils/tierMapping');
 const axios = require('axios');
 const { authenticate } = require('./middleware/auth');
-const EC2_STREAM_URL = process.env.EC2_STREAM_URL || 'https://tbmvpkvtm2.eu-central-1.awsapprunner.com';
+const EC2_STREAM_URL = process.env.EC2_STREAM_URL || 'https://test-api.suretalknow.com';
 
 const settingsRoutes = require('./routes/settings');
 const devicesRoutes = require('./routes/devices');
