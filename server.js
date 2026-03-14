@@ -62,7 +62,7 @@ app.use((req, res, next) => {
 // CORS configuration
 const corsOptions = {
   origin: process.env.NODE_ENV === 'production'
-    ? ['https://suretalk.com', 'https://www.suretalk.com', 'https://admin.suretalk.com', process.env.FRONTEND_URL].filter(Boolean)
+    ? ['https://suretalk.com', 'https://www.suretalk.com', 'https://test-api.suretalknow.com', 'https://admin.suretalk.com', process.env.FRONTEND_URL].filter(Boolean)
     : ['http://localhost:3000', 'http://localhost:3001'],
   credentials: true,
   optionsSuccessStatus: 200,
