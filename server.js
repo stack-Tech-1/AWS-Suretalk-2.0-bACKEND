@@ -40,9 +40,23 @@ app.use(helmet({
       defaultSrc: ["'self'"],
       styleSrc: ["'self'", "'unsafe-inline'"],
       scriptSrc: ["'self'"],
-      imgSrc: ["'self'", "data:", "https:"]
+      imgSrc: ["'self'", "data:", "https:"],
+      mediaSrc: [
+        "'self'",
+        "https://test-api.suretalknow.com",
+        "https://*.amazonaws.com",
+        "blob:"
+      ],
+      connectSrc: [
+        "'self'",
+        "https://test-api.suretalknow.com",
+        "https://*.amazonaws.com",
+        "wss://tbmvpkvtm2.eu-central-1.awsapprunner.com"
+      ]
     }
-  }
+  },
+  crossOriginResourcePolicy: { policy: "cross-origin" },
+  crossOriginEmbedderPolicy: false
 }));
 
 app.set('trust proxy', 1);
