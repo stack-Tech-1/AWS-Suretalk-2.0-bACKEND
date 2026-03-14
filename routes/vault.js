@@ -12,6 +12,50 @@ const {
 const { syncToIvr } = require('../utils/syncIvr');
 const { syncRecordingToTwilio } = require('../utils/twilioMediaSync');
 
+// Resolve the best available audio URL for a voice will
+async function resolveWillAudioUrl(will) {
+  // Priority 1: Use twilio_recording_sid if available and synced
+  if (will.twilio_recording_sid && will.twilio_sync_status === 'synced') {
+    const accountSid = process.env.TWILIO_ACCOUNT_SID;
+    const authToken = process.env.TWILIO_AUTH_TOKEN;
+    if (accountSid && authToken) {
+      return `https://${accountSid}:${authToken}@api.twilio.com/2010-04-01/Accounts/${accountSid}/Recordings/${will.twilio_recording_sid}.mp3`;
+    }
+  }
+
+  // Priority 2: s3_key looks like a Twilio SID (starts with RE and is ~34 chars)
+  // This handles wills where the IVR sent the SID as the voiceMessage
+  if (will.s3_key && will.s3_key.startsWith('RE') && will.s3_key.length > 30 && !will.s3_bucket) {
+    const accountSid = process.env.TWILIO_ACCOUNT_SID;
+    const authToken = process.env.TWILIO_AUTH_TOKEN;
+    if (accountSid && authToken) {
+      // Self-heal: migrate misplaced SID to the correct column
+      pool.query(
+        `UPDATE voice_wills SET twilio_recording_sid = $1, twilio_sync_status = 'synced' WHERE id = $2 AND twilio_recording_sid IS NULL`,
+        [will.s3_key, will.id]
+      ).catch(err => console.warn('Could not migrate SID for will', will.id, err.message));
+
+      return `https://${accountSid}:${authToken}@api.twilio.com/2010-04-01/Accounts/${accountSid}/Recordings/${will.s3_key}.mp3`;
+    }
+  }
+
+  // Priority 3: Proper S3 key with a bucket — generate signed URL
+  if (will.s3_key && will.s3_bucket) {
+    try {
+      return await generateDownloadUrl(will.s3_key, will.s3_bucket, 3600);
+    } catch (err) {
+      console.warn(`Could not generate S3 URL for will ${will.id}:`, err.message);
+    }
+  }
+
+  // Priority 4: s3_key is already a full URL
+  if (will.s3_key && will.s3_key.startsWith('https://')) {
+    return will.s3_key;
+  }
+
+  return null;
+}
+
 // Get all vault items (permanent voice notes)
 router.get('/', authenticate, validateTier('LEGACY_VAULT_PREMIUM'), async (req, res) => {
   try {
@@ -107,11 +151,7 @@ router.get('/wills', authenticate, validateTier('LEGACY_VAULT_PREMIUM'), async (
     // Generate download URLs and get beneficiary names
     const willsWithDetails = await Promise.all(
       result.rows.map(async (will) => {
-        const downloadUrl = await generateDownloadUrl(
-          will.s3_key,
-          will.s3_bucket,
-          3600
-        );
+        const downloadUrl = await resolveWillAudioUrl(will);
 
         // Get beneficiary names
         let beneficiaryNames = [];
@@ -209,7 +249,7 @@ router.post('/wills', authenticate, validateTier('LEGACY_VAULT_PREMIUM'), [
     );
 
     const will = result.rows[0];
-    const downloadUrl = await generateDownloadUrl(will.s3_key, will.s3_bucket, 3600);
+    const downloadUrl = await resolveWillAudioUrl(will);
 
     // --- Fire-and-forget sync to IVR ---
     const s3Url = `https://${will.s3_bucket}.s3.${process.env.AWS_REGION}.amazonaws.com/${will.s3_key}`;
