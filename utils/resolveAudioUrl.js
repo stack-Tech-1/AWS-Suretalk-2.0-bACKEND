@@ -46,4 +46,24 @@ function resolveIvrPlaybackUrl(record) {
   return null;
 }
 
-module.exports = { resolveAudioUrl, resolveIvrPlaybackUrl };
+function resolveAppPlaybackUrl(record) {
+  // Relative path for use in the frontend audio player.
+  // Frontend prepends the API base URL (e.g. http://localhost:5000/api).
+  const source = record.source || 'app';
+
+  if (source === 'ivr') {
+    const sid = record.twilio_recording_sid ||
+      (record.s3_key?.startsWith('RE') && record.s3_key?.length > 30 && !record.s3_key?.includes('/')
+        ? record.s3_key
+        : null);
+    if (sid) return `/audio/recording/${sid}`;
+  }
+
+  if (record.s3_key) {
+    return `/audio/s3/${record.s3_key}`;
+  }
+
+  return null;
+}
+
+module.exports = { resolveAudioUrl, resolveIvrPlaybackUrl, resolveAppPlaybackUrl };

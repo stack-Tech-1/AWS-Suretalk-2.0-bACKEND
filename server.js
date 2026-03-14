@@ -11,6 +11,9 @@ const WebSocket = require('ws');
 const logger = require('./utils/logger');
 const { v4: uuidv4 } = require('uuid');
 const { normalizeTier } = require('./utils/tierMapping');
+const axios = require('axios');
+const { authenticate } = require('./middleware/auth');
+const EC2_STREAM_URL = process.env.EC2_STREAM_URL || 'https://test-api.suretalknow.com';
 
 const settingsRoutes = require('./routes/settings');
 const devicesRoutes = require('./routes/devices');
@@ -500,6 +503,60 @@ app.post('/api/sync/credential', syncAuth, async (req, res) => {
 
 
 
+
+// Proxy Twilio recording stream (for IVR recordings)
+app.get('/api/audio/recording/:recordingSid', authenticate, async (req, res) => {
+  const { recordingSid } = req.params;
+
+  if (!recordingSid || !recordingSid.startsWith('RE')) {
+    return res.status(400).json({ error: 'Invalid recording SID' });
+  }
+
+  try {
+    const response = await axios({
+      method: 'GET',
+      url: `${EC2_STREAM_URL}/api/stream-recording/${recordingSid}`,
+      responseType: 'stream',
+      timeout: 30000
+    });
+
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Accept-Ranges', 'bytes');
+    response.data.pipe(res);
+
+  } catch (error) {
+    console.error('Audio proxy error:', error.message);
+    res.status(500).json({ error: 'Failed to stream recording' });
+  }
+});
+
+// Proxy S3 recording stream (for app recordings)
+app.get('/api/audio/s3/:s3Key(*)', authenticate, async (req, res) => {
+  const { s3Key } = req.params;
+
+  if (!s3Key) {
+    return res.status(400).json({ error: 'Missing S3 key' });
+  }
+
+  try {
+    const response = await axios({
+      method: 'GET',
+      url: `${EC2_STREAM_URL}/api/stream-s3-recording/${s3Key}`,
+      responseType: 'stream',
+      timeout: 30000
+    });
+
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Accept-Ranges', 'bytes');
+    response.data.pipe(res);
+
+  } catch (error) {
+    console.error('S3 audio proxy error:', error.message);
+    res.status(500).json({ error: 'Failed to stream recording' });
+  }
+});
 
 // Error handling middleware
 app.use((err, req, res, next) => {
