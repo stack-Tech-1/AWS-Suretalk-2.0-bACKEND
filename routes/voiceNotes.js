@@ -58,12 +58,14 @@ router.get('/', authenticate, async (req, res) => {
     // Generate download URLs for each note
     const notesWithUrls = await Promise.all(
       result.rows.map(async (note) => {
+        if (!note.s3_key || !note.s3_bucket || note.s3_key.startsWith('RE')) {
+          return { ...note, downloadUrl: null, canDownload: false };
+        }
         const downloadUrl = await generateDownloadUrl(
           note.s3_key,
           note.s3_bucket,
           3600 // 1 hour expiry
         );
-        
         return {
           ...note,
           downloadUrl,
@@ -355,8 +357,8 @@ router.post('/', authenticate, [
       `INSERT INTO voice_notes (
         user_id, title, description, s3_key, s3_bucket,
         file_size_bytes, duration_seconds, is_permanent, tags, scheduled_for,
-        contact_id, contact_pending
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        contact_id, contact_pending, source
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
       RETURNING *`,
       [
         req.user.id,
@@ -370,7 +372,8 @@ router.post('/', authenticate, [
         processedTags,
         scheduledFor || null,
         contactId || null,
-        contactPending === true || contactPending === 'true' ? true : false
+        contactPending === true || contactPending === 'true' ? true : false,
+        'app'
       ]
     );
 
