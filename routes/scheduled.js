@@ -73,18 +73,20 @@ router.get('/', authenticate, async (req, res) => {
     // Generate download URLs for voice notes
     const messagesWithUrls = await Promise.all(
       result.rows.map(async (message) => {
-        if (message.voice_note_id) {
-          const downloadUrl = await generateDownloadUrl(
-            message.s3_key,
-            message.s3_bucket,
-            3600
-          );
-          return {
-            ...message,
-            voiceNoteDownloadUrl: downloadUrl
-          };
+        if (message.voice_note_id && message.s3_key && message.s3_bucket) {
+          try {
+            const downloadUrl = await generateDownloadUrl(
+              message.s3_key,
+              message.s3_bucket,
+              3600
+            );
+            return { ...message, voiceNoteDownloadUrl: downloadUrl };
+          } catch (err) {
+            console.warn('Could not generate download URL for scheduled message', message.id, err.message);
+            return { ...message, voiceNoteDownloadUrl: null };
+          }
         }
-        return message;
+        return { ...message, voiceNoteDownloadUrl: null };
       })
     );
 
@@ -264,14 +266,14 @@ router.post('/', authenticate, [
       ]
     );
 
-     // Create notification
-  await createNotification(req.user.id, 'message', 
-    'scheduled message created', 
-    `"${message.title}" has been successfully recorded`,
+  // Create notification
+  await createNotification(req.user.id, 'message',
+    'scheduled message created',
+    `Your scheduled message has been created successfully`,
     {
-      messageId: message.id,
-      title: message.title,      
-      url: `/usersDashboard/scheduled/${message.id}`
+      messageId: result.rows[0].id,
+      title: 'Scheduled Message',
+      url: `/usersDashboard/scheduled/${result.rows[0].id}`
     },
     '/icons/message-sent.png'
   );
