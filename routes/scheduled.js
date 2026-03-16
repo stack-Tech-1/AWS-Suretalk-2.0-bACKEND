@@ -267,7 +267,7 @@ router.post('/', authenticate, [
      // Create notification
   await createNotification(req.user.id, 'message', 
     'scheduled message created', 
-    `"${Message.title}" has been successfully recorded`,
+    `"${message.title}" has been successfully recorded`,
     {
       messageId: message.id,
       title: message.title,      
