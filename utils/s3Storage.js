@@ -6,8 +6,10 @@ const multerS3 = require('multer-s3');
 
 // Initialize S3
 const s3 = new AWS.S3({
-  region: process.env.AWS_REGION,
-  signatureVersion: 'v4'
+  region: process.env.AWS_REGION || 'eu-central-1',
+  signatureVersion: 'v4',
+  accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
 });
 
 // S3 buckets configuration
