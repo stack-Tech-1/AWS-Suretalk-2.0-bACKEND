@@ -142,14 +142,15 @@ router.get('/:id', authenticate, async (req, res) => {
     const message = result.rows[0];
 
     // Generate download URL if voice note exists
+    let voiceNoteDownloadUrl = null;
     if (message.s3_key && message.s3_bucket) {
-      const downloadUrl = await generateDownloadUrl(
-        message.s3_key,
-        message.s3_bucket,
-        3600
-      );
-      message.voiceNoteDownloadUrl = downloadUrl;
+      try {
+        voiceNoteDownloadUrl = await generateDownloadUrl(message.s3_key, message.s3_bucket, 3600);
+      } catch (err) {
+        console.warn('Could not generate download URL for scheduled message', id, err.message);
+      }
     }
+    message.voiceNoteDownloadUrl = voiceNoteDownloadUrl;
 
     res.json({
       success: true,
