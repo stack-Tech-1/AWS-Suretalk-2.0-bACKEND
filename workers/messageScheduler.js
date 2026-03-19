@@ -85,16 +85,9 @@ const makePhoneCall = async (to, senderName, audioUrl, customMessage) => {
     ? customMessage
     : `Hello! You have a voice message from ${senderName} on SureTalk.`;
 
-  const twiml = `<?xml version="1.0" encoding="TwiML"?>
-    <Response>
-      <Say voice="Polly.Joanna" language="en-US">${introText}</Say>
-      <Pause length="1"/>
-      <Say voice="Polly.Joanna" language="en-US">Here is your message:</Say>
-      <Pause length="1"/>
-      <Play>${audioUrl}</Play>
-      <Pause length="1"/>
-      <Say voice="Polly.Joanna" language="en-US">This message was delivered by SureTalk. Goodbye.</Say>
-    </Response>`;
+  const twiml = audioUrl
+    ? '<?xml version="1.0" encoding="UTF-8"?><Response><Say voice="Polly.Joanna" language="en-US">' + introText + '</Say><Pause length="1"/><Say voice="Polly.Joanna" language="en-US">Here is your message:</Say><Pause length="1"/><Play>' + audioUrl + '</Play><Pause length="1"/><Say voice="Polly.Joanna" language="en-US">This message was delivered by SureTalk. Goodbye.</Say></Response>'
+    : '<?xml version="1.0" encoding="UTF-8"?><Response><Say voice="Polly.Joanna" language="en-US">' + introText + '</Say><Pause length="1"/><Say voice="Polly.Joanna" language="en-US">This message was delivered by SureTalk. Goodbye.</Say></Response>';
 
   const call = await twilioClient.calls.create({
     to,
@@ -208,11 +201,20 @@ const processScheduledMessages = async () => {
       let callSid = null;
       let smsSid = null;
 
-      // Build audio URL for Twilio <Play> — must be publicly accessible
+      // Build audio URL for Twilio <Play> — must be publicly accessible and serve audio/mpeg
       const EC2_URL = process.env.EC2_STREAM_URL || 'https://test-api.suretalknow.com';
-      const audioUrl = message.s3_key && !message.s3_key.startsWith('http') && !message.s3_key.startsWith('RE')
-        ? `${EC2_URL}/api/stream-s3-recording/${message.s3_key}`
-        : downloadUrl;
+
+      let audioUrl;
+      if (message.twilio_recording_sid) {
+        // IVR recording — use existing Twilio stream endpoint
+        audioUrl = `${EC2_URL}/api/stream-recording/${message.twilio_recording_sid}`;
+      } else if (message.s3_key && !message.s3_key.startsWith('http') && !message.s3_key.startsWith('RE')) {
+        // App recording in S3 — use EC2 S3 stream endpoint (serves audio/mpeg)
+        audioUrl = `${EC2_URL}/api/stream-s3-recording/${message.s3_key}`;
+      } else {
+        // No audio available — TwiML will be TTS-only
+        audioUrl = null;
+      }
 
       // EMAIL DELIVERY
       if (message.recipient_email &&
