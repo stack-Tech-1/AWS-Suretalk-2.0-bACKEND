@@ -1,3 +1,4 @@
+// C:\Users\SMC\Documents\GitHub\AWS-Suretalk-2.0-bACKEND\utils\syncIvr.js
 const axios = require('axios');
 const { pool } = require('../config/database');
 const logger = require('./logger');
@@ -14,7 +15,13 @@ const logger = require('./logger');
  * @param {string} endpointPath - IVR endpoint path (e.g. 'sync-user')
  * @param {Object} [client]     - Optional pg client (pass when inside a transaction)
  */
+const SYNC_ENABLED = process.env.IVR_SYNC_ENABLED !== 'false';
+
 const syncToIvr = async (payload, endpointPath, client) => {
+  if (!SYNC_ENABLED) {
+    logger.info('IVR sync disabled via IVR_SYNC_ENABLED=false');
+    return;
+  }
   const db = client || pool;
   let outboxId;
 

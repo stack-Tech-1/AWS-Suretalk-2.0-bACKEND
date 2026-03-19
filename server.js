@@ -76,7 +76,14 @@ app.use((req, res, next) => {
 // CORS configuration
 const corsOptions = {
   origin: process.env.NODE_ENV === 'production'
-    ? ['https://suretalk.com', 'https://www.suretalk.com', 'https://test-api.suretalknow.com', 'https://admin.suretalk.com', process.env.FRONTEND_URL].filter(Boolean)
+    ? [
+        'https://suretalk.com',
+        'https://www.suretalk.com',
+        'https://test-api.suretalknow.com',
+        'https://admin.suretalk.com',
+        'https://main.dz6waicb3343e.amplifyapp.com',
+        process.env.FRONTEND_URL
+      ].filter(Boolean)
     : ['http://localhost:3000', 'http://localhost:3001'],
   credentials: true,
   optionsSuccessStatus: 200,
@@ -374,6 +381,107 @@ app.post('/api/sync/slot', syncAuth, async (req, res) => {
   } catch (err) {
     console.error('Sync slot error:', err);
     res.status(500).json({ success: false });
+  }
+});
+
+// Receive schedule created from IVR
+app.post('/api/sync/schedule', syncAuth, async (req, res) => {
+  const {
+    scheduleId,
+    userId: ivrUserId,   // phone number from IVR
+    recordingSid,
+    contact,
+    scheduledFor,
+    type,
+    slotNumber,
+    source = 'ivr',
+    createdAt
+  } = req.body;
+
+  if (!scheduleId || !ivrUserId || !scheduledFor) {
+    return res.status(400).json({ success: false, error: 'Missing required fields' });
+  }
+
+  try {
+    // Audit log
+    await pool.query(
+      `INSERT INTO sync_received_log (source, event_type, payload)
+       VALUES ('ivr', 'create_schedule', $1)`,
+      [JSON.stringify(req.body)]
+    );
+
+    // Find the internal user by phone number
+    const userResult = await pool.query(
+      'SELECT id FROM users WHERE phone = $1',
+      [ivrUserId]
+    );
+
+    if (userResult.rows.length === 0) {
+      console.warn(`Sync schedule: user not found for phone ${ivrUserId}`);
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+
+    const dbUserId = userResult.rows[0].id;
+
+    // Idempotency check — skip if already synced
+    const existingCheck = await pool.query(
+      `SELECT id FROM scheduled_messages
+       WHERE metadata->>'ivrScheduleId' = $1`,
+      [scheduleId]
+    );
+
+    if (existingCheck.rows.length > 0) {
+      console.log(`Schedule ${scheduleId} already synced, skipping`);
+      return res.status(200).json({ success: true, message: 'Already synced' });
+    }
+
+    // Find the voice note by Twilio recording SID
+    let voiceNoteId = null;
+    if (recordingSid) {
+      const noteResult = await pool.query(
+        `SELECT id FROM voice_notes
+         WHERE (twilio_recording_sid = $1 OR s3_key = $1)
+         AND user_id = $2
+         AND deleted_at IS NULL`,
+        [recordingSid, dbUserId]
+      );
+      if (noteResult.rows.length > 0) {
+        voiceNoteId = noteResult.rows[0].id;
+      }
+    }
+
+    // Insert into scheduled_messages
+    await pool.query(
+      `INSERT INTO scheduled_messages (
+        user_id, voice_note_id, recipient_phone,
+        delivery_method, scheduled_for, delivery_status,
+        metadata, created_at
+      ) VALUES ($1, $2, $3, $4, $5, 'scheduled', $6, $7)
+      ON CONFLICT DO NOTHING`,
+      [
+        dbUserId,
+        voiceNoteId,
+        contact || null,
+        'phone',
+        new Date(scheduledFor),
+        JSON.stringify({
+          ivrScheduleId: scheduleId,
+          source: 'ivr',
+          type: type || 'voice',
+          slotNumber,
+          recordingSid,
+          syncedAt: new Date().toISOString()
+        }),
+        createdAt ? new Date(createdAt) : new Date()
+      ]
+    );
+
+    console.log(`Schedule ${scheduleId} synced to app for user ${dbUserId}`);
+    res.status(200).json({ success: true });
+
+  } catch (err) {
+    console.error('Sync schedule error:', err);
+    res.status(500).json({ success: false, error: 'Failed to sync schedule' });
   }
 });
 
