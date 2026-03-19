@@ -411,14 +411,66 @@ router.post('/', authenticate, [
     );
 
     // --- Fire-and-forget sync to IVR ---
-    syncToIvr({
-      userId: req.user.phone,
-      slotNumber: note.id.toString(),
-      contact: note.title || 'Unknown',
-      voiceMessage: resolveIvrPlaybackUrl(note),
-      action: 'create',
-      source: 'app'
-    }, 'sync-slot');
+    // Only sync app recordings (not IVR recordings)
+    if (note.source === 'app') {
+      try {
+        // Find the lowest available slot number (1-15) for this user
+        const slotResult = await pool.query(
+          `SELECT s.slot_number
+           FROM generate_series(1, 15) AS s(slot_number)
+           WHERE s.slot_number NOT IN (
+             SELECT ivr_slot_number FROM voice_notes
+             WHERE user_id = $1
+               AND deleted_at IS NULL
+               AND ivr_slot_number IS NOT NULL
+           )
+           ORDER BY s.slot_number
+           LIMIT 1`,
+          [req.user.id]
+        );
+
+        if (slotResult.rows.length === 0) {
+          // All 15 slots are full — skip IVR sync, just log it
+          console.warn(`All IVR slots full for user ${req.user.id}. Voice note ${note.id} saved to app only.`);
+        } else {
+          const ivrSlotNumber = slotResult.rows[0].slot_number;
+
+          // Save the slot number to the voice note record
+          await pool.query(
+            'UPDATE voice_notes SET ivr_slot_number = $1 WHERE id = $2',
+            [ivrSlotNumber, note.id]
+          );
+
+          // Get contact phone number if contact is attached
+          let contactPhone = '';
+          if (contactId) {
+            const contactResult = await pool.query(
+              'SELECT phone FROM contacts WHERE id = $1 AND user_id = $2',
+              [contactId, req.user.id]
+            );
+            contactPhone = contactResult.rows[0]?.phone || '';
+          }
+
+          // Build the S3 URL for IVR playback
+          const audioUrl = `https://${note.s3_bucket}.s3.${process.env.AWS_REGION}.amazonaws.com/${note.s3_key}`;
+
+          // Sync to IVR with proper slot number
+          syncToIvr({
+            userId: req.user.phone || '',
+            slotNumber: ivrSlotNumber.toString(),
+            contact: contactPhone,
+            voiceMessage: audioUrl,
+            action: 'create',
+            source: 'app'
+          }, 'sync-slot');
+
+          console.log(`Voice note ${note.id} assigned IVR slot ${ivrSlotNumber} for user ${req.user.id}`);
+        }
+      } catch (slotError) {
+        // Non-fatal — voice note is already saved, just log the sync failure
+        console.error('Failed to assign IVR slot for voice note:', note.id, slotError.message);
+      }
+    }
 
     res.status(201).json({
       success: true,
@@ -594,7 +646,7 @@ router.delete('/:id', authenticate, async (req, res) => {
 
     // Check ownership
     const ownershipCheck = await pool.query(
-      'SELECT id, s3_key, s3_bucket, source, twilio_recording_sid FROM voice_notes WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL',
+      'SELECT id, s3_key, s3_bucket, source, twilio_recording_sid, ivr_slot_number FROM voice_notes WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL',
       [id, req.user.id]
     );
 
@@ -614,13 +666,16 @@ router.delete('/:id', authenticate, async (req, res) => {
     );
 
     // Fire-and-forget: sync delete to IVR
-    syncToIvr({
-      userId: req.user.phone,
-      voiceMessage: note.s3_key,
-      slotNumber: id.toString(),
-      action: 'delete',
-      source: 'app'
-    }, 'sync-slot');
+    // Only sync deletion if this note had an IVR slot assigned
+    if (note.source === 'app' && note.ivr_slot_number) {
+      syncToIvr({
+        userId: req.user.phone || '',
+        slotNumber: note.ivr_slot_number.toString(),
+        voiceMessage: note.s3_key,
+        action: 'delete',
+        source: 'app'
+      }, 'sync-slot');
+    }
 
     // Fire-and-forget: delete from Twilio if IVR recording
     if (note.source === 'ivr' && twilioClient) {

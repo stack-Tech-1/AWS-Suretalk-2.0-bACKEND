@@ -425,6 +425,90 @@ router.post('/sync/:id/retry', authenticateSuperAdmin, async (req, res) => {
   }
 });
 
+// ── PUT /api/super-admin/sync/:id/edit-retry ─────────────────────────────────
+// Edit payload fields and retry a dead sync item
+router.put('/sync/:id/edit-retry', authenticateSuperAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { userId, slotNumber, contact, voiceMessage } = req.body;
+
+    // Validate required fields
+    if (!userId || !slotNumber || !voiceMessage) {
+      return res.status(400).json({
+        success: false,
+        error: 'userId, slotNumber, and voiceMessage are required'
+      });
+    }
+
+    // Validate slotNumber is 1-15
+    const slotNum = parseInt(slotNumber);
+    if (isNaN(slotNum) || slotNum < 1 || slotNum > 15) {
+      return res.status(400).json({
+        success: false,
+        error: 'slotNumber must be between 1 and 15'
+      });
+    }
+
+    // Get current item to preserve eventType and other fields
+    const currentItem = await pool.query(
+      'SELECT * FROM sync_outbox WHERE id = $1',
+      [id]
+    );
+
+    if (currentItem.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Sync item not found' });
+    }
+
+    // Build updated payload preserving existing fields
+    const existingPayload = currentItem.rows[0].payload || {};
+    const updatedPayload = {
+      ...existingPayload,
+      userId,
+      slotNumber: slotNum.toString(),
+      contact: contact || '',
+      voiceMessage,
+      action: existingPayload.action || 'create',
+      source: existingPayload.source || 'app',
+      _editedBySuperAdmin: true,
+      _editedAt: new Date().toISOString(),
+      _editedBy: req.user.id
+    };
+
+    // Update payload and reset for retry
+    await pool.query(
+      `UPDATE sync_outbox
+       SET payload = $1,
+           status = 'pending',
+           attempts = 0,
+           error_message = NULL,
+           last_attempt_at = NULL
+       WHERE id = $2`,
+      [JSON.stringify(updatedPayload), id]
+    );
+
+    // Log the admin action
+    await pool.query(
+      `INSERT INTO analytics_events (user_id, event_type, event_data)
+       VALUES ($1, 'super_admin_edit_retry_sync', $2)`,
+      [req.user.id, JSON.stringify({ syncId: id, changes: { userId, slotNumber: slotNum, contact, voiceMessage } })]
+    );
+
+    res.json({
+      success: true,
+      message: 'Sync item updated and queued for retry',
+      data: { updatedPayload }
+    });
+
+  } catch (err) {
+    console.error('Super admin edit retry error:', {
+      message: err.message,
+      code: err.code,
+      detail: err.detail
+    });
+    res.status(500).json({ success: false, error: 'Failed to update sync item' });
+  }
+});
+
 // ── GET /api/super-admin/overview ────────────────────────────────────────────
 // System-wide overview stats
 router.get('/overview', authenticateSuperAdmin, async (req, res) => {
