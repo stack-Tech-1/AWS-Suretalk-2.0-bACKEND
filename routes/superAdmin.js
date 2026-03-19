@@ -708,30 +708,35 @@ router.get('/sync-health', authenticateSuperAdmin, async (req, res) => {
     const sevenDaysAgo = new Date();
     sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
 
-    const [outboxStats, recentFailures, receivedLog, recentSuccess] = await Promise.all([
+    // App → IVR outbox stats
+    const outboxStats = await pool.query(`
+      SELECT status, COUNT(*) as count, AVG(attempts) as avg_attempts
+      FROM sync_outbox
+      GROUP BY status
+    `);
 
-      // App → IVR outbox stats
-      pool.query(`
-        SELECT
-          status,
-          COUNT(*) as count,
-          AVG(attempts) as avg_attempts
-        FROM sync_outbox
-        GROUP BY status
-      `),
+    const recentFailures = await pool.query(`
+      SELECT id, event_type, attempts, error_message,
+             last_attempt_at, created_at
+      FROM sync_outbox
+      WHERE status IN ('failed', 'dead')
+      ORDER BY last_attempt_at DESC NULLS LAST
+      LIMIT 10
+    `);
 
-      // Recent failures from App → IVR
-      pool.query(`
-        SELECT id, event_type, attempts, error_message,
-               last_attempt_at, created_at, payload
-        FROM sync_outbox
-        WHERE status IN ('failed', 'dead')
-        ORDER BY last_attempt_at DESC
-        LIMIT 10
-      `),
+    const recentSuccess = await pool.query(`
+      SELECT
+        MAX(CASE WHEN status = 'sent' THEN sent_at END) as last_app_to_ivr_success,
+        MAX(CASE WHEN status = 'dead' THEN last_attempt_at END) as last_dead_at
+      FROM sync_outbox
+    `);
 
-      // IVR → App received log
-      pool.query(`
+    // IVR → App received log — handle missing table gracefully
+    let receivedBreakdown = [];
+    let lastIvrReceived = null;
+
+    try {
+      const receivedLog = await pool.query(`
         SELECT
           event_type,
           COUNT(*) as total,
@@ -739,24 +744,19 @@ router.get('/sync-health', authenticateSuperAdmin, async (req, res) => {
         FROM sync_received_log
         GROUP BY event_type
         ORDER BY total DESC
-      `, [sevenDaysAgo]),
+      `, [sevenDaysAgo]);
+      receivedBreakdown = receivedLog.rows;
 
-      // Last successful sync both directions
-      pool.query(`
-        SELECT
-          MAX(CASE WHEN status = 'sent' THEN sent_at END) as last_app_to_ivr_success,
-          MAX(CASE WHEN status = 'dead' THEN last_attempt_at END) as last_dead_at
-        FROM sync_outbox
-      `)
-    ]);
+      const lastReceived = await pool.query(`
+        SELECT created_at FROM sync_received_log
+        ORDER BY created_at DESC LIMIT 1
+      `);
+      lastIvrReceived = lastReceived.rows[0]?.created_at || null;
+    } catch (logErr) {
+      console.warn('sync_received_log query failed (table may not exist):', logErr.message);
+    }
 
-    // Last IVR → App sync
-    const lastIvrToAppResult = await pool.query(`
-      SELECT created_at FROM sync_received_log
-      ORDER BY created_at DESC LIMIT 1
-    `);
-
-    // Calculate success rate App → IVR
+    // Calculate success rate
     const outboxMap = {};
     outboxStats.rows.forEach(row => { outboxMap[row.status] = parseInt(row.count); });
     const totalSyncs = Object.values(outboxMap).reduce((a, b) => a + b, 0);
@@ -775,13 +775,13 @@ router.get('/sync-health', authenticateSuperAdmin, async (req, res) => {
           lastDeadAt: recentSuccess.rows[0]?.last_dead_at || null
         },
         ivrToApp: {
-          breakdown: receivedLog.rows,
-          lastReceived: lastIvrToAppResult.rows[0]?.created_at || null
+          breakdown: receivedBreakdown,
+          lastReceived: lastIvrReceived
         }
       }
     });
   } catch (err) {
-    console.error('Sync health endpoint error:', { message: err.message, code: err.code });
+    console.error('Sync health endpoint error:', { message: err.message, code: err.code, detail: err.detail });
     res.status(500).json({ success: false, error: 'Failed to fetch sync health' });
   }
 });
