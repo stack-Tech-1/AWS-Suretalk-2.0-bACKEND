@@ -176,14 +176,32 @@ router.get('/users/:id/full', authenticateSuperAdmin, async (req, res) => {
     );
 
     // Vault/wills
-    const vaultResult = await pool.query(
-      `SELECT id, title, description, file_size_bytes,
-              release_condition, release_date, created_at
-       FROM voice_wills
-       WHERE user_id = $1
-       ORDER BY created_at DESC`,
-      [id]
-    );
+    let vaultResult = { rows: [] };
+    try {
+      vaultResult = await pool.query(
+        `SELECT id, title, description, file_size_bytes,
+                release_condition, release_date, created_at
+         FROM voice_wills
+         WHERE user_id = $1
+         ORDER BY created_at DESC`,
+        [id]
+      );
+    } catch (vaultErr) {
+      console.warn('voice_wills query failed (table may not exist):', vaultErr.message);
+      // Try alternate table name
+      try {
+        vaultResult = await pool.query(
+          `SELECT id, title, description, file_size_bytes,
+                  release_condition, release_date, created_at
+           FROM wills
+           WHERE user_id = $1
+           ORDER BY created_at DESC`,
+          [id]
+        );
+      } catch (willsErr) {
+        console.warn('wills query also failed:', willsErr.message);
+      }
+    }
 
     res.json({
       success: true,
@@ -196,7 +214,12 @@ router.get('/users/:id/full', authenticateSuperAdmin, async (req, res) => {
       }
     });
   } catch (err) {
-    console.error('Super admin get user full error:', err);
+    console.error('Super admin get user full error:', {
+      message: err.message,
+      code: err.code,
+      detail: err.detail,
+      table: err.table
+    });
     res.status(500).json({ success: false, error: 'Failed to fetch user data' });
   }
 });
@@ -386,14 +409,18 @@ router.post('/sync/:id/retry', authenticateSuperAdmin, async (req, res) => {
     await pool.query(
       `UPDATE sync_outbox
        SET status = 'pending', attempts = 0, error_message = NULL,
-           last_attempt_at = NULL, updated_at = NOW()
+           last_attempt_at = NULL
        WHERE id = $1 AND status = 'dead'`,
       [id]
     );
 
     res.json({ success: true, message: 'Sync item queued for retry' });
   } catch (err) {
-    console.error('Super admin retry sync error:', err);
+    console.error('Super admin retry sync error:', {
+      message: err.message,
+      code: err.code,
+      detail: err.detail
+    });
     res.status(500).json({ success: false, error: 'Failed to retry sync item' });
   }
 });
