@@ -127,14 +127,41 @@ router.get('/subscription', authenticate, async (req, res) => {
     let stripeSubscription = null;
     if (stripe && user.stripe_subscription_id) {
       try {
-        stripeSubscription = await stripe.subscriptions.retrieve(
+        // Race against an 8 second timeout
+        const stripePromise = stripe.subscriptions.retrieve(
           user.stripe_subscription_id,
-          {
-            expand: ['latest_invoice.payment_intent']
-          }
+          { expand: ['latest_invoice.payment_intent'] }
         );
+
+        const timeoutPromise = new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('Stripe request timed out after 8s')), 8000)
+        );
+
+        stripeSubscription = await Promise.race([stripePromise, timeoutPromise]);
+
       } catch (stripeError) {
         console.warn('Failed to fetch Stripe subscription:', stripeError.message);
+
+        // If subscription ID is invalid or not found, clear it from DB
+        // so future requests don't waste time trying to fetch it
+        if (
+          stripeError.type === 'StripeInvalidRequestError' ||
+          stripeError.message?.includes('No such subscription') ||
+          stripeError.message?.includes('resource_missing') ||
+          stripeError.message?.includes('timed out')
+        ) {
+          try {
+            await pool.query(
+              `UPDATE users
+               SET stripe_subscription_id = NULL, updated_at = NOW()
+               WHERE id = $1 AND stripe_subscription_id = $2`,
+              [req.user.id, user.stripe_subscription_id]
+            );
+            console.log(`Cleared invalid stripe_subscription_id for user ${req.user.id}`);
+          } catch (clearErr) {
+            console.warn('Failed to clear invalid stripe_subscription_id:', clearErr.message);
+          }
+        }
       }
     }
 
@@ -302,86 +329,271 @@ router.post('/create-portal-session', authenticate, async (req, res) => {
 
 // Handle Stripe webhook
 router.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
-  console.log('📥 Webhook received');
-  
-  let event;
-  
-  try {
-    const signature = req.headers['stripe-signature'];
-    const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
-    
-    console.log('Signature exists:', !!signature);
-    console.log('Webhook secret exists:', !!webhookSecret);
+  if (!stripe) {
+    return res.status(503).json({ error: 'Stripe not configured' });
+  }
 
-    if (signature && webhookSecret) {
-      // Verify webhook signature (production or CLI with secret)
-      try {
-        event = stripe.webhooks.constructEvent(
-          req.body,
-          signature,
-          webhookSecret
+  const sig = req.headers['stripe-signature'];
+  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+  if (!sig || !webhookSecret) {
+    console.error('Missing stripe signature or webhook secret');
+    return res.status(400).json({ error: 'Missing signature or webhook secret' });
+  }
+
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
+    console.log(`✅ Stripe webhook received: ${event.type}`);
+  } catch (err) {
+    console.error('Stripe webhook verification failed:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  // Always respond to Stripe immediately — process asynchronously
+  res.status(200).json({ received: true });
+
+  // Process event after responding
+  try {
+    const object = event.data.object;
+
+    // Helper: find user in PostgreSQL by Stripe customer metadata or ID
+    const findUser = async (stripeObject) => {
+      // 1. Try metadata.userId (phone number stored when customer was created on EC2)
+      const metaUserId = stripeObject.metadata?.userId ||
+                         stripeObject.customer_details?.phone;
+
+      if (metaUserId) {
+        const byPhone = await pool.query(
+          `SELECT id, phone, email, subscription_tier, stripe_customer_id
+           FROM users
+           WHERE phone = $1 AND deleted_at IS NULL
+           LIMIT 1`,
+          [metaUserId]
         );
-        console.log('✅ Webhook signature verified');
-      } catch (err) {
-        console.error('❌ Webhook signature verification failed:', err.message);
-        console.log('⚠️ Attempting to parse as JSON for CLI testing...');
-        
-        // Try to parse as JSON for CLI testing
-        try {
-          event = JSON.parse(req.body.toString());
-          console.log('✅ Parsed webhook from CLI');
-        } catch (parseErr) {
-          console.error('❌ Failed to parse webhook:', parseErr.message);
-          return res.status(400).send(`Webhook Error: ${err.message}`);
+        if (byPhone.rows.length > 0) {
+          console.log(`Found user via metadata.userId phone: ${metaUserId}`);
+          return byPhone.rows[0];
         }
       }
-    } else {
-      // No signature - parse as JSON (for CLI without secret)
-      console.log('⚠️ No signature, parsing as JSON');
-      event = JSON.parse(req.body.toString());
-    }
-    
-    console.log('✅ Webhook event type:', event.type);
-    
-    // Handle the event
+
+      // 2. Try stripe_customer_id
+      const customerId = stripeObject.customer || stripeObject.id;
+      if (customerId) {
+        const byCustomer = await pool.query(
+          `SELECT id, phone, email, subscription_tier, stripe_customer_id
+           FROM users
+           WHERE stripe_customer_id = $1 AND deleted_at IS NULL
+           LIMIT 1`,
+          [customerId]
+        );
+        if (byCustomer.rows.length > 0) {
+          console.log(`Found user via stripe_customer_id: ${customerId}`);
+          return byCustomer.rows[0];
+        }
+      }
+
+      // 3. Try customer email via Stripe API
+      try {
+        if (customerId && customerId.startsWith('cus_')) {
+          const customer = await stripe.customers.retrieve(customerId);
+          if (customer.email) {
+            const byEmail = await pool.query(
+              `SELECT id, phone, email, subscription_tier, stripe_customer_id
+               FROM users
+               WHERE email = $1 AND deleted_at IS NULL
+               LIMIT 1`,
+              [customer.email]
+            );
+            if (byEmail.rows.length > 0) {
+              console.log(`Found user via Stripe customer email: ${customer.email}`);
+              return byEmail.rows[0];
+            }
+          }
+        }
+      } catch (stripeErr) {
+        console.warn('Could not retrieve Stripe customer for email lookup:', stripeErr.message);
+      }
+
+      console.warn('No user found for Stripe event:', {
+        type: event.type,
+        customerId,
+        metadata: stripeObject.metadata
+      });
+      return null;
+    };
+
+    // Helper: map Stripe price ID to tier
+    const getTierFromPriceId = (priceId) => {
+      const priceMap = {
+        [process.env.STRIPE_PRICE_LITE]: 'LITE',
+        [process.env.STRIPE_PRICE_ESSENTIAL]: 'ESSENTIAL',
+        [process.env.STRIPE_PRICE_PREMIUM]: 'LEGACY_VAULT_PREMIUM',
+        [process.env.NEXT_PUBLIC_STRIPE_LITE_PRICE_ID]: 'LITE',
+        [process.env.NEXT_PUBLIC_STRIPE_ESSENTIAL_PRICE_ID]: 'ESSENTIAL',
+        [process.env.NEXT_PUBLIC_STRIPE_PREMIUM_PRICE_ID]: 'LEGACY_VAULT_PREMIUM',
+        [process.env.STRIPE_TEST_PRICE_LITE]: 'LITE',
+        [process.env.STRIPE_TEST_PRICE_ESSENTIAL]: 'ESSENTIAL',
+        [process.env.STRIPE_TEST_PRICE_PREMIUM]: 'LEGACY_VAULT_PREMIUM'
+      };
+      return priceMap[priceId] || null;
+    };
+
+    // Helper: update PostgreSQL and sync to DynamoDB/IVR
+    const updateUserSubscription = async (userId, userPhone, updates) => {
+      const setParts = [];
+      const values = [];
+      let paramCount = 1;
+
+      for (const [key, value] of Object.entries(updates)) {
+        setParts.push(`${key} = $${paramCount}`);
+        values.push(value);
+        paramCount++;
+      }
+
+      setParts.push(`updated_at = NOW()`);
+      values.push(userId);
+
+      await pool.query(
+        `UPDATE users SET ${setParts.join(', ')} WHERE id = $${paramCount}`,
+        values
+      );
+
+      console.log(`✅ PostgreSQL updated for user ${userId}:`, updates);
+
+      // Sync tier change to DynamoDB/IVR if tier or status changed
+      if (updates.subscription_tier || updates.subscription_status) {
+        try {
+          const { syncToIvr } = require('../utils/syncIvr');
+          syncToIvr({
+            userId: userPhone,
+            subscription_tier: updates.subscription_tier,
+            verified: updates.subscription_status === 'active' ||
+                      updates.subscription_status === 'trialing',
+            action: 'update',
+            source: 'stripe_webhook'
+          }, 'sync-user');
+          console.log(`✅ IVR sync triggered for user ${userId}`);
+        } catch (syncErr) {
+          console.error('IVR sync failed after webhook (non-fatal):', syncErr.message);
+        }
+      }
+    };
+
+    // Process each event type
     switch (event.type) {
-      case 'checkout.session.completed':
-        console.log('💰 Checkout completed:', event.data.object.id);
-        await handleCheckoutSessionCompleted(event.data.object);
+
+      case 'customer.subscription.created':
+      case 'customer.subscription.updated': {
+        const subscription = object;
+        const user = await findUser(subscription);
+        if (!user) break;
+
+        const priceId = subscription.items?.data[0]?.price?.id;
+        const tier = getTierFromPriceId(priceId) || user.subscription_tier;
+
+        await updateUserSubscription(user.id, user.phone, {
+          subscription_tier: tier,
+          subscription_status: subscription.status,
+          stripe_subscription_id: subscription.id,
+          stripe_customer_id: subscription.customer
+        });
+
+        console.log(`✅ Subscription ${event.type} processed for user ${user.id} — tier: ${tier}`);
         break;
-      
-      case 'customer.subscription.updated':
-        console.log('🔄 Subscription updated:', event.data.object.id);
-        await handleSubscriptionUpdated(event.data.object);
+      }
+
+      case 'customer.subscription.deleted': {
+        const subscription = object;
+        const user = await findUser(subscription);
+        if (!user) break;
+
+        await updateUserSubscription(user.id, user.phone, {
+          subscription_tier: 'LITE',
+          subscription_status: 'inactive',
+          stripe_subscription_id: null
+        });
+
+        console.log(`✅ Subscription deleted — user ${user.id} downgraded to LITE`);
         break;
-      
-      case 'customer.subscription.deleted':
-        console.log('🗑️ Subscription deleted:', event.data.object.id);
-        await handleSubscriptionDeleted(event.data.object);
+      }
+
+      case 'invoice.paid': {
+        const invoice = object;
+        const user = await findUser(invoice);
+        if (!user) break;
+
+        await updateUserSubscription(user.id, user.phone, {
+          subscription_status: 'active',
+          stripe_customer_id: invoice.customer
+        });
+
+        // Log billing history
+        try {
+          await pool.query(
+            `INSERT INTO billing_history
+              (user_id, stripe_invoice_id, amount_cents, currency, description, status)
+             VALUES ($1, $2, $3, $4, $5, 'succeeded')
+             ON CONFLICT DO NOTHING`,
+            [
+              user.id,
+              invoice.id,
+              invoice.amount_paid || 0,
+              invoice.currency || 'usd',
+              'Subscription payment'
+            ]
+          );
+        } catch (billingErr) {
+          console.warn('Failed to log billing history:', billingErr.message);
+        }
+
+        console.log(`✅ Invoice paid for user ${user.id} — $${(invoice.amount_paid / 100).toFixed(2)}`);
         break;
-      
-      case 'invoice.payment_succeeded':
-        console.log('✅ Invoice payment succeeded:', event.data.object.id);
-        await handleInvoicePaymentSucceeded(event.data.object);
+      }
+
+      case 'invoice.payment_failed': {
+        const invoice = object;
+        const user = await findUser(invoice);
+        if (!user) break;
+
+        await updateUserSubscription(user.id, user.phone, {
+          subscription_status: 'past_due'
+        });
+
+        // Log failed billing
+        try {
+          await pool.query(
+            `INSERT INTO billing_history
+              (user_id, stripe_invoice_id, amount_cents, currency, description, status)
+             VALUES ($1, $2, $3, $4, $5, 'failed')
+             ON CONFLICT DO NOTHING`,
+            [
+              user.id,
+              invoice.id,
+              invoice.amount_due || 0,
+              invoice.currency || 'usd',
+              'Payment failed'
+            ]
+          );
+        } catch (billingErr) {
+          console.warn('Failed to log billing history:', billingErr.message);
+        }
+
+        console.log(`⚠️ Payment failed for user ${user.id}`);
         break;
-      
-      case 'invoice.payment_failed':
-        console.log('❌ Invoice payment failed:', event.data.object.id);
-        await handleInvoicePaymentFailed(event.data.object);
-        break;
-      
+      }
+
       default:
-        console.log(`⚡ Unhandled event type: ${event.type}`);
+        console.log(`ℹ️ Unhandled Stripe event type: ${event.type}`);
     }
-    
-    res.json({ received: true });
-    
-  } catch (error) {
-    console.error('❌ Webhook error:', error);
-    console.error('Error stack:', error.stack);
-    res.status(500).json({
-      success: false,
-      error: 'Webhook handler failed'
+
+  } catch (processingError) {
+    // Don't throw — we already sent 200 to Stripe
+    // Log for debugging but don't cause Stripe to retry
+    console.error('Webhook processing error (non-fatal after 200 response):', {
+      message: processingError.message,
+      eventType: event.type,
+      stack: processingError.stack
     });
   }
 });
