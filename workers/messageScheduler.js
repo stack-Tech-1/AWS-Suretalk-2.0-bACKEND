@@ -196,6 +196,16 @@ const processScheduledMessages = async () => {
         downloadUrl = process.env.FRONTEND_URL + '/usersDashboard/voice-notes';
       }
 
+      // Fetch play token URL for email/SMS — use it instead of raw S3 URL
+      const tokenResult = await pool.query(
+        `SELECT token FROM play_tokens WHERE scheduled_message_id = $1 AND expires_at > NOW()`,
+        [sm.id]
+      );
+      const playToken = tokenResult.rows[0]?.token;
+      const playerUrl = playToken
+        ? `${process.env.FRONTEND_URL}/play/${playToken}`
+        : downloadUrl;
+
       let deliverySuccess = false;
       let errorMessages = [];
       let callSid = null;
@@ -224,7 +234,7 @@ const processScheduledMessages = async () => {
             message.recipient_email,
             message.voice_note_title || 'Voice Note',
             message.custom_message || `You have a voice message from ${message.sender_name}`,
-            downloadUrl,
+            playerUrl,
             message.sender_name || 'SureTalk'
           );
           deliverySuccess = true;
@@ -257,7 +267,7 @@ const processScheduledMessages = async () => {
           smsSid = await sendSMS(
             message.recipient_phone,
             message.sender_name || 'SureTalk',
-            downloadUrl,
+            playerUrl,
             message.custom_message
           );
           logger.info(`SMS delivered for message ${sm.id}, SID: ${smsSid}`);

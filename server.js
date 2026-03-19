@@ -176,6 +176,7 @@ app.use('/api/devices', devicesRoutes);
 app.use('/api/backup', backupRoutes);
 app.use('/api/notifications', require('./routes/notifications').router);
 app.use('/api/storage', require('./routes/storage'));
+app.use('/api/play', require('./routes/play'));
 app.use('/api/auth', require('./routes/adminAuth'));
 
 

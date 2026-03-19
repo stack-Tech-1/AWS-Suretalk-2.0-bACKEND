@@ -8,6 +8,7 @@ const { generateDownloadUrl } = require('../utils/s3Storage');
 const Twilio = require('twilio');
 const nodemailer = require('nodemailer');
 const { createNotification } = require('./notifications');
+const { v4: uuidv4 } = require('uuid');
 
 // Initialize Twilio client
 const twilioClient = process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN
@@ -265,6 +266,24 @@ router.post('/', authenticate, [
         new Date(scheduledFor),
         metadata || {}
       ]
+    );
+
+    // Generate play token for secure public playback link
+    const playToken = uuidv4();
+    const tokenExpiry = new Date(scheduledFor);
+    tokenExpiry.setDate(tokenExpiry.getDate() + 30); // 30 days after scheduled date
+
+    await pool.query(
+      `INSERT INTO play_tokens (
+        token, scheduled_message_id, voice_note_id,
+        user_id, expires_at, created_at
+      ) VALUES ($1, $2, $3, $4, $5, NOW())`,
+      [playToken, result.rows[0].id, voiceNoteId, req.user.id, tokenExpiry]
+    );
+
+    await pool.query(
+      `UPDATE scheduled_messages SET metadata = metadata || $1::jsonb WHERE id = $2`,
+      [JSON.stringify({ playToken, playUrl: `${process.env.FRONTEND_URL}/play/${playToken}` }), result.rows[0].id]
     );
 
   // Create notification
