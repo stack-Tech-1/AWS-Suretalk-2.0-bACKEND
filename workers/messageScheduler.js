@@ -2,26 +2,8 @@
 
 const { pool } = require('../config/database');
 
-const nodemailer = require('nodemailer');
-const Twilio = require('twilio');
-
-const twilioClient = process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN
-  ? new Twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
-  : null;
 const { generateDownloadUrl } = require('../utils/s3Storage');
-const logger = require('../utils/logger');
 
-
-// Email transporter
-const emailTransporter = nodemailer.createTransport({
-  host: process.env.SMTP_HOST,
-  port: process.env.SMTP_PORT,
-  secure: process.env.SMTP_SECURE === 'true',
-  auth: {
-    user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS
-  }
-});
 
 // Process scheduled messages
 const processScheduledMessages = async () => {
@@ -85,15 +67,25 @@ const processScheduledMessages = async () => {
 
       const message = { ...sm, ...detailResult.rows[0] };
 
-      const downloadUrl = await generateDownloadUrl(
-        message.s3_key,
-        message.s3_bucket,
-        7 * 24 * 3600
-      );
+      let downloadUrl = null;
+      if (message.s3_key && message.s3_bucket &&
+          !message.s3_key.startsWith('http') &&
+          !message.s3_key.startsWith('RE')) {
+        try {
+          downloadUrl = await generateDownloadUrl(
+            message.s3_key,
+            message.s3_bucket,
+            7 * 24 * 3600
+          );
+        } catch (urlError) {
+          console.warn('Could not generate download URL for scheduled message', sm.id, urlError.message);
+          downloadUrl = process.env.FRONTEND_URL + '/usersDashboard/voice-notes';
+        }
+      } else {
+        downloadUrl = process.env.FRONTEND_URL + '/usersDashboard/voice-notes';
+      }
 
       let deliverySuccess = false;
-      let twilioCallSid = null;
-      let twilioMessageSid = null;
 
       if (message.recipient_email && message.delivery_method.includes('email')) {
         try {
@@ -110,41 +102,22 @@ const processScheduledMessages = async () => {
         }
       }
 
-      // Twilio call + SMS delivery
-      if (
-        twilioClient &&
-        message.recipient_phone &&
-        (message.delivery_method === 'sms' || message.delivery_method === 'both')
-      ) {
-        try {
-          const recordingUrl = message.twilio_recording_sid
-            ? `https://${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}@api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_ACCOUNT_SID}/Recordings/${message.twilio_recording_sid}.mp3`
-            : downloadUrl;
-
-          const twiml = `<Response><Say>You have a voice message from ${message.sender_name}.</Say><Play>${recordingUrl}</Play></Response>`;
-
-          const call = await twilioClient.calls.create({
-            twiml,
-            to: message.recipient_phone,
-            from: process.env.TWILIO_PHONE_NUMBER
-          });
-          twilioCallSid = call.sid;
-
-          const sms = await twilioClient.messages.create({
-            body: `You have a voice message from ${message.sender_name}. Listen anytime: ${process.env.FRONTEND_URL}/messages/${message.id}`,
-            to: message.recipient_phone,
-            from: process.env.TWILIO_PHONE_NUMBER
-          });
-          twilioMessageSid = sms.sid;
-
-          deliverySuccess = true;
-          logger.info(`Twilio delivery succeeded for message ${message.id}: call=${twilioCallSid}, sms=${twilioMessageSid}`);
-        } catch (twilioError) {
-          logger.error(`Twilio delivery failed for message ${message.id}:`, twilioError.message);
-        }
-      } else if (message.delivery_method === 'sms' || message.delivery_method === 'both') {
-        if (!twilioClient) {
-          logger.warn(`Twilio not configured — skipping call/SMS for message ${message.id}`);
+      if (message.recipient_phone && message.delivery_method !== 'email') {
+        console.log(`Phone delivery skipped for message ${message.id} - Twilio not configured. Phone: ${message.recipient_phone}`);
+        // Phone delivery will be added in a future update
+        // For now, if email also exists, email delivery counts as success
+        if (!message.recipient_email) {
+          // Phone-only delivery — mark as failed with clear reason
+          await pool.query(
+            `UPDATE scheduled_messages
+             SET delivery_attempts = delivery_attempts + 1,
+                 last_attempt_at = $1,
+                 error_message = 'Phone delivery not yet configured - please use email delivery',
+                 updated_at = $1
+             WHERE id = $2`,
+            [now, sm.id]
+          );
+          continue;
         }
       }
 
@@ -154,11 +127,9 @@ const processScheduledMessages = async () => {
            SET delivery_status = 'delivered',
                delivered_at = $1,
                delivery_attempts = delivery_attempts + 1,
-               twilio_call_sid = $3,
-               twilio_message_sid = $4,
                updated_at = $1
            WHERE id = $2`,
-          [now, message.id, twilioCallSid, twilioMessageSid]
+          [now, message.id]
         );
       } else {
         await pool.query(
@@ -179,38 +150,63 @@ const processScheduledMessages = async () => {
   console.log(`Processed ${lockedRows.length} scheduled messages`);
 };
 
-// Email sending function
+// Email sending function (AWS SES)
 const sendEmail = async (to, title, message, downloadUrl, senderName) => {
+  const AWS = require('aws-sdk');
+  const ses = new AWS.SES({
+    region: process.env.AWS_REGION,
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
+  });
+
   const emailHtml = `
-    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-      <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
-                  color: white; padding: 30px; text-align: center; border-radius: 10px 10px 0 0;">
-        <h1 style="margin: 0;">${title}</h1>
-        <p style="margin: 10px 0 0; opacity: 0.9;">A voice message from ${senderName}</p>
+    <!DOCTYPE html>
+    <html>
+    <head><meta charset="UTF-8"></head>
+    <body style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+      <div style="background: linear-gradient(135deg, #6366f1 0%, #7c3aed 100%);
+                  color: white; padding: 30px; text-align: center; border-radius: 12px 12px 0 0;">
+        <h1 style="margin: 0; font-size: 24px;">Voice Message for You</h1>
+        <p style="margin: 10px 0 0; opacity: 0.9;">A message from ${senderName}</p>
       </div>
-      <div style="background: #f9f9f9; padding: 30px; border-radius: 0 0 10px 10px;">
-        <p>${message}</p>
-        <p>Click the button below to listen to the voice note:</p>
-        <a href="${downloadUrl}" 
-           style="display: inline-block; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
-                  color: white; padding: 12px 30px; text-decoration: none; border-radius: 5px; 
-                  margin: 20px 0;">
-          Listen to Voice Note
-        </a>
-        <p><small>This link will expire in 7 days.</small></p>
+      <div style="background: #f9f9f9; padding: 30px; border-radius: 0 0 12px 12px; border: 1px solid #e2e8f0;">
+        <p style="color: #334155; font-size: 16px;">${message}</p>
+        <p style="color: #64748b;">Click the button below to listen to your voice message:</p>
+        <div style="text-align: center; margin: 30px 0;">
+          <a href="${downloadUrl}"
+             style="display: inline-block; background: linear-gradient(135deg, #6366f1, #7c3aed);
+                    color: white; padding: 14px 32px; text-decoration: none; border-radius: 8px;
+                    font-weight: bold; font-size: 16px;">
+            🎧 Listen to Voice Note
+          </a>
+        </div>
+        <p style="color: #94a3b8; font-size: 12px; text-align: center;">
+          This link will expire in 7 days. Sent via SureTalk.
+        </p>
       </div>
-    </div>
+    </body>
+    </html>
   `;
 
-  const mailOptions = {
-    from: `"SureTalk" <${process.env.SMTP_FROM || 'noreply@suretalk.com'}>`,
-    to,
-    subject: `Voice Note: ${title}`,
-    html: emailHtml,
-    text: `${message}\n\nListen to voice note: ${downloadUrl}\n\nThis link will expire in 7 days.`
+  const params = {
+    Destination: { ToAddresses: [to] },
+    Message: {
+      Body: {
+        Html: { Charset: 'UTF-8', Data: emailHtml },
+        Text: {
+          Charset: 'UTF-8',
+          Data: `${message}\n\nListen to your voice note: ${downloadUrl}\n\nThis link expires in 7 days.`
+        }
+      },
+      Subject: {
+        Charset: 'UTF-8',
+        Data: `Voice Note: ${title}`
+      }
+    },
+    Source: process.env.SES_FROM_EMAIL
   };
 
-  await emailTransporter.sendMail(mailOptions);
+  await ses.sendEmail(params).promise();
 };
 
 // Start scheduler
