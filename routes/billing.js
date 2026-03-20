@@ -954,6 +954,111 @@ router.post('/change-tier', authenticate, [
   }
 });
 
+// ── GET /api/billing/history ─────────────────────────────────────────────────
+router.get('/history', authenticate, async (req, res) => {
+  try {
+    const localHistory = await pool.query(
+      `SELECT stripe_invoice_id, amount_cents, currency,
+              description, status, created_at
+       FROM billing_history
+       WHERE user_id = $1
+       ORDER BY created_at DESC
+       LIMIT 24`,
+      [req.user.id]
+    );
+
+    const userResult = await pool.query(
+      'SELECT stripe_customer_id FROM users WHERE id = $1',
+      [req.user.id]
+    );
+
+    let stripeInvoices = [];
+    if (stripe && userResult.rows[0]?.stripe_customer_id) {
+      try {
+        const invoicesPromise = stripe.invoices.list({
+          customer: userResult.rows[0].stripe_customer_id,
+          limit: 24
+        });
+        const timeoutPromise = new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('timeout')), 8000)
+        );
+        const invoices = await Promise.race([invoicesPromise, timeoutPromise]);
+        stripeInvoices = invoices.data.map(inv => ({
+          id: inv.id,
+          amount: inv.amount_paid / 100,
+          currency: inv.currency.toUpperCase(),
+          status: inv.status,
+          date: new Date(inv.created * 1000).toISOString(),
+          description: inv.description || 'Subscription payment',
+          pdfUrl: inv.invoice_pdf,
+          hostedUrl: inv.hosted_invoice_url
+        }));
+      } catch (stripeErr) {
+        console.error('Stripe invoice fetch failed:', stripeErr.message);
+      }
+    }
+
+    res.json({
+      success: true,
+      data: { stripeInvoices, localHistory: localHistory.rows }
+    });
+  } catch (err) {
+    console.error('Billing history error:', err.message);
+    res.status(500).json({ success: false, error: 'Failed to fetch billing history' });
+  }
+});
+
+// ── GET /api/billing/payment-methods ─────────────────────────────────────────
+router.get('/payment-methods', authenticate, async (req, res) => {
+  try {
+    const userResult = await pool.query(
+      'SELECT stripe_customer_id FROM users WHERE id = $1',
+      [req.user.id]
+    );
+
+    if (!stripe || !userResult.rows[0]?.stripe_customer_id) {
+      return res.json({
+        success: true,
+        data: { paymentMethods: [], hasStripeCustomer: false }
+      });
+    }
+
+    const pmPromise = stripe.paymentMethods.list({
+      customer: userResult.rows[0].stripe_customer_id,
+      type: 'card'
+    });
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('timeout')), 8000)
+    );
+    const paymentMethods = await Promise.race([pmPromise, timeoutPromise]);
+
+    const customerPromise = stripe.customers.retrieve(userResult.rows[0].stripe_customer_id);
+    const customer = await Promise.race([
+      customerPromise,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 8000))
+    ]);
+
+    const defaultPmId = customer.invoice_settings?.default_payment_method;
+
+    const cards = paymentMethods.data.map(pm => ({
+      id: pm.id,
+      brand: pm.card.brand,
+      last4: pm.card.last4,
+      expMonth: pm.card.exp_month,
+      expYear: pm.card.exp_year,
+      isDefault: pm.id === defaultPmId
+    }));
+
+    res.json({
+      success: true,
+      data: { paymentMethods: cards, hasStripeCustomer: true }
+    });
+  } catch (err) {
+    console.error('Payment methods error:', err.message);
+    res.status(500).json({ success: false, error: 'Failed to fetch payment methods' });
+  }
+});
+
 // Helper function to get limits for tier
 function getLimitsForTier(tier) {
   const limits = {

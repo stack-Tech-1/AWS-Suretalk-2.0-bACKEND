@@ -1191,4 +1191,172 @@ router.get('/stats', authenticate, async (req, res) => {
   }
 });
 
+// ── PUT /api/users/settings ──────────────────────────────────────────────────
+router.put('/settings', authenticate, async (req, res) => {
+  try {
+    const { notifications, privacy, appearance, security } = req.body;
+
+    const settings = {
+      notifications: notifications || {},
+      privacy: privacy || {},
+      appearance: appearance || {},
+      security: security || {},
+      updatedAt: new Date().toISOString()
+    };
+
+    await pool.query(
+      `UPDATE users SET settings = $1, updated_at = NOW() WHERE id = $2`,
+      [JSON.stringify(settings), req.user.id]
+    );
+
+    res.json({ success: true, data: { settings } });
+  } catch (err) {
+    console.error('Save settings error:', err.message);
+    res.status(500).json({ success: false, error: 'Failed to save settings' });
+  }
+});
+
+// ── GET /api/users/settings ──────────────────────────────────────────────────
+router.get('/settings', authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT settings FROM users WHERE id = $1',
+      [req.user.id]
+    );
+    res.json({
+      success: true,
+      data: { settings: result.rows[0]?.settings || {} }
+    });
+  } catch (err) {
+    console.error('Get settings error:', err.message);
+    res.status(500).json({ success: false, error: 'Failed to get settings' });
+  }
+});
+
+// ── POST /api/users/profile-image ────────────────────────────────────────────
+router.post('/profile-image', authenticate, async (req, res) => {
+  try {
+    const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
+
+    const s3 = new S3Client({
+      region: process.env.AWS_REGION,
+      credentials: {
+        accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
+      }
+    });
+
+    const { imageData, contentType } = req.body;
+    if (!imageData) {
+      return res.status(400).json({ success: false, error: 'No image data provided' });
+    }
+
+    const base64Data = imageData.replace(/^data:image\/\w+;base64,/, '');
+    const imageBuffer = Buffer.from(base64Data, 'base64');
+
+    if (imageBuffer.length > 5 * 1024 * 1024) {
+      return res.status(400).json({
+        success: false,
+        error: 'Image too large. Maximum size is 5MB.'
+      });
+    }
+
+    const s3Key = `profile-images/${req.user.id}/avatar.jpg`;
+    const bucket = process.env.AWS_S3_BUCKET_VOICE_NOTES;
+
+    await s3.send(new PutObjectCommand({
+      Bucket: bucket,
+      Key: s3Key,
+      Body: imageBuffer,
+      ContentType: contentType || 'image/jpeg',
+      CacheControl: 'max-age=31536000'
+    }));
+
+    const imageUrl = `https://${bucket}.s3.${process.env.AWS_REGION}.amazonaws.com/${s3Key}?t=${Date.now()}`;
+
+    await pool.query(
+      'UPDATE users SET profile_image_url = $1, updated_at = NOW() WHERE id = $2',
+      [imageUrl, req.user.id]
+    );
+
+    res.json({ success: true, data: { profileImageUrl: imageUrl } });
+  } catch (err) {
+    console.error('Profile image upload error:', err.message);
+    res.status(500).json({ success: false, error: 'Failed to upload profile image' });
+  }
+});
+
+// ── DELETE /api/users/account ────────────────────────────────────────────────
+router.delete('/account', authenticate, async (req, res) => {
+  try {
+    const { confirmation } = req.body;
+
+    if (confirmation !== 'DELETE') {
+      return res.status(400).json({
+        success: false,
+        error: 'Please type DELETE to confirm account deletion'
+      });
+    }
+
+    if (req.isImpersonating) {
+      return res.status(403).json({
+        success: false,
+        error: 'Cannot delete account during impersonation'
+      });
+    }
+
+    const userResult = await pool.query(
+      'SELECT stripe_subscription_id, stripe_customer_id, phone FROM users WHERE id = $1',
+      [req.user.id]
+    );
+    const user = userResult.rows[0];
+
+    if (user?.stripe_subscription_id) {
+      try {
+        const Stripe = require('stripe');
+        const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
+        await stripe.subscriptions.cancel(user.stripe_subscription_id);
+      } catch (stripeErr) {
+        console.error('Failed to cancel Stripe subscription on delete:', stripeErr.message);
+      }
+    }
+
+    await pool.query(
+      `UPDATE users
+       SET deleted_at = NOW(),
+           status = 'deleted',
+           email = email || '_deleted_' || extract(epoch from now())::text,
+           updated_at = NOW()
+       WHERE id = $1`,
+      [req.user.id]
+    );
+
+    if (user?.phone) {
+      try {
+        syncToIvr({
+          userId: user.phone,
+          action: 'unsubscribe',
+          source: 'app'
+        }, 'sync-user');
+      } catch (syncErr) {
+        console.error('IVR sync on delete failed:', syncErr.message);
+      }
+    }
+
+    await pool.query(
+      `INSERT INTO analytics_events (user_id, event_type, event_data)
+       VALUES ($1, 'account_deleted', $2)`,
+      [req.user.id, JSON.stringify({
+        deletedAt: new Date().toISOString(),
+        hadStripeSubscription: !!user?.stripe_subscription_id
+      })]
+    );
+
+    res.json({ success: true, message: 'Account deleted successfully' });
+  } catch (err) {
+    console.error('Delete account error:', err.message);
+    res.status(500).json({ success: false, error: 'Failed to delete account' });
+  }
+});
+
 module.exports = router;
