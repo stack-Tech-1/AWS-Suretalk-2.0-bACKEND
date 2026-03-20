@@ -414,34 +414,32 @@ router.post('/', authenticate, [
     // Only sync app recordings (not IVR recordings)
     if (note.source === 'app') {
       try {
-        // Find the lowest available slot number (1-15) for this user
-        const slotResult = await pool.query(
-          `SELECT s.slot_number
-           FROM generate_series(1, 15) AS s(slot_number)
-           WHERE s.slot_number NOT IN (
-             SELECT ivr_slot_number FROM voice_notes
-             WHERE user_id = $1
-               AND deleted_at IS NULL
-               AND ivr_slot_number IS NOT NULL
-           )
-           ORDER BY s.slot_number
-           LIMIT 1`,
+        // Get ALL slots taken in PostgreSQL for this user
+        const takenSlotsResult = await pool.query(
+          `SELECT ivr_slot_number FROM voice_notes
+           WHERE user_id = $1
+             AND deleted_at IS NULL
+             AND ivr_slot_number IS NOT NULL`,
           [req.user.id]
         );
 
-        if (slotResult.rows.length === 0) {
-          // All 15 slots are full — skip IVR sync, just log it
-          console.warn(`All IVR slots full for user ${req.user.id}. Voice note ${note.id} saved to app only.`);
+        const takenInPostgres = new Set(
+          takenSlotsResult.rows.map(r => r.ivr_slot_number)
+        );
+
+        // Find lowest available slot not taken in PostgreSQL
+        let candidateSlot = null;
+        for (let s = 1; s <= 15; s++) {
+          if (!takenInPostgres.has(s)) {
+            candidateSlot = s;
+            break;
+          }
+        }
+
+        if (!candidateSlot) {
+          console.warn(`All IVR slots full for user ${req.user.id}. Voice note saved to app only.`);
         } else {
-          const ivrSlotNumber = slotResult.rows[0].slot_number;
-
-          // Save the slot number to the voice note record
-          await pool.query(
-            'UPDATE voice_notes SET ivr_slot_number = $1 WHERE id = $2',
-            [ivrSlotNumber, note.id]
-          );
-
-          // Get contact phone number if contact is attached
+          // Get contact phone
           let contactPhone = '';
           if (contactId) {
             const contactResult = await pool.query(
@@ -451,23 +449,86 @@ router.post('/', authenticate, [
             contactPhone = contactResult.rows[0]?.phone || '';
           }
 
-          // Build the S3 URL for IVR playback
-          const audioUrl = `https://${note.s3_bucket}.s3.${process.env.AWS_REGION}.amazonaws.com/${note.s3_key}`;
+          // Build audio URL for IVR playback via EC2 stream
+          const s3Key = note.s3_key;
+          const audioUrl = `${process.env.EC2_STREAM_URL}/api/stream-s3-recording/${s3Key}`;
 
-          // Sync to IVR with proper slot number
-          syncToIvr({
-            userId: req.user.phone || '',
-            slotNumber: ivrSlotNumber.toString(),
-            contact: contactPhone,
-            voiceMessage: audioUrl,
-            action: 'create',
-            source: 'app'
-          }, 'sync-slot');
+          // Try slots starting from candidateSlot, skip on 409 conflict
+          let assignedSlot = null;
+          let slotToTry = candidateSlot;
 
-          console.log(`Voice note ${note.id} assigned IVR slot ${ivrSlotNumber} for user ${req.user.id}`);
+          while (slotToTry <= 15 && !assignedSlot) {
+            // Skip slots already taken in PostgreSQL
+            if (takenInPostgres.has(slotToTry)) {
+              slotToTry++;
+              continue;
+            }
+
+            try {
+              // Attempt sync — if DynamoDB has this slot, it returns 409
+              const axios = require('axios');
+              const syncPayload = {
+                userId: req.user.phone || '',
+                slotNumber: slotToTry.toString(),
+                contact: contactPhone,
+                voiceMessage: audioUrl,
+                action: 'create',
+                source: 'app'
+              };
+
+              await axios.post(
+                `${process.env.IVR_API_URL}/sync-slot`,
+                syncPayload,
+                {
+                  headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${process.env.IVR_SYNC_TOKEN}`
+                  },
+                  timeout: 5000
+                }
+              );
+
+              // Success — this slot worked
+              assignedSlot = slotToTry;
+              console.log(`Voice note ${note.id} synced to IVR slot ${assignedSlot}`);
+
+            } catch (syncErr) {
+              if (syncErr.response?.status === 409) {
+                // Slot conflict in DynamoDB — try next slot
+                console.warn(`IVR slot ${slotToTry} conflict (DynamoDB mismatch), trying slot ${slotToTry + 1}`);
+                slotToTry++;
+              } else {
+                // Other error — save to outbox for retry as before
+                console.warn(`Sync to IVR failed (will retry via outbox):`, syncErr.message);
+
+                // Save to sync_outbox for retry
+                syncToIvr({
+                  userId: req.user.phone || '',
+                  slotNumber: slotToTry.toString(),
+                  contact: contactPhone,
+                  voiceMessage: audioUrl,
+                  action: 'create',
+                  source: 'app'
+                }, 'sync-slot');
+
+                assignedSlot = slotToTry; // Optimistically assign — outbox will retry
+                break;
+              }
+            }
+          }
+
+          if (assignedSlot) {
+            // Save the confirmed slot number to PostgreSQL
+            await pool.query(
+              'UPDATE voice_notes SET ivr_slot_number = $1 WHERE id = $2',
+              [assignedSlot, note.id]
+            );
+            console.log(`Voice note ${note.id} assigned IVR slot ${assignedSlot} for user ${req.user.id}`);
+          } else {
+            console.warn(`No available IVR slots for user ${req.user.id} — all 15 slots occupied in DynamoDB`);
+          }
         }
       } catch (slotError) {
-        // Non-fatal — voice note is already saved, just log the sync failure
         console.error('Failed to assign IVR slot for voice note:', note.id, slotError.message);
       }
     }
