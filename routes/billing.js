@@ -330,10 +330,16 @@ router.post('/create-portal-session', authenticate, async (req, res) => {
       throw stripeErr;
     }
 
-    const session = await stripe.billingPortal.sessions.create({
+    const portalPromise = stripe.billingPortal.sessions.create({
       customer: user.stripe_customer_id,
       return_url: returnUrl || `${process.env.FRONTEND_URL}/usersDashboard/billing`
     });
+
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('Portal session request timed out')), 8000)
+    );
+
+    const session = await Promise.race([portalPromise, timeoutPromise]);
 
     res.json({
       success: true,
