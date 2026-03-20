@@ -2,6 +2,17 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../config/database');
 const { generateDownloadUrl } = require('../utils/s3Storage');
+const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
+const { DynamoDBDocumentClient, GetCommand } = require('@aws-sdk/lib-dynamodb');
+
+const dynamoClient = new DynamoDBClient({
+  region: process.env.AWS_REGION || 'eu-central-1',
+  credentials: {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
+  }
+});
+const dynamodb = DynamoDBDocumentClient.from(dynamoClient);
 
 // Super admin authentication middleware
 const authenticateSuperAdmin = async (req, res, next) => {
@@ -426,6 +437,157 @@ router.put('/users/:id/suspend', authenticateSuperAdmin, async (req, res) => {
   } catch (err) {
     console.error('Super admin suspend error:', err);
     res.status(500).json({ success: false, error: 'Failed to update account status' });
+  }
+});
+
+// ── POST /api/super-admin/users/:id/resync ────────────────────────────────────
+// Re-sync a user's subscription data from DynamoDB to PostgreSQL
+router.post('/users/:id/resync', authenticateSuperAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // 1. Get user from PostgreSQL to find their phone number
+    const userResult = await pool.query(
+      `SELECT id, phone, email, full_name, subscription_tier,
+              stripe_customer_id, stripe_subscription_id
+       FROM users WHERE id = $1`,
+      [id]
+    );
+
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+
+    const user = userResult.rows[0];
+
+    if (!user.phone) {
+      return res.status(400).json({
+        success: false,
+        error: 'User has no phone number — cannot look up in IVR system'
+      });
+    }
+
+    // Normalize phone to E.164 for DynamoDB lookup
+    const normalizePhone = (phone) => {
+      const digits = phone.replace(/[^\d]/g, '');
+      if (digits.length === 10) return `+1${digits}`;
+      if (digits.length === 11 && digits.startsWith('1')) return `+${digits}`;
+      if (digits.length === 13 && digits.startsWith('234')) return `+${digits}`;
+      if (digits.length === 12 && digits.startsWith('234')) return `+${digits}`;
+      return phone.startsWith('+') ? phone : `+${digits}`;
+    };
+
+    const normalizedPhone = normalizePhone(user.phone);
+    console.log(`Re-sync: looking up DynamoDB for phone ${normalizedPhone}`);
+
+    // 2. Look up user in DynamoDB
+    const USERS_TABLE = process.env.DYNAMO_USERS_TABLE || 'Users';
+    let dynamoUser = null;
+
+    try {
+      const dynamoResult = await dynamodb.send(
+        new GetCommand({
+          TableName: USERS_TABLE,
+          Key: { userId: normalizedPhone }
+        })
+      );
+      dynamoUser = dynamoResult.Item;
+    } catch (dynamoErr) {
+      console.error('DynamoDB lookup failed:', dynamoErr.message);
+      return res.status(500).json({
+        success: false,
+        error: `DynamoDB lookup failed: ${dynamoErr.message}`
+      });
+    }
+
+    if (!dynamoUser) {
+      return res.status(404).json({
+        success: false,
+        error: `User not found in IVR system for phone ${normalizedPhone}`
+      });
+    }
+
+    console.log(`Re-sync: DynamoDB user found:`, {
+      userId: dynamoUser.userId,
+      tier: dynamoUser.subscription_tier,
+      stripeCustomerId: dynamoUser.stripeCustomerId,
+      stripeSubscriptionId: dynamoUser.stripeSubscriptionId
+    });
+
+    // 3. Map DynamoDB tier to PostgreSQL tier
+    const tierMap = {
+      'LITE': 'LITE',
+      'ESSENTIAL': 'ESSENTIAL',
+      'PREMIUM': 'LEGACY_VAULT_PREMIUM',
+      'LEGACY_VAULT_PREMIUM': 'LEGACY_VAULT_PREMIUM'
+    };
+    const mappedTier = tierMap[dynamoUser.subscription_tier] ||
+                       user.subscription_tier || 'LITE';
+
+    // 4. Build update — only update fields that DynamoDB has values for
+    const updates = {
+      subscription_tier: mappedTier
+    };
+
+    if (dynamoUser.stripeCustomerId) {
+      updates.stripe_customer_id = dynamoUser.stripeCustomerId;
+    }
+    if (dynamoUser.stripeSubscriptionId &&
+        dynamoUser.stripeSubscriptionId !== 'unsubscribed') {
+      updates.stripe_subscription_id = dynamoUser.stripeSubscriptionId;
+    }
+    if (dynamoUser.subscriptionStatus) {
+      updates.subscription_status = dynamoUser.subscriptionStatus;
+    }
+    if (dynamoUser.verified !== undefined) {
+      updates.subscription_status = dynamoUser.verified ? 'active' : 'inactive';
+    }
+
+    // 5. Apply updates to PostgreSQL
+    const setParts = Object.keys(updates).map((key, i) => `${key} = $${i + 1}`);
+    const values = [...Object.values(updates), id];
+
+    await pool.query(
+      `UPDATE users SET ${setParts.join(', ')}, updated_at = NOW() WHERE id = $${values.length}`,
+      values
+    );
+
+    // 6. Log the admin action
+    await pool.query(
+      `INSERT INTO analytics_events (user_id, event_type, event_data)
+       VALUES ($1, 'super_admin_resync', $2)`,
+      [id, JSON.stringify({
+        syncedFields: Object.keys(updates),
+        dynamoTier: dynamoUser.subscription_tier,
+        mappedTier,
+        actionBy: req.user.id,
+        syncedAt: new Date().toISOString()
+      })]
+    );
+
+    console.log(`Re-sync complete for user ${id}:`, updates);
+
+    res.json({
+      success: true,
+      message: 'User synced successfully from IVR system',
+      data: {
+        syncedFields: Object.keys(updates),
+        before: {
+          tier: user.subscription_tier,
+          stripeCustomerId: user.stripe_customer_id,
+          stripeSubscriptionId: user.stripe_subscription_id
+        },
+        after: updates
+      }
+    });
+
+  } catch (err) {
+    console.error('Re-sync error:', {
+      message: err.message,
+      code: err.code,
+      userId: req.params.id
+    });
+    res.status(500).json({ success: false, error: 'Re-sync failed: ' + err.message });
   }
 });
 
