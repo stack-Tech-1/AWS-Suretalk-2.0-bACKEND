@@ -76,9 +76,14 @@ const pool = new Pool({
 let connectionAttempts = 0;
 const maxConnectionAttempts = 5;
 
+let hasLoggedInitialConnection = false;
+
 pool.on('connect', () => {
-  console.log('✅ Database connected successfully to:', dbConfig.host);
   connectionAttempts = 0;
+  if (!hasLoggedInitialConnection) {
+    console.log('✅ Database connected successfully to:', dbConfig.host);
+    hasLoggedInitialConnection = true;
+  }
 });
 
 pool.on('error', (err) => {
