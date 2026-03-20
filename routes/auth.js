@@ -528,6 +528,10 @@ router.post('/change-password', authenticate, [
   body('newPassword').isLength({ min: 8 })
 ], async (req, res) => {
   try {
+    if (req.isImpersonating) {
+      return res.status(403).json({ success: false, error: 'This action is not allowed during impersonation' });
+    }
+
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
       return res.status(400).json({

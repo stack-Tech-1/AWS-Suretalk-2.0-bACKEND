@@ -189,6 +189,368 @@ router.get('/users/export', authenticateSuperAdmin, async (req, res) => {
   }
 });
 
+// ── POST /api/super-admin/users/:id/impersonate ──────────────────────────────
+router.post('/users/:id/impersonate', authenticateSuperAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const adminId = req.user.id;
+
+    // Cannot impersonate yourself
+    if (id === adminId) {
+      return res.status(400).json({
+        success: false,
+        error: 'Cannot impersonate yourself'
+      });
+    }
+
+    // Get target user
+    const targetResult = await pool.query(
+      `SELECT id, full_name, email, phone, is_admin, is_super_admin, is_suspended
+       FROM users WHERE id = $1`,
+      [id]
+    );
+
+    if (targetResult.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+
+    const target = targetResult.rows[0];
+
+    // Cannot impersonate admins or super admins
+    if (target.is_admin || target.is_super_admin) {
+      return res.status(403).json({
+        success: false,
+        error: 'Cannot impersonate admin accounts'
+      });
+    }
+
+    // Cannot impersonate suspended users
+    if (target.is_suspended) {
+      return res.status(403).json({
+        success: false,
+        error: 'Cannot impersonate a suspended account'
+      });
+    }
+
+    // Generate impersonation token — 5 minute expiry
+    const jwt = require('jsonwebtoken');
+    const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
+
+    const token = jwt.sign(
+      {
+        userId: target.id,
+        impersonation: true,
+        adminId: adminId,
+        exp: Math.floor(expiresAt.getTime() / 1000)
+      },
+      process.env.JWT_SECRET
+    );
+
+    // Store token in database
+    await pool.query(
+      `INSERT INTO impersonation_tokens
+         (token, admin_id, target_user_id, expires_at)
+       VALUES ($1, $2, $3, $4)`,
+      [token, adminId, id, expiresAt]
+    );
+
+    // Log the impersonation action
+    await pool.query(
+      `INSERT INTO analytics_events (user_id, event_type, event_data)
+       VALUES ($1, 'super_admin_impersonation_start', $2)`,
+      [adminId, JSON.stringify({
+        targetUserId: id,
+        targetName: target.full_name,
+        targetEmail: target.email,
+        expiresAt: expiresAt.toISOString(),
+        adminEmail: req.user.email
+      })]
+    );
+
+    console.log(`🔐 Impersonation started: admin ${req.user.email} → user ${target.email}`);
+
+    res.json({
+      success: true,
+      data: {
+        token,
+        expiresAt: expiresAt.toISOString(),
+        targetUser: {
+          id: target.id,
+          fullName: target.full_name,
+          email: target.email
+        },
+        durationMinutes: 5
+      }
+    });
+
+  } catch (err) {
+    console.error('Impersonation error:', err.message);
+    res.status(500).json({ success: false, error: 'Failed to start impersonation' });
+  }
+});
+
+// ── POST /api/super-admin/impersonate/exit ───────────────────────────────────
+router.post('/impersonate/exit', async (req, res) => {
+  try {
+    // This endpoint accepts either admin token or impersonation token
+    const authHeader = req.headers.authorization;
+    if (!authHeader?.startsWith('Bearer ')) {
+      return res.status(401).json({ success: false, error: 'Unauthorized' });
+    }
+
+    const token = authHeader.split(' ')[1];
+    const jwt = require('jsonwebtoken');
+
+    let decoded;
+    try {
+      decoded = jwt.verify(token, process.env.JWT_SECRET);
+    } catch (err) {
+      // Token may be expired — still try to deactivate it
+      decoded = jwt.decode(token);
+    }
+
+    if (decoded?.impersonation && decoded?.userId) {
+      // Deactivate the impersonation token
+      await pool.query(
+        `UPDATE impersonation_tokens
+         SET is_active = FALSE, exited_at = NOW()
+         WHERE token = $1`,
+        [token]
+      );
+
+      // Log exit
+      if (decoded.adminId) {
+        await pool.query(
+          `INSERT INTO analytics_events (user_id, event_type, event_data)
+           VALUES ($1, 'super_admin_impersonation_exit', $2)`,
+          [decoded.adminId, JSON.stringify({
+            targetUserId: decoded.userId,
+            exitedAt: new Date().toISOString()
+          })]
+        );
+      }
+
+      console.log(`🔐 Impersonation ended for user ${decoded.userId}`);
+    }
+
+    res.json({ success: true, message: 'Impersonation ended' });
+
+  } catch (err) {
+    console.error('Impersonation exit error:', err.message);
+    res.status(500).json({ success: false, error: 'Failed to exit impersonation' });
+  }
+});
+
+// ── GET /api/super-admin/users/:id/export/full ───────────────────────────────
+router.get('/users/:id/export/full', authenticateSuperAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const [userResult, voiceNotes, contacts, scheduled, vault, activity] = await Promise.all([
+      pool.query(`SELECT id, full_name, email, phone, subscription_tier,
+                         subscription_status, email_verified, source,
+                         created_at, last_login, is_suspended
+                  FROM users WHERE id = $1`, [id]),
+      pool.query(`SELECT id, title, description, duration_seconds, file_size_bytes,
+                         is_favorite, is_permanent, play_count, source, created_at
+                  FROM voice_notes WHERE user_id = $1 AND deleted_at IS NULL
+                  ORDER BY created_at DESC`, [id]),
+      pool.query(`SELECT id, name, phone, email, relationship, is_beneficiary, created_at
+                  FROM contacts WHERE user_id = $1 ORDER BY created_at DESC`, [id]),
+      pool.query(`SELECT id, delivery_method, delivery_status, scheduled_for,
+                         delivered_at, recipient_phone, recipient_email, created_at
+                  FROM scheduled_messages WHERE user_id = $1 ORDER BY created_at DESC`, [id]),
+      pool.query(`SELECT id, title, release_condition, release_date, is_released, created_at
+                  FROM voice_wills WHERE user_id = $1 ORDER BY created_at DESC`, [id]),
+      pool.query(`SELECT event_type, event_data, created_at
+                  FROM analytics_events WHERE user_id = $1
+                  AND created_at >= NOW() - INTERVAL '90 days'
+                  ORDER BY created_at DESC LIMIT 1000`, [id])
+    ]);
+
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+
+    const exportData = {
+      exportedAt: new Date().toISOString(),
+      exportedBy: req.user.email,
+      user: userResult.rows[0],
+      voiceNotes: voiceNotes.rows,
+      contacts: contacts.rows,
+      scheduledMessages: scheduled.rows,
+      vault: vault.rows,
+      activityLog: activity.rows
+    };
+
+    const filename = `suretalk-user-${userResult.rows[0].full_name?.replace(/\s+/g, '-') || id}-${new Date().toISOString().split('T')[0]}.json`;
+
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.send(JSON.stringify(exportData, null, 2));
+
+  } catch (err) {
+    console.error('Export full user error:', err.message);
+    res.status(500).json({ success: false, error: 'Export failed' });
+  }
+});
+
+// ── GET /api/super-admin/users/:id/export/billing ────────────────────────────
+router.get('/users/:id/export/billing', authenticateSuperAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const [userResult, billing] = await Promise.all([
+      pool.query('SELECT full_name, email FROM users WHERE id = $1', [id]),
+      pool.query(`SELECT stripe_invoice_id, amount_cents, currency,
+                         description, status, tier_before, tier_after, created_at
+                  FROM billing_history WHERE user_id = $1
+                  ORDER BY created_at DESC`, [id])
+    ]);
+
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+
+    const headers = ['Invoice ID', 'Amount', 'Currency', 'Description',
+                     'Status', 'Tier Before', 'Tier After', 'Date'];
+
+    const rows = billing.rows.map(row => [
+      row.stripe_invoice_id || '',
+      `$${(row.amount_cents / 100).toFixed(2)}`,
+      (row.currency || 'USD').toUpperCase(),
+      `"${(row.description || '').replace(/"/g, '""')}"`,
+      row.status || '',
+      row.tier_before || '',
+      row.tier_after || '',
+      row.created_at ? new Date(row.created_at).toISOString().split('T')[0] : ''
+    ].join(','));
+
+    const csv = [headers.join(','), ...rows].join('\n');
+    const user = userResult.rows[0];
+    const filename = `suretalk-billing-${user.full_name?.replace(/\s+/g, '-') || id}-${new Date().toISOString().split('T')[0]}.csv`;
+
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.send(csv);
+
+  } catch (err) {
+    console.error('Export billing error:', err.message);
+    res.status(500).json({ success: false, error: 'Export failed' });
+  }
+});
+
+// ── GET /api/super-admin/users/:id/export/voice-notes ────────────────────────
+router.get('/users/:id/export/voice-notes', authenticateSuperAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const [userResult, notes] = await Promise.all([
+      pool.query('SELECT full_name FROM users WHERE id = $1', [id]),
+      pool.query(`SELECT id, title, description, duration_seconds, file_size_bytes,
+                         file_format, is_favorite, is_permanent, play_count,
+                         last_played, source, s3_bucket, created_at
+                  FROM voice_notes WHERE user_id = $1 AND deleted_at IS NULL
+                  ORDER BY created_at DESC`, [id])
+    ]);
+
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+
+    const headers = ['ID', 'Title', 'Description', 'Duration (s)', 'Size (bytes)',
+                     'Format', 'Favorite', 'Permanent', 'Play Count',
+                     'Last Played', 'Source', 'Bucket', 'Created'];
+
+    const rows = notes.rows.map(note => [
+      note.id,
+      `"${(note.title || '').replace(/"/g, '""')}"`,
+      `"${(note.description || '').replace(/"/g, '""')}"`,
+      note.duration_seconds || 0,
+      note.file_size_bytes || 0,
+      note.file_format || 'mp3',
+      note.is_favorite ? 'Yes' : 'No',
+      note.is_permanent ? 'Yes' : 'No',
+      note.play_count || 0,
+      note.last_played ? new Date(note.last_played).toISOString() : '',
+      note.source || 'app',
+      note.s3_bucket || '',
+      note.created_at ? new Date(note.created_at).toISOString() : ''
+    ].join(','));
+
+    const csv = [headers.join(','), ...rows].join('\n');
+    const filename = `suretalk-voice-notes-${userResult.rows[0].full_name?.replace(/\s+/g, '-') || id}-${new Date().toISOString().split('T')[0]}.csv`;
+
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.send(csv);
+
+  } catch (err) {
+    console.error('Export voice notes error:', err.message);
+    res.status(500).json({ success: false, error: 'Export failed' });
+  }
+});
+
+// ── GET /api/super-admin/export/sync-logs ────────────────────────────────────
+router.get('/export/sync-logs', authenticateSuperAdmin, async (req, res) => {
+  try {
+    const { days = 30 } = req.query;
+
+    const [outbox, received] = await Promise.all([
+      pool.query(`SELECT id, event_type, status, attempts,
+                         error_message, created_at, last_attempt_at
+                  FROM sync_outbox
+                  WHERE created_at >= NOW() - INTERVAL '${parseInt(days)} days'
+                  ORDER BY created_at DESC
+                  LIMIT 5000`),
+      pool.query(`SELECT id, source, event_type, created_at
+                  FROM sync_received_log
+                  WHERE created_at >= NOW() - INTERVAL '${parseInt(days)} days'
+                  ORDER BY created_at DESC
+                  LIMIT 5000`)
+    ]);
+
+    const outboxHeaders = ['ID', 'Event Type', 'Status', 'Attempts', 'Error', 'Created', 'Last Attempt'];
+    const outboxRows = outbox.rows.map(row => [
+      row.id,
+      row.event_type || '',
+      row.status || '',
+      row.attempts || 0,
+      `"${(row.error_message || '').replace(/"/g, '""')}"`,
+      row.created_at ? new Date(row.created_at).toISOString() : '',
+      row.last_attempt_at ? new Date(row.last_attempt_at).toISOString() : ''
+    ].join(','));
+
+    const receivedHeaders = ['ID', 'Source', 'Event Type', 'Created'];
+    const receivedRows = received.rows.map(row => [
+      row.id,
+      row.source || '',
+      row.event_type || '',
+      row.created_at ? new Date(row.created_at).toISOString() : ''
+    ].join(','));
+
+    const csv = [
+      `# App → IVR Sync Log (last ${days} days)`,
+      outboxHeaders.join(','),
+      ...outboxRows,
+      '',
+      `# IVR → App Sync Log (last ${days} days)`,
+      receivedHeaders.join(','),
+      ...receivedRows
+    ].join('\n');
+
+    const filename = `suretalk-sync-logs-${new Date().toISOString().split('T')[0]}.csv`;
+
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.send(csv);
+
+  } catch (err) {
+    console.error('Export sync logs error:', err.message);
+    res.status(500).json({ success: false, error: 'Export failed' });
+  }
+});
+
 // ── GET /api/super-admin/users/:id/full ──────────────────────────────────────
 // Complete user profile with all their data
 router.get('/users/:id/full', authenticateSuperAdmin, async (req, res) => {

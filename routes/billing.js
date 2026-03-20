@@ -196,6 +196,10 @@ router.post('/create-checkout', authenticate, [
   body('cancelUrl').notEmpty().withMessage('Cancel URL is required')
 ], async (req, res) => {
   try {
+    if (req.isImpersonating) {
+      return res.status(403).json({ success: false, error: 'This action is not allowed during impersonation' });
+    }
+
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
       console.log('Validation errors:', errors.array()); // Add this for debugging

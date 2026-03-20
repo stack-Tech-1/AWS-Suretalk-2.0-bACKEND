@@ -15,7 +15,30 @@ const authenticate = async (req, res, next) => {
     }
 
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    
+
+    // Check if this is an impersonation token
+    if (decoded.impersonation === true) {
+      const impResult = await pool.query(
+        `SELECT id, is_active, expires_at FROM impersonation_tokens WHERE token = $1`,
+        [token]
+      );
+
+      if (impResult.rows.length === 0 || !impResult.rows[0].is_active) {
+        return res.status(401).json({ success: false, error: 'Impersonation session has ended' });
+      }
+
+      if (new Date() > new Date(impResult.rows[0].expires_at)) {
+        await pool.query(
+          'UPDATE impersonation_tokens SET is_active = FALSE WHERE id = $1',
+          [impResult.rows[0].id]
+        );
+        return res.status(401).json({ success: false, error: 'Impersonation session has expired' });
+      }
+
+      req.isImpersonating = true;
+      req.impersonatingAdminId = decoded.adminId;
+    }
+
     // Check if user exists and is active
     const userQuery = await pool.query(
         `SELECT id, email, phone, full_name, subscription_tier, subscription_status, profile_image_url, is_admin FROM users WHERE id = $1 AND deleted_at IS NULL`,
