@@ -192,6 +192,36 @@ app.get('/api/test-stripe-connection', async (req, res) => {
   }
 });
 
+// Temporary: test Stripe API key auth
+app.get('/api/test-stripe-auth', async (req, res) => {
+  try {
+    const Stripe = require('stripe');
+    const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
+
+    // This is the fastest possible Stripe API call
+    const result = await Promise.race([
+      stripe.balance.retrieve(),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('Timed out after 8s')), 8000)
+      )
+    ]);
+
+    res.json({
+      success: true,
+      message: 'Stripe auth working',
+      available: result.available?.length
+    });
+  } catch (err) {
+    res.json({
+      success: false,
+      error: err.message,
+      type: err.type || 'unknown',
+      code: err.code || 'unknown',
+      statusCode: err.statusCode || 'unknown'
+    });
+  }
+});
+
 // API Routes - IMPORTANT: Webhook route must be defined BEFORE routes that need JSON
 // Dedicated Stripe webhook handler — registered before billing router so it takes priority
 app.use('/api/billing/webhook', express.raw({ type: 'application/json' }), require('./routes/stripeWebhook'));
