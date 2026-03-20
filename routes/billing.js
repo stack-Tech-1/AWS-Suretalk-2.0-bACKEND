@@ -313,10 +313,20 @@ router.post('/create-portal-session', authenticate, async (req, res) => {
 
     // Verify the customer still exists in Stripe before creating portal
     try {
-      await stripe.customers.retrieve(user.stripe_customer_id);
+      const customerPromise = stripe.customers.retrieve(user.stripe_customer_id);
+      const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('customer_lookup_timeout')), 8000)
+      );
+      await Promise.race([customerPromise, timeoutPromise]);
     } catch (stripeErr) {
-      if (stripeErr.type === 'StripeInvalidRequestError') {
-        // Customer deleted from Stripe — clear from DB
+      // Only clear customer ID if Stripe definitively says it doesn't exist
+      // Never clear on timeouts or connection errors
+      const isDefinitelyGone =
+        stripeErr.type === 'StripeInvalidRequestError' &&
+        (stripeErr.code === 'resource_missing' ||
+         stripeErr.message?.includes('No such customer'));
+
+      if (isDefinitelyGone) {
         await pool.query(
           'UPDATE users SET stripe_customer_id = NULL WHERE id = $1',
           [req.user.id]
@@ -327,7 +337,10 @@ router.post('/create-portal-session', authenticate, async (req, res) => {
           code: 'STRIPE_CUSTOMER_NOT_FOUND'
         });
       }
-      throw stripeErr;
+
+      // For timeouts or connection errors — keep the customer ID, just proceed
+      // The portal session creation will also have its own timeout
+      console.warn('Customer verification failed (non-fatal, proceeding):', stripeErr.message);
     }
 
     const portalPromise = stripe.billingPortal.sessions.create({
