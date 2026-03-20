@@ -336,7 +336,7 @@ router.post('/create-portal-session', authenticate, async (req, res) => {
     });
 
     const timeoutPromise = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error('Portal session request timed out')), 8000)
+      setTimeout(() => reject(new Error('Portal session request timed out after 8s')), 8000)
     );
 
     const session = await Promise.race([portalPromise, timeoutPromise]);
