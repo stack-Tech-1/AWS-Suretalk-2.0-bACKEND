@@ -292,34 +292,60 @@ router.post('/create-portal-session', authenticate, async (req, res) => {
 
     const { returnUrl } = req.body;
 
-    // Get Stripe customer ID
-    const user = await pool.query(
-      'SELECT stripe_customer_id FROM users WHERE id = $1',
+    const userResult = await pool.query(
+      `SELECT stripe_customer_id, stripe_subscription_id,
+              subscription_tier, full_name, email
+       FROM users WHERE id = $1`,
       [req.user.id]
     );
 
-    if (!user.rows[0]?.stripe_customer_id) {
+    const user = userResult.rows[0];
+
+    // No Stripe customer ID — explain clearly instead of crashing
+    if (!user?.stripe_customer_id) {
+      console.warn(`create-portal-session: no stripe_customer_id for user ${req.user.id}`);
       return res.status(400).json({
         success: false,
-        error: 'No subscription found'
+        error: 'No billing account found. If you subscribed via phone, please contact support to link your account.',
+        code: 'NO_STRIPE_CUSTOMER'
       });
     }
 
-    // Create portal session
+    // Verify the customer still exists in Stripe before creating portal
+    try {
+      await stripe.customers.retrieve(user.stripe_customer_id);
+    } catch (stripeErr) {
+      if (stripeErr.type === 'StripeInvalidRequestError') {
+        // Customer deleted from Stripe — clear from DB
+        await pool.query(
+          'UPDATE users SET stripe_customer_id = NULL WHERE id = $1',
+          [req.user.id]
+        );
+        return res.status(400).json({
+          success: false,
+          error: 'Billing account not found. Please contact support.',
+          code: 'STRIPE_CUSTOMER_NOT_FOUND'
+        });
+      }
+      throw stripeErr;
+    }
+
     const session = await stripe.billingPortal.sessions.create({
-      customer: user.rows[0].stripe_customer_id,
-      return_url: returnUrl || `${process.env.FRONTEND_URL}/dashboard/settings`
+      customer: user.stripe_customer_id,
+      return_url: returnUrl || `${process.env.FRONTEND_URL}/usersDashboard/billing`
     });
 
     res.json({
       success: true,
-      data: {
-        url: session.url
-      }
+      data: { url: session.url }
     });
 
   } catch (error) {
-    console.error('Create portal session error:', error);
+    console.error('Create portal session error:', {
+      message: error.message,
+      type: error.type,
+      userId: req.user.id
+    });
     res.status(500).json({
       success: false,
       error: 'Failed to create portal session'
