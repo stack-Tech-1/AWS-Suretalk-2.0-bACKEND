@@ -1270,7 +1270,10 @@ router.post('/profile-image', authenticate, async (req, res) => {
       CacheControl: 'max-age=31536000'
     });
 
-    const presignedUrl = await getSignedUrl(s3, command, { expiresIn: 300 });
+    const presignedUrl = await getSignedUrl(s3, command, {
+      expiresIn: 300,
+      unhoistableHeaders: new Set(['x-amz-checksum-crc32', 'x-amz-sdk-checksum-algorithm'])
+    });
 
     // The final public URL after upload
     const publicUrl = `https://${bucket}.s3.${process.env.AWS_REGION || 'eu-central-1'}.amazonaws.com/${s3Key}`;
