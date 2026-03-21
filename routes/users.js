@@ -1359,4 +1359,129 @@ router.delete('/account', authenticate, async (req, res) => {
   }
 });
 
+// ── GET /api/users/export ─────────────────────────────────────────────────────
+router.get('/export', authenticate, async (req, res) => {
+  try {
+    const XLSX = require('xlsx');
+    const userId = req.user.id;
+
+    const [userResult, voiceNotes, contacts, scheduled, activity] = await Promise.all([
+      pool.query(
+        `SELECT full_name, email, phone, subscription_tier,
+                subscription_status, created_at, last_login
+         FROM users WHERE id = $1`,
+        [userId]
+      ),
+      pool.query(
+        `SELECT title, description, duration_seconds, file_size_bytes,
+                is_favorite, is_permanent, play_count, source, created_at
+         FROM voice_notes
+         WHERE user_id = $1 AND deleted_at IS NULL
+         ORDER BY created_at DESC`,
+        [userId]
+      ),
+      pool.query(
+        `SELECT name, phone, email, relationship, is_beneficiary, created_at
+         FROM contacts WHERE user_id = $1 ORDER BY created_at DESC`,
+        [userId]
+      ),
+      pool.query(
+        `SELECT delivery_method, delivery_status, scheduled_for,
+                delivered_at, recipient_phone, recipient_email, created_at
+         FROM scheduled_messages WHERE user_id = $1 ORDER BY created_at DESC`,
+        [userId]
+      ),
+      pool.query(
+        `SELECT event_type, created_at
+         FROM analytics_events
+         WHERE user_id = $1
+           AND created_at >= NOW() - INTERVAL '90 days'
+         ORDER BY created_at DESC
+         LIMIT 500`,
+        [userId]
+      )
+    ]);
+
+    const user = userResult.rows[0];
+
+    const wb = XLSX.utils.book_new();
+
+    // Sheet 1 — Profile
+    const profileData = [{
+      'Full Name': user.full_name || '',
+      'Email': user.email || '',
+      'Phone': user.phone || '',
+      'Subscription Tier': user.subscription_tier || '',
+      'Status': user.subscription_status || '',
+      'Member Since': user.created_at ? new Date(user.created_at).toLocaleDateString() : '',
+      'Last Login': user.last_login ? new Date(user.last_login).toLocaleDateString() : ''
+    }];
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(profileData), 'Profile');
+
+    // Sheet 2 — Voice Notes
+    if (voiceNotes.rows.length > 0) {
+      const notesData = voiceNotes.rows.map(n => ({
+        'Title': n.title || '',
+        'Description': n.description || '',
+        'Duration (seconds)': n.duration_seconds || 0,
+        'Size (KB)': n.file_size_bytes ? Math.round(n.file_size_bytes / 1024) : 0,
+        'Favorite': n.is_favorite ? 'Yes' : 'No',
+        'Permanent': n.is_permanent ? 'Yes' : 'No',
+        'Play Count': n.play_count || 0,
+        'Source': n.source || 'app',
+        'Created': n.created_at ? new Date(n.created_at).toLocaleDateString() : ''
+      }));
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(notesData), 'Voice Notes');
+    }
+
+    // Sheet 3 — Contacts
+    if (contacts.rows.length > 0) {
+      const contactsData = contacts.rows.map(c => ({
+        'Name': c.name || '',
+        'Phone': c.phone || '',
+        'Email': c.email || '',
+        'Relationship': c.relationship || '',
+        'Beneficiary': c.is_beneficiary ? 'Yes' : 'No',
+        'Added': c.created_at ? new Date(c.created_at).toLocaleDateString() : ''
+      }));
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(contactsData), 'Contacts');
+    }
+
+    // Sheet 4 — Scheduled Messages
+    if (scheduled.rows.length > 0) {
+      const scheduledData = scheduled.rows.map(s => ({
+        'Delivery Method': s.delivery_method || '',
+        'Status': s.delivery_status || '',
+        'Scheduled For': s.scheduled_for ? new Date(s.scheduled_for).toLocaleString() : '',
+        'Delivered At': s.delivered_at ? new Date(s.delivered_at).toLocaleString() : '',
+        'Recipient Phone': s.recipient_phone || '',
+        'Recipient Email': s.recipient_email || '',
+        'Created': s.created_at ? new Date(s.created_at).toLocaleDateString() : ''
+      }));
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(scheduledData), 'Scheduled Messages');
+    }
+
+    // Sheet 5 — Activity Log
+    if (activity.rows.length > 0) {
+      const activityData = activity.rows.map(a => ({
+        'Event': a.event_type?.replace(/_/g, ' ') || '',
+        'Date': a.created_at ? new Date(a.created_at).toLocaleString() : ''
+      }));
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(activityData), 'Activity Log');
+    }
+
+    const buffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+    const filename = `SureTalk-Data-Export-${new Date().toISOString().split('T')[0]}.xlsx`;
+
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Content-Length', buffer.length);
+    res.send(buffer);
+
+  } catch (err) {
+    console.error('User export error:', err.message);
+    res.status(500).json({ success: false, error: 'Failed to export data' });
+  }
+});
+
 module.exports = router;

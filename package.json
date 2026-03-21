@@ -47,7 +47,8 @@
         "uuid": "^9.0.1",
         "web-push": "^3.6.7",
         "winston": "^3.10.0",
-        "ws": "^8.18.3"
+        "ws": "^8.18.3",
+        "xlsx": "^0.18.5"
     },
     "devDependencies": {
         "nodemon": "^3.0.1"
