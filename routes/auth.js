@@ -220,7 +220,8 @@ router.post('/login', validateLogin, async (req, res) => {
     }
 
     // Check subscription status
-    if (user.subscription_status !== 'active') {
+    const validStatuses = ['active', 'trialing', 'past_due'];
+    if (user.subscription_status && !validStatuses.includes(user.subscription_status)) {
       return res.status(403).json({
         success: false,
         error: 'Account is not active'
