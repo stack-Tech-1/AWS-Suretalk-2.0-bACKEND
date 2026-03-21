@@ -53,7 +53,8 @@ const authenticate = async (req, res, next) => {
     user.subscription_tier = normalizeTier(user.subscription_tier);
 
     // Check subscription status
-    if (user.subscription_status !== 'active') {
+    const validStatuses = ['active', 'trialing', 'past_due'];
+    if (user.subscription_status && !validStatuses.includes(user.subscription_status)) {
       throw new Error('Subscription not active');
     }
 
