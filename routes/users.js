@@ -1237,52 +1237,84 @@ router.get('/settings', authenticate, async (req, res) => {
 router.post('/profile-image', authenticate, async (req, res) => {
   try {
     const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
+    const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 
     const s3 = new S3Client({
-      region: process.env.AWS_REGION,
+      region: process.env.AWS_REGION || 'eu-central-1',
       credentials: {
         accessKeyId: process.env.AWS_ACCESS_KEY_ID,
         secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
       }
     });
 
-    const { imageData, contentType } = req.body;
-    if (!imageData) {
-      return res.status(400).json({ success: false, error: 'No image data provided' });
-    }
+    const { contentType } = req.body;
 
-    const base64Data = imageData.replace(/^data:image\/\w+;base64,/, '');
-    const imageBuffer = Buffer.from(base64Data, 'base64');
-
-    if (imageBuffer.length > 5 * 1024 * 1024) {
+    // Validate content type
+    const allowedTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
+    if (!contentType || !allowedTypes.includes(contentType)) {
       return res.status(400).json({
         success: false,
-        error: 'Image too large. Maximum size is 5MB.'
+        error: 'Invalid image type. Use JPEG, PNG, WebP or GIF.'
       });
     }
 
-    const s3Key = `profile-images/${req.user.id}/avatar.jpg`;
+    const ext = contentType.split('/')[1].replace('jpeg', 'jpg');
+    const s3Key = `profile-images/${req.user.id}/avatar.${ext}`;
     const bucket = process.env.AWS_S3_BUCKET_VOICE_NOTES;
 
-    await s3.send(new PutObjectCommand({
+    // Generate presigned URL for direct browser upload
+    const command = new PutObjectCommand({
       Bucket: bucket,
       Key: s3Key,
-      Body: imageBuffer,
-      ContentType: contentType || 'image/jpeg',
+      ContentType: contentType,
       CacheControl: 'max-age=31536000'
-    }));
+    });
 
-    const imageUrl = `https://${bucket}.s3.${process.env.AWS_REGION}.amazonaws.com/${s3Key}?t=${Date.now()}`;
+    const presignedUrl = await getSignedUrl(s3, command, { expiresIn: 300 });
+
+    // The final public URL after upload
+    const publicUrl = `https://${bucket}.s3.${process.env.AWS_REGION || 'eu-central-1'}.amazonaws.com/${s3Key}`;
+
+    res.json({
+      success: true,
+      data: {
+        presignedUrl,
+        publicUrl,
+        s3Key
+      }
+    });
+
+  } catch (err) {
+    console.error('Profile image presign error:', err.message);
+    res.status(500).json({ success: false, error: 'Failed to generate upload URL' });
+  }
+});
+
+// ── POST /api/users/profile-image/confirm ────────────────────────────────────
+router.post('/profile-image/confirm', authenticate, async (req, res) => {
+  try {
+    const { publicUrl } = req.body;
+
+    if (!publicUrl) {
+      return res.status(400).json({ success: false, error: 'No URL provided' });
+    }
+
+    // Add cache buster to force browser refresh
+    const urlWithCacheBuster = `${publicUrl}?t=${Date.now()}`;
 
     await pool.query(
       'UPDATE users SET profile_image_url = $1, updated_at = NOW() WHERE id = $2',
-      [imageUrl, req.user.id]
+      [urlWithCacheBuster, req.user.id]
     );
 
-    res.json({ success: true, data: { profileImageUrl: imageUrl } });
+    res.json({
+      success: true,
+      data: { profileImageUrl: urlWithCacheBuster }
+    });
+
   } catch (err) {
-    console.error('Profile image upload error:', err.message);
-    res.status(500).json({ success: false, error: 'Failed to upload profile image' });
+    console.error('Profile image confirm error:', err.message);
+    res.status(500).json({ success: false, error: 'Failed to save profile image' });
   }
 });
 
