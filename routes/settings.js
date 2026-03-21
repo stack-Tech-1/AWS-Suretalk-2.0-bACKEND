@@ -119,28 +119,6 @@ router.put('/', authenticate, [
         [JSON.stringify(bulkSettings), userId]
       );
 
-      // Also save important settings to system_settings for persistence
-      const importantSettings = [
-        { category: 'notifications', key: 'email', value: bulkSettings.notifications?.email, type: 'boolean' },
-        { category: 'notifications', key: 'push', value: bulkSettings.notifications?.push, type: 'boolean' },
-        { category: 'privacy', key: 'autoDelete', value: bulkSettings.privacy?.autoDelete, type: 'number' },
-        { category: 'appearance', key: 'theme', value: bulkSettings.appearance?.theme, type: 'string' },
-        { category: 'security', key: 'twoFactor', value: bulkSettings.security?.twoFactor, type: 'boolean' },
-        { category: 'security', key: 'sessionTimeout', value: bulkSettings.security?.sessionTimeout, type: 'number' },
-      ];
-
-      for (const setting of importantSettings) {
-        if (setting.value !== undefined) {
-          await pool.query(
-            `INSERT INTO system_settings (category, setting_key, setting_value, setting_type, created_by)
-             VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT (category, setting_key, created_by) 
-             DO UPDATE SET setting_value = EXCLUDED.setting_value, updated_at = CURRENT_TIMESTAMP`,
-            [setting.category, setting.key, String(setting.value), setting.type, userId]
-          );
-        }
-      }
-
     } else if (category && key !== undefined) {
       // Update single setting
       // First update in users table
@@ -160,20 +138,6 @@ router.put('/', authenticate, [
         [JSON.stringify(userSettings), userId]
       );
 
-      // Also save to system_settings for important settings
-      const importantKeys = ['email', 'push', 'autoDelete', 'theme', 'twoFactor', 'sessionTimeout'];
-      if (importantKeys.includes(key)) {
-        const settingType = typeof value === 'boolean' ? 'boolean' :
-                           typeof value === 'number' ? 'number' : 'string';
-
-        await pool.query(
-          `INSERT INTO system_settings (category, setting_key, setting_value, setting_type, created_by)
-           VALUES ($1, $2, $3, $4, $5)
-           ON CONFLICT (category, setting_key, created_by) 
-           DO UPDATE SET setting_value = EXCLUDED.setting_value, updated_at = CURRENT_TIMESTAMP`,
-          [category, key, String(value), settingType, userId]
-        );
-      }
     } else {
       return res.status(400).json({
         success: false,
