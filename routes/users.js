@@ -1523,4 +1523,63 @@ router.get('/export', authenticate, async (req, res) => {
   }
 });
 
+// ── GET /api/users/profile-image-url ─────────────────────────────────────────
+router.get('/profile-image-url', authenticate, async (req, res) => {
+  try {
+    const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
+    const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
+
+    const bucket = process.env.AWS_S3_BUCKET_VOICE_NOTES;
+    const region = process.env.AWS_REGION || 'eu-central-1';
+
+    // Get user's profile image s3 key from database
+    const userResult = await pool.query(
+      'SELECT profile_image_url FROM users WHERE id = $1',
+      [req.user.id]
+    );
+
+    const profileImageUrl = userResult.rows[0]?.profile_image_url;
+
+    if (!profileImageUrl) {
+      return res.json({ success: true, data: { presignedUrl: null } });
+    }
+
+    // Extract S3 key from the stored URL
+    // URL format: https://bucket.s3.region.amazonaws.com/key?t=timestamp
+    // OR it could already be an s3 key like: profile-images/userId/avatar.png
+    let s3Key;
+    try {
+      const urlObj = new URL(profileImageUrl);
+      // Remove leading slash and strip query params
+      s3Key = urlObj.pathname.replace(/^\//, '');
+    } catch {
+      // If it's already a key (not a full URL), use it directly
+      s3Key = profileImageUrl.replace(/\?.*$/, '');
+    }
+
+    const s3 = new S3Client({
+      region,
+      credentials: {
+        accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
+      },
+      forcePathStyle: false
+    });
+
+    const command = new GetObjectCommand({
+      Bucket: bucket,
+      Key: s3Key
+    });
+
+    // Presigned URL valid for 1 hour
+    const presignedUrl = await getSignedUrl(s3, command, { expiresIn: 3600 });
+
+    res.json({ success: true, data: { presignedUrl } });
+
+  } catch (err) {
+    console.error('Profile image URL error:', err.message);
+    res.status(500).json({ success: false, error: 'Failed to generate image URL' });
+  }
+});
+
 module.exports = router;
