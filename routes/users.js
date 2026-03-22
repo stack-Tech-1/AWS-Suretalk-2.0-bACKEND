@@ -1239,17 +1239,20 @@ router.post('/profile-image', authenticate, async (req, res) => {
     const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
     const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 
+    const bucket = process.env.AWS_S3_BUCKET_VOICE_NOTES; // suertalk-voice-notes
+    const region = process.env.AWS_REGION || 'eu-central-1';
+
     const s3 = new S3Client({
-      region: process.env.AWS_REGION || 'eu-central-1',
+      region,
       credentials: {
         accessKeyId: process.env.AWS_ACCESS_KEY_ID,
         secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
-      }
+      },
+      forcePathStyle: false  // Force virtual-hosted style URLs
     });
 
     const { contentType } = req.body;
 
-    // Validate content type
     const allowedTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
     if (!contentType || !allowedTypes.includes(contentType)) {
       return res.status(400).json({
@@ -1260,23 +1263,24 @@ router.post('/profile-image', authenticate, async (req, res) => {
 
     const ext = contentType.split('/')[1].replace('jpeg', 'jpg');
     const s3Key = `profile-images/${req.user.id}/avatar.${ext}`;
-    const bucket = process.env.AWS_S3_BUCKET_VOICE_NOTES;
 
-    // Generate presigned URL for direct browser upload
     const command = new PutObjectCommand({
       Bucket: bucket,
       Key: s3Key,
       ContentType: contentType,
-      CacheControl: 'max-age=31536000'
+      CacheControl: 'max-age=31536000',
+      ChecksumAlgorithm: undefined  // Remove checksum requirement
     });
 
+    // Generate presigned URL without checksum headers
     const presignedUrl = await getSignedUrl(s3, command, {
-      expiresIn: 300,
-      unhoistableHeaders: new Set(['x-amz-checksum-crc32', 'x-amz-sdk-checksum-algorithm'])
+      expiresIn: 300
     });
 
-    // The final public URL after upload
-    const publicUrl = `https://${bucket}.s3.${process.env.AWS_REGION || 'eu-central-1'}.amazonaws.com/${s3Key}`;
+    // Virtual-hosted style public URL
+    const publicUrl = `https://${bucket}.s3.${region}.amazonaws.com/${s3Key}`;
+
+    console.log('Profile image presigned URL generated:', { bucket, s3Key, region });
 
     res.json({
       success: true,
@@ -1289,7 +1293,7 @@ router.post('/profile-image', authenticate, async (req, res) => {
 
   } catch (err) {
     console.error('Profile image presign error:', err.message);
-    res.status(500).json({ success: false, error: 'Failed to generate upload URL' });
+    res.status(500).json({ success: false, error: 'Failed to generate upload URL: ' + err.message });
   }
 });
 
