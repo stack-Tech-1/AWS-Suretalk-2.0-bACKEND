@@ -11,6 +11,7 @@ const emailService = require('../utils/emailService');
 const twilio = require('twilio');
 const { syncToIvr } = require('../utils/syncIvr');
 const { normalizeTier, TIERS } = require('../utils/tierMapping');
+const axios = require('axios');
 
 const twilioClient = process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN
   ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
@@ -1054,6 +1055,30 @@ router.get('/test-twilio-account', async (req, res) => {
   try {
     const account = await twilioClient.api.accounts(process.env.TWILIO_ACCOUNT_SID).fetch();
     res.json({ success: true, account: { status: account.status, friendlyName: account.friendlyName } });
+  } catch (err) {
+    res.status(500).json({ error: err.message, code: err.code });
+  }
+});
+
+
+
+router.post('/test-twilio-messages', async (req, res) => {
+  const auth = Buffer.from(`${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`).toString('base64');
+  const url = `https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_ACCOUNT_SID}/Messages.json`;
+  const data = new URLSearchParams({
+    To: '+1234567890', // dummy number
+    From: process.env.TWILIO_PHONE_NUMBER,
+    Body: 'Test'
+  });
+  try {
+    const response = await axios.post(url, data, {
+      headers: {
+        'Authorization': `Basic ${auth}`,
+        'Content-Type': 'application/x-www-form-urlencoded'
+      },
+      timeout: 30000
+    });
+    res.json({ success: true, data: response.data });
   } catch (err) {
     res.status(500).json({ error: err.message, code: err.code });
   }
