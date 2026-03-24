@@ -1040,4 +1040,22 @@ router.post('/claim-account', validateClaimAccount, async (req, res) => {
   }
 });
 
+router.get('/test-outbound', async (req, res) => {
+  const https = require('https');
+  const options = {
+    hostname: 'api.twilio.com',
+    port: 443,
+    path: '/',
+    method: 'HEAD',
+    timeout: 10000
+  };
+  const reqTest = https.request(options, (resp) => {
+    res.json({ success: true, statusCode: resp.statusCode });
+  });
+  reqTest.on('error', (err) => {
+    res.status(500).json({ success: false, error: err.message, code: err.code });
+  });
+  reqTest.end();
+});
+
 module.exports = router;
