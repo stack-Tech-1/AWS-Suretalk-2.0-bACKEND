@@ -1047,4 +1047,16 @@ router.post('/claim-account', validateClaimAccount, async (req, res) => {
   }
 });
 
+router.get('/test-twilio-account', async (req, res) => {
+  if (!twilioClient) {
+    return res.status(500).json({ error: 'Twilio client not initialized' });
+  }
+  try {
+    const account = await twilioClient.api.accounts(process.env.TWILIO_ACCOUNT_SID).fetch();
+    res.json({ success: true, account: { status: account.status, friendlyName: account.friendlyName } });
+  } catch (err) {
+    res.status(500).json({ error: err.message, code: err.code });
+  }
+});
+
 module.exports = router;
