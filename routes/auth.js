@@ -918,6 +918,13 @@ router.post('/send-claim-otp', validateCheckPhone, async (req, res) => {
         to: phone
       });
     } catch (twilioErr) {
+      console.error('Twilio error:', {
+        code: twilioErr.code,
+        message: twilioErr.message,
+        status: twilioErr.status,
+        moreInfo: twilioErr.moreInfo,
+        stack: twilioErr.stack
+      });
       const connectivityCodes = ['ECONNABORTED', 'ECONNREFUSED', 'ETIMEDOUT'];
       if (connectivityCodes.includes(twilioErr.code)) {
         console.error('Twilio connectivity error:', twilioErr.code, twilioErr.message);
@@ -1038,24 +1045,6 @@ router.post('/claim-account', validateClaimAccount, async (req, res) => {
   } catch (err) {
     return res.status(500).json({ success: false, error: 'Server error' });
   }
-});
-
-router.get('/test-outbound', async (req, res) => {
-  const https = require('https');
-  const options = {
-    hostname: 'api.twilio.com',
-    port: 443,
-    path: '/',
-    method: 'HEAD',
-    timeout: 10000
-  };
-  const reqTest = https.request(options, (resp) => {
-    res.json({ success: true, statusCode: resp.statusCode });
-  });
-  reqTest.on('error', (err) => {
-    res.status(500).json({ success: false, error: err.message, code: err.code });
-  });
-  reqTest.end();
 });
 
 module.exports = router;
