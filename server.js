@@ -82,6 +82,7 @@ const corsOptions = {
         'https://test-api.suretalknow.com',
         'https://admin.suretalk.com',
         'https://main.dz6waicb3343e.amplifyapp.com',
+        'https://app.suretalknow.com',
         process.env.FRONTEND_URL
       ].filter(Boolean)
     : ['http://localhost:3000', 'http://localhost:3001'],
