@@ -91,6 +91,28 @@ router.post('/register', validateRegister, async (req, res) => {
       `INSERT INTO users (
         email, phone, password_hash, full_name, 
         subscription_tier, storage_limit_gb, contacts_limit, voice_notes_limit,
+        subscription_status, email_verified, source
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'active', false, 'app')
+      RETURNING id, email, phone, full_name, subscription_tier, 
+                storage_limit_gb, contacts_limit, voice_notes_limit,
+                created_at, email_verified, source`,
+      [
+        email,
+        phone,
+        passwordHash,
+        fullName,
+        normalizedTier,
+        storageLimitGb,
+        contactsLimit,
+        voiceNotesLimit
+      ]
+    );
+/*
+    // Create user with email_verified = false
+    const newUser = await pool.query(
+      `INSERT INTO users (
+        email, phone, password_hash, full_name, 
+        subscription_tier, storage_limit_gb, contacts_limit, voice_notes_limit,
         subscription_status, email_verified
       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'active', false)
       RETURNING id, email, phone, full_name, subscription_tier, 
@@ -107,7 +129,7 @@ router.post('/register', validateRegister, async (req, res) => {
         voiceNotesLimit
       ]
     );
-
+*/
     const createdUser = newUser.rows[0];
 
     // Generate email verification token
