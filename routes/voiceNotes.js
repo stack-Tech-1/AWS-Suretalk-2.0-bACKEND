@@ -122,10 +122,12 @@ router.get('/:id', authenticate, async (req, res) => {
 
     const note = result.rows[0];
     
-    // Generate download URL — route Twilio SIDs through the EC2 proxy, not S3
+    // Generate download URL — route Twilio SIDs through this server's own proxy, not directly
+    // to EC2, because the EC2 server sets cross-origin-resource-policy: same-origin which
+    // blocks the browser from loading audio cross-origin.
     const isTwilioSid = note.s3_key?.startsWith('RE') && note.s3_key?.length > 30 && !note.s3_key?.includes('/');
     const downloadUrl = isTwilioSid
-      ? `${process.env.EC2_STREAM_URL || 'https://test-api.suretalknow.com'}/api/stream-recording/${note.s3_key}`
+      ? `${req.protocol}://${req.get('host')}/api/audio/recording/${note.s3_key}`
       : await generateDownloadUrl(note.s3_key, note.s3_bucket, 3600);
 
     // Increment play count
@@ -787,7 +789,7 @@ router.get('/:id/download', authenticate, async (req, res) => {
     const { s3_key, s3_bucket } = result.rows[0];
     const isTwilioSid = s3_key?.startsWith('RE') && s3_key?.length > 30 && !s3_key?.includes('/');
     const downloadUrl = isTwilioSid
-      ? `${process.env.EC2_STREAM_URL || 'https://test-api.suretalknow.com'}/api/stream-recording/${s3_key}`
+      ? `${req.protocol}://${req.get('host')}/api/audio/recording/${s3_key}`
       : await generateDownloadUrl(s3_key, s3_bucket, 3600);
 
     res.json({
