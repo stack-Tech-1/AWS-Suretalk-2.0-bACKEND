@@ -298,20 +298,23 @@ router.post('/create-portal-session', authenticate, async (req, res) => {
 
     const userResult = await pool.query(
       `SELECT stripe_customer_id, stripe_subscription_id,
-              subscription_tier, full_name, email
+              subscription_tier, full_name, email, source
        FROM users WHERE id = $1`,
       [req.user.id]
     );
 
     const user = userResult.rows[0];
 
-    // No Stripe customer ID — explain clearly instead of crashing
+    // No Stripe customer ID — distinguish free web users from IVR subscribers
     if (!user?.stripe_customer_id) {
-      console.warn(`create-portal-session: no stripe_customer_id for user ${req.user.id}`);
+      console.warn(`create-portal-session: no stripe_customer_id for user ${req.user.id} (source=${user?.source})`);
+      const isIvr = user?.source === 'ivr';
       return res.status(400).json({
         success: false,
-        error: 'No billing account found. If you subscribed via phone, please contact support to link your account.',
-        code: 'NO_STRIPE_CUSTOMER'
+        error: isIvr
+          ? 'No billing account found. If you subscribed via phone, please contact support to link your account.'
+          : 'You are on the free LITE plan. Upgrade your subscription to access billing management.',
+        code: isIvr ? 'NO_STRIPE_CUSTOMER' : 'FREE_PLAN'
       });
     }
 
