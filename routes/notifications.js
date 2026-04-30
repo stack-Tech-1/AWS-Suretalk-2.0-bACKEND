@@ -121,18 +121,17 @@ router.post('/mark-all-read', authenticate, async (req, res) => {
     const userId = req.user.id;
 
     const result = await pool.query(
-      `UPDATE notifications 
-       SET is_read = true, read_at = CURRENT_TIMESTAMP 
-       WHERE user_id = $1 AND is_read = false
-       RETURNING COUNT(*) as marked_count`,
+      `UPDATE notifications
+       SET is_read = true, read_at = CURRENT_TIMESTAMP
+       WHERE user_id = $1 AND is_read = false`,
       [userId]
     );
 
     res.json({
       success: true,
-      message: `${result.rows[0].marked_count} notifications marked as read`,
+      message: `${result.rowCount} notifications marked as read`,
       data: {
-        marked_count: parseInt(result.rows[0].marked_count)
+        marked_count: result.rowCount
       }
     });
 
@@ -183,15 +182,15 @@ router.delete('/', authenticate, async (req, res) => {
     const userId = req.user.id;
 
     const result = await pool.query(
-      `DELETE FROM notifications WHERE user_id = $1 RETURNING COUNT(*) as deleted_count`,
+      `DELETE FROM notifications WHERE user_id = $1`,
       [userId]
     );
 
     res.json({
       success: true,
-      message: `${result.rows[0].deleted_count} notifications cleared`,
+      message: `${result.rowCount} notifications cleared`,
       data: {
-        deleted_count: parseInt(result.rows[0].deleted_count)
+        deleted_count: result.rowCount
       }
     });
 
