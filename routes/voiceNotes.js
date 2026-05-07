@@ -288,6 +288,30 @@ router.post('/upload', authenticate, uploadToS3('VOICE_NOTES').single('audio'), 
   }
 });
 
+// Return which IVR slots (1-15) are taken vs available for the current user
+router.get('/ivr-slots', authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT ivr_slot_number, title, id
+       FROM voice_notes
+       WHERE user_id = $1 AND deleted_at IS NULL AND ivr_slot_number IS NOT NULL
+       ORDER BY ivr_slot_number`,
+      [req.user.id]
+    );
+    const taken = result.rows.map(r => ({
+      slot: r.ivr_slot_number,
+      title: r.title,
+      id: r.id
+    }));
+    const takenNums = new Set(taken.map(t => t.slot));
+    const available = Array.from({ length: 15 }, (_, i) => i + 1).filter(n => !takenNums.has(n));
+    res.json({ success: true, data: { taken, available, totalSlots: 15 } });
+  } catch (error) {
+    console.error('Get IVR slots error:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch IVR slots' });
+  }
+});
+
 // Create voice note after upload (with pre-signed URL)
 router.post('/', authenticate, [
   body('title').notEmpty().trim(),
@@ -296,7 +320,8 @@ router.post('/', authenticate, [
   body('fileSize').isInt({ min: 1 }),
   body('duration').isInt({ min: 1 }),
   body('contactId').optional().isUUID(),
-  body('contactPending').optional().isBoolean()
+  body('contactPending').optional().isBoolean(),
+  body('slotNumber').optional().isInt({ min: 1, max: 15 })
 ], async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -318,7 +343,8 @@ router.post('/', authenticate, [
       isPermanent,
       scheduledFor,
       contactId,
-      contactPending
+      contactPending,
+      slotNumber
     } = req.body;
     
     // Process tags - handle both array and string formats
@@ -337,6 +363,21 @@ router.post('/', authenticate, [
         success: false,
         error: 'Permanent storage requires LEGACY_VAULT_PREMIUM tier'
       });
+    }
+
+    // Validate requested IVR slot is not already taken
+    if (slotNumber) {
+      const slotCheck = await pool.query(
+        `SELECT id, title FROM voice_notes
+         WHERE user_id = $1 AND ivr_slot_number = $2 AND deleted_at IS NULL`,
+        [req.user.id, parseInt(slotNumber)]
+      );
+      if (slotCheck.rows.length > 0) {
+        return res.status(409).json({
+          success: false,
+          error: `IVR slot ${slotNumber} is already used by "${slotCheck.rows[0].title}". Please choose a different slot.`
+        });
+      }
     }
 
     // Verify contactId belongs to this user (if provided)
@@ -428,12 +469,16 @@ router.post('/', authenticate, [
           takenSlotsResult.rows.map(r => r.ivr_slot_number)
         );
 
-        // Find lowest available slot not taken in PostgreSQL
+        // Use user-requested slot if provided, otherwise find the lowest available
         let candidateSlot = null;
-        for (let s = 1; s <= 15; s++) {
-          if (!takenInPostgres.has(s)) {
-            candidateSlot = s;
-            break;
+        if (slotNumber && !takenInPostgres.has(parseInt(slotNumber))) {
+          candidateSlot = parseInt(slotNumber);
+        } else {
+          for (let s = 1; s <= 15; s++) {
+            if (!takenInPostgres.has(s)) {
+              candidateSlot = s;
+              break;
+            }
           }
         }
 
@@ -524,6 +569,7 @@ router.post('/', authenticate, [
               'UPDATE voice_notes SET ivr_slot_number = $1 WHERE id = $2',
               [assignedSlot, note.id]
             );
+            note.ivr_slot_number = assignedSlot; // include in API response
             console.log(`Voice note ${note.id} assigned IVR slot ${assignedSlot} for user ${req.user.id}`);
           } else {
             console.warn(`No available IVR slots for user ${req.user.id} — all 15 slots occupied in DynamoDB`);
