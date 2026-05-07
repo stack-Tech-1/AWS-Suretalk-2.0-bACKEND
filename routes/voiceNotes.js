@@ -96,6 +96,31 @@ router.get('/', authenticate, async (req, res) => {
   }
 });
 
+// Return which IVR slots (1-15) are taken vs available for the current user
+// MUST be defined before GET /:id so "ivr-slots" isn't captured as an :id param
+router.get('/ivr-slots', authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT ivr_slot_number, title, id
+       FROM voice_notes
+       WHERE user_id = $1 AND deleted_at IS NULL AND ivr_slot_number IS NOT NULL
+       ORDER BY ivr_slot_number`,
+      [req.user.id]
+    );
+    const taken = result.rows.map(r => ({
+      slot: r.ivr_slot_number,
+      title: r.title,
+      id: r.id
+    }));
+    const takenNums = new Set(taken.map(t => t.slot));
+    const available = Array.from({ length: 15 }, (_, i) => i + 1).filter(n => !takenNums.has(n));
+    res.json({ success: true, data: { taken, available, totalSlots: 15 } });
+  } catch (error) {
+    console.error('Get IVR slots error:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch IVR slots' });
+  }
+});
+
 // Get single voice note
 router.get('/:id', authenticate, async (req, res) => {
   try {
@@ -285,30 +310,6 @@ router.post('/upload', authenticate, uploadToS3('VOICE_NOTES').single('audio'), 
       success: false,
       error: 'Failed to upload voice note'
     });
-  }
-});
-
-// Return which IVR slots (1-15) are taken vs available for the current user
-router.get('/ivr-slots', authenticate, async (req, res) => {
-  try {
-    const result = await pool.query(
-      `SELECT ivr_slot_number, title, id
-       FROM voice_notes
-       WHERE user_id = $1 AND deleted_at IS NULL AND ivr_slot_number IS NOT NULL
-       ORDER BY ivr_slot_number`,
-      [req.user.id]
-    );
-    const taken = result.rows.map(r => ({
-      slot: r.ivr_slot_number,
-      title: r.title,
-      id: r.id
-    }));
-    const takenNums = new Set(taken.map(t => t.slot));
-    const available = Array.from({ length: 15 }, (_, i) => i + 1).filter(n => !takenNums.has(n));
-    res.json({ success: true, data: { taken, available, totalSlots: 15 } });
-  } catch (error) {
-    console.error('Get IVR slots error:', error);
-    res.status(500).json({ success: false, error: 'Failed to fetch IVR slots' });
   }
 });
 
