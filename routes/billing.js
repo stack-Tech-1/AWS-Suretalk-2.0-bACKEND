@@ -732,6 +732,26 @@ async function handleCheckoutSessionCompleted(session) {
     
     console.log('✅ User updated successfully:', result.rows[0].email);
 
+    // Sync new tier to IVR/DynamoDB
+    try {
+      const { syncToIvr } = require('../utils/syncIvr');
+      const { ivrTierName } = require('../utils/tierMapping');
+      const updatedUser = result.rows[0];
+      if (updatedUser.phone) {
+        syncToIvr({
+          userId: updatedUser.phone,
+          subscription_tier: ivrTierName(tier),
+          subscription_status: 'active',
+          verified: true,
+          action: 'update',
+          source: 'checkout_completion'
+        }, 'sync-user');
+        console.log('✅ IVR sync triggered after checkout for user', userId);
+      }
+    } catch (syncErr) {
+      console.error('IVR sync failed after checkout (non-fatal):', syncErr.message);
+    }
+
     // FIXED: Check if session.invoice exists before creating billing record
     if (session.invoice) {
       await pool.query(
@@ -931,13 +951,32 @@ router.post('/change-tier', authenticate, [
     // Update limits based on tier
     const limits = getLimitsForTier(tier);
     await pool.query(
-      `UPDATE users 
+      `UPDATE users
        SET storage_limit_gb = $1,
            contacts_limit = $2,
            voice_notes_limit = $3
        WHERE id = $4`,
       [limits.storageGb, limits.contacts, limits.voiceNotes, userId]
     );
+
+    // Sync new tier to IVR/DynamoDB
+    try {
+      const { syncToIvr } = require('../utils/syncIvr');
+      const { ivrTierName } = require('../utils/tierMapping');
+      const changedUser = await pool.query('SELECT phone FROM users WHERE id = $1', [userId]);
+      if (changedUser.rows[0]?.phone) {
+        syncToIvr({
+          userId: changedUser.rows[0].phone,
+          subscription_tier: ivrTierName(tier),
+          verified: true,
+          action: 'update_tier',
+          source: 'app'
+        }, 'sync-user');
+        console.log('✅ IVR sync triggered after tier change for user', userId);
+      }
+    } catch (syncErr) {
+      console.error('IVR sync failed after tier change (non-fatal):', syncErr.message);
+    }
 
     res.json({
       success: true,
