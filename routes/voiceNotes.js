@@ -24,14 +24,14 @@ router.get('/', authenticate, async (req, res) => {
       SELECT vn.*,
              c.name  AS contact_name,
              c.phone AS contact_phone,
-             (SELECT COUNT(*) FROM voice_notes WHERE user_id = $1 AND deleted_at IS NULL) as total_count
+             (SELECT COUNT(*) FROM voice_notes WHERE user_id = $1 AND deleted_at IS NULL AND s3_bucket != $2) as total_count
       FROM voice_notes vn
       LEFT JOIN contacts c ON vn.contact_id = c.id
-      WHERE vn.user_id = $1 AND vn.deleted_at IS NULL
+      WHERE vn.user_id = $1 AND vn.deleted_at IS NULL AND vn.s3_bucket != $2
     `;
 
-    const queryParams = [req.user.id];
-    let paramCount = 2;
+    const queryParams = [req.user.id, BUCKETS.WILLS];
+    let paramCount = 3;
 
     // Apply filters
     if (filter === 'favorites') {
