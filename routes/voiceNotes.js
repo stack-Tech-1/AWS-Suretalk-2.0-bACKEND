@@ -113,8 +113,9 @@ router.get('/ivr-slots', authenticate, async (req, res) => {
       id: r.id
     }));
     const takenNums = new Set(taken.map(t => t.slot));
-    const available = Array.from({ length: 15 }, (_, i) => i + 1).filter(n => !takenNums.has(n));
-    res.json({ success: true, data: { taken, available, totalSlots: 15 } });
+    const slotLimit = req.user.subscription_tier === 'LITE' ? 3 : 9;
+    const available = Array.from({ length: slotLimit }, (_, i) => i + 1).filter(n => !takenNums.has(n));
+    res.json({ success: true, data: { taken, available, totalSlots: slotLimit } });
   } catch (error) {
     console.error('Get IVR slots error:', error);
     res.status(500).json({ success: false, error: 'Failed to fetch IVR slots' });
@@ -366,6 +367,17 @@ router.post('/', authenticate, [
       });
     }
 
+    // Validate slot is within the user's tier limit
+    if (slotNumber) {
+      const slotLimit = req.user.subscription_tier === 'LITE' ? 3 : 9;
+      if (parseInt(slotNumber) > slotLimit) {
+        return res.status(403).json({
+          success: false,
+          error: `Your plan allows a maximum of ${slotLimit} IVR slots. Please choose a slot between 1 and ${slotLimit}.`
+        });
+      }
+    }
+
     // Validate requested IVR slot is not already taken
     if (slotNumber) {
       const slotCheck = await pool.query(
@@ -471,11 +483,12 @@ router.post('/', authenticate, [
         );
 
         // Use user-requested slot if provided, otherwise find the lowest available
+        const slotLimit = req.user.subscription_tier === 'LITE' ? 3 : 9;
         let candidateSlot = null;
         if (slotNumber && !takenInPostgres.has(parseInt(slotNumber))) {
           candidateSlot = parseInt(slotNumber);
         } else {
-          for (let s = 1; s <= 15; s++) {
+          for (let s = 1; s <= slotLimit; s++) {
             if (!takenInPostgres.has(s)) {
               candidateSlot = s;
               break;
