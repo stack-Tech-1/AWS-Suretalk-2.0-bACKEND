@@ -50,7 +50,7 @@ router.get('/', authenticate, async (req, res) => {
     }
 
     // Order and pagination
-    query += ` ORDER BY vn.created_at DESC LIMIT $${paramCount} OFFSET $${paramCount + 1}`;
+    query += ` ORDER BY vn.ivr_slot_number ASC NULLS LAST, vn.created_at DESC LIMIT $${paramCount} OFFSET $${paramCount + 1}`;
     queryParams.push(parseInt(limit), offset);
 
     const result = await pool.query(query, queryParams);
