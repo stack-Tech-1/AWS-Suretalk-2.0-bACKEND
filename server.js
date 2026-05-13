@@ -354,13 +354,14 @@ app.post('/api/sync/user', syncAuth, async (req, res) => {
 
 // Receive new/updated slot from IVR
 app.post('/api/sync/slot', syncAuth, async (req, res) => {
-  const { 
+  const {
     userId,           // phone number from IVR
-    slotNumber,       // we can log it but won't use it for uniqueness     
+    slotNumber,       // we can log it but won't use it for uniqueness
     voiceMessage,     // this is the s3_key or full URL — use as unique identifier
-    createdAt, 
-    action, 
-    source = 'ivr' 
+    createdAt,
+    action,
+    source = 'ivr',
+    type              // optional: 'will' routes to voice_wills instead of voice_notes
   } = req.body;
 
   try {
@@ -396,42 +397,74 @@ app.post('/api/sync/slot', syncAuth, async (req, res) => {
         console.warn(`No voice note found to delete for user ${userId}, s3_key ${voiceMessage}`);
       }
     } else if (action === 'create' || action === 'update') {
-      // Idempotency check: skip INSERT if a note with the same s3_key already exists
-      const existingNote = await pool.query(
-        `SELECT id FROM voice_notes WHERE user_id = $1 AND s3_key = $2`,
-        [dbUserId, voiceMessage]
-      );
+      // If IVR explicitly marks this slot as a will, route to voice_wills
+      if (type === 'will') {
+        const isTwilioSid = voiceMessage &&
+          typeof voiceMessage === 'string' &&
+          voiceMessage.startsWith('RE') &&
+          voiceMessage.length > 30 &&
+          !voiceMessage.includes('/') &&
+          !voiceMessage.includes('http');
 
-      if (existingNote.rows.length > 0) {
-        console.log(`Duplicate sync-slot ignored: user ${userId}, s3_key ${voiceMessage}`);
-      } else {
-        await pool.query(
-          `INSERT INTO voice_notes (
-             user_id, slot_number, title, description,
-             s3_key, s3_bucket, recording_url,
-             file_size_bytes, duration_seconds, created_at, source
-           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-           ON CONFLICT (user_id, slot_number) DO UPDATE SET
-             title         = EXCLUDED.title,
-             description   = EXCLUDED.description,
-             s3_key        = EXCLUDED.s3_key,
-             recording_url = EXCLUDED.recording_url,
-             source        = EXCLUDED.source,
-             updated_at    = NOW()`,
-          [
-            dbUserId,
-            slotNumber,
-            `Voice Note ${slotNumber || '(imported)'}`,
-            null,
-            voiceMessage,
-            'suretalk-voicenotes-prod',
-            voiceMessage,
-            0,
-            0,
-            createdAt || new Date(),
-            source
-          ]
+        const s3KeyValue         = isTwilioSid ? null : (voiceMessage || null);
+        const twilioRecordingSid = isTwilioSid ? voiceMessage : null;
+
+        const existingWill = await pool.query(
+          `SELECT id FROM voice_wills WHERE user_id = $1 AND will_slot_number = $2 AND deleted_at IS NULL`,
+          [dbUserId, slotNumber]
         );
+
+        if (existingWill.rows.length === 0) {
+          await pool.query(
+            `INSERT INTO voice_wills (user_id, will_slot_number, s3_key, twilio_recording_sid, source, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING`,
+            [dbUserId, slotNumber, s3KeyValue, twilioRecordingSid, source, createdAt || new Date()]
+          );
+        } else {
+          await pool.query(
+            `UPDATE voice_wills SET s3_key = $1, twilio_recording_sid = $2, updated_at = NOW()
+             WHERE user_id = $3 AND will_slot_number = $4 AND deleted_at IS NULL`,
+            [s3KeyValue, twilioRecordingSid, dbUserId, slotNumber]
+          );
+        }
+      } else {
+        // Idempotency check: skip INSERT if a note with the same s3_key already exists
+        const existingNote = await pool.query(
+          `SELECT id FROM voice_notes WHERE user_id = $1 AND s3_key = $2`,
+          [dbUserId, voiceMessage]
+        );
+
+        if (existingNote.rows.length > 0) {
+          console.log(`Duplicate sync-slot ignored: user ${userId}, s3_key ${voiceMessage}`);
+        } else {
+          await pool.query(
+            `INSERT INTO voice_notes (
+               user_id, slot_number, title, description,
+               s3_key, s3_bucket, recording_url,
+               file_size_bytes, duration_seconds, created_at, source
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+             ON CONFLICT (user_id, slot_number) DO UPDATE SET
+               title         = EXCLUDED.title,
+               description   = EXCLUDED.description,
+               s3_key        = EXCLUDED.s3_key,
+               recording_url = EXCLUDED.recording_url,
+               source        = EXCLUDED.source,
+               updated_at    = NOW()`,
+            [
+              dbUserId,
+              slotNumber,
+              `Voice Note ${slotNumber || '(imported)'}`,
+              null,
+              voiceMessage,
+              'suretalk-voicenotes-prod',
+              voiceMessage,
+              0,
+              0,
+              createdAt || new Date(),
+              source
+            ]
+          );
+        }
       }
     } else {
       return res.status(400).json({ success: false, error: 'Invalid action' });

@@ -24,10 +24,10 @@ router.get('/', authenticate, async (req, res) => {
       SELECT vn.*,
              c.name  AS contact_name,
              c.phone AS contact_phone,
-             (SELECT COUNT(*) FROM voice_notes WHERE user_id = $1 AND deleted_at IS NULL AND s3_bucket != $2) as total_count
+             (SELECT COUNT(*) FROM voice_notes WHERE user_id = $1 AND deleted_at IS NULL AND s3_bucket != $2 AND is_will = FALSE) as total_count
       FROM voice_notes vn
       LEFT JOIN contacts c ON vn.contact_id = c.id
-      WHERE vn.user_id = $1 AND vn.deleted_at IS NULL AND vn.s3_bucket != $2
+      WHERE vn.user_id = $1 AND vn.deleted_at IS NULL AND vn.s3_bucket != $2 AND vn.is_will = FALSE
     `;
 
     const queryParams = [req.user.id, BUCKETS.WILLS];
@@ -906,6 +906,52 @@ router.get('/stats', authenticate, async (req, res) => {
       success: false,
       error: 'Failed to fetch statistics'
     });
+  }
+});
+
+// Convert an existing voice note into a voice will (moves record to voice_wills table)
+router.post('/:id/convert-to-will', authenticate, validateTier('LEGACY_VAULT_PREMIUM'), async (req, res) => {
+  try {
+    const noteResult = await pool.query(
+      `SELECT * FROM voice_notes WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL AND is_will = FALSE`,
+      [req.params.id, req.user.id]
+    );
+
+    if (noteResult.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Voice note not found' });
+    }
+
+    const n = noteResult.rows[0];
+
+    await pool.query(
+      `INSERT INTO voice_wills (
+         user_id, title, description, s3_key, s3_bucket,
+         twilio_recording_sid, will_slot_number, source, created_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       ON CONFLICT DO NOTHING`,
+      [
+        req.user.id,
+        n.title,
+        n.description,
+        n.s3_key,
+        n.s3_bucket,
+        n.twilio_recording_sid,
+        n.ivr_slot_number,
+        n.source,
+        n.created_at
+      ]
+    );
+
+    await pool.query(
+      `UPDATE voice_notes SET is_will = TRUE, deleted_at = NOW() WHERE id = $1`,
+      [n.id]
+    );
+
+    res.json({ success: true, message: 'Recording moved to Voice Wills' });
+
+  } catch (error) {
+    console.error('Convert to will error:', error);
+    res.status(500).json({ success: false, error: 'Failed to convert recording' });
   }
 });
 
