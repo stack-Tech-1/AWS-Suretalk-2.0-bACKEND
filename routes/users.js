@@ -166,7 +166,7 @@ router.get('/stats', authenticate, async (req, res) => {
         (SELECT COUNT(*) FROM voice_notes WHERE user_id = $1 AND deleted_at IS NULL) as voice_notes_total,
         (SELECT COALESCE(SUM(file_size_bytes), 0) FROM voice_notes WHERE user_id = $1 AND deleted_at IS NULL) as storage_bytes,
         (SELECT COUNT(*) FROM contacts WHERE user_id = $1) as contacts_total,
-        (SELECT COUNT(*) FROM scheduled_messages WHERE user_id = $1) as scheduled_messages_total,
+        (SELECT COUNT(*) FROM scheduled_messages WHERE user_id = $1 AND delivery_status = 'scheduled') as scheduled_messages_total,
         (SELECT COUNT(*) FROM voice_wills WHERE user_id = $1) as wills_total
       `,
       [req.user.id]
