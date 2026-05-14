@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { pool } = require('../config/database');
-const { generateDownloadUrl } = require('../utils/s3Storage');
+const { deleteFromS3 } = require('../utils/s3Storage');
 const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
 const { DynamoDBDocumentClient, GetCommand } = require('@aws-sdk/lib-dynamodb');
 
@@ -1395,6 +1395,78 @@ router.get('/system-health', authenticateSuperAdmin, async (req, res) => {
   } catch (err) {
     console.error('System health endpoint error:', { message: err.message, code: err.code });
     res.status(500).json({ success: false, error: 'Failed to fetch system health' });
+  }
+});
+
+// Hard delete — permanently wipe a user and all their data
+router.delete('/users/:id', authenticateSuperAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { confirm } = req.body;
+
+  if (confirm !== 'DELETE_USER') {
+    return res.status(400).json({ success: false, error: 'Missing confirmation. Send { confirm: "DELETE_USER" } in the request body.' });
+  }
+
+  try {
+    // 1. Fetch target user
+    const userResult = await pool.query(
+      'SELECT id, email, full_name, is_super_admin FROM users WHERE id = $1',
+      [id]
+    );
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+    const target = userResult.rows[0];
+
+    // 2. Block deletion of super admins
+    if (target.is_super_admin) {
+      return res.status(403).json({ success: false, error: 'Cannot delete a super admin account' });
+    }
+
+    // 3. Audit log BEFORE deletion
+    await pool.query(
+      `INSERT INTO admin_audit_log (admin_id, action, target_user_id, details, created_at)
+       VALUES ($1, 'hard_delete_user', $2, $3, NOW())`,
+      [req.user.id, id, JSON.stringify({ email: target.email, full_name: target.full_name, deleted_by: req.user.email })]
+    );
+
+    // 4. Collect all S3 files to delete
+    const [notesResult, willsResult] = await Promise.all([
+      pool.query('SELECT s3_key, s3_bucket FROM voice_notes WHERE user_id = $1 AND s3_key IS NOT NULL', [id]),
+      pool.query('SELECT s3_key, s3_bucket FROM voice_wills WHERE user_id = $1 AND s3_key IS NOT NULL', [id])
+    ]);
+    const s3Files = [...notesResult.rows, ...willsResult.rows];
+
+    // 5. Delete S3 objects (fire-and-forget — don't let S3 errors block user deletion)
+    if (s3Files.length > 0) {
+      Promise.allSettled(
+        s3Files.map(f => deleteFromS3(f.s3_key, f.s3_bucket))
+      ).catch(err => console.warn('S3 cleanup warning:', err.message));
+    }
+
+    // 6. NULL out non-CASCADE foreign key references
+    await pool.query('UPDATE system_logs SET user_id = NULL WHERE user_id = $1', [id]);
+    await pool.query('UPDATE lifecycle_rules SET created_by = NULL WHERE created_by = $1', [id]);
+    await pool.query('UPDATE rule_executions SET executed_by = NULL WHERE executed_by = $1', [id]);
+    await pool.query('UPDATE storage_config SET updated_by = NULL WHERE updated_by = $1', [id]);
+    await pool.query('UPDATE storage_reports SET uploaded_by = NULL WHERE uploaded_by = $1', [id]);
+    await pool.query(
+      `UPDATE knowledge_base_articles
+       SET published_by = CASE WHEN published_by = $1 THEN NULL ELSE published_by END,
+           created_by   = CASE WHEN created_by   = $1 THEN NULL ELSE created_by   END,
+           updated_by   = CASE WHEN updated_by   = $1 THEN NULL ELSE updated_by   END
+       WHERE published_by = $1 OR created_by = $1 OR updated_by = $1`,
+      [id]
+    );
+
+    // 7. Hard delete — CASCADE handles dependent tables automatically
+    await pool.query('DELETE FROM users WHERE id = $1', [id]);
+
+    res.json({ success: true, message: `User ${target.email} permanently deleted` });
+
+  } catch (err) {
+    console.error('Hard delete user error:', err);
+    res.status(500).json({ success: false, error: 'Failed to delete user' });
   }
 });
 
