@@ -1425,8 +1425,8 @@ router.delete('/users/:id', authenticateSuperAdmin, async (req, res) => {
 
     // 3. Audit log BEFORE deletion
     await pool.query(
-      `INSERT INTO admin_audit_log (admin_id, action, target_user_id, details, created_at)
-       VALUES ($1, 'hard_delete_user', $2, $3, NOW())`,
+      `INSERT INTO admin_audit_log (admin_user_id, action, target_id, new_value)
+       VALUES ($1, 'hard_delete_user', $2, $3)`,
       [req.user.id, id, JSON.stringify({ email: target.email, full_name: target.full_name, deleted_by: req.user.email })]
     );
 
