@@ -9,7 +9,6 @@ const { authenticate } = require('../middleware/auth');
 const tokenService = require('../utils/tokens');
 const emailService = require('../utils/emailService');
 const twilio = require('twilio');
-const AWS = require('aws-sdk');
 const { syncToIvr } = require('../utils/syncIvr');
 const { normalizeTier, TIERS } = require('../utils/tierMapping');
 const axios = require('axios');
@@ -17,8 +16,6 @@ const axios = require('axios');
 const twilioClient = process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN
   ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
   : null;
-
-const snsClient = new AWS.SNS({ region: process.env.AWS_REGION || 'eu-central-1' });
 
 // Validation middleware
 const validateRegister = [
@@ -910,6 +907,10 @@ router.post('/send-claim-otp', validateCheckPhone, async (req, res) => {
 
     const { phone } = req.body;
 
+    if (!twilioClient) {
+      return res.status(503).json({ success: false, error: 'SMS service unavailable' });
+    }
+
     // Verify account is IVR-created before sending OTP (prevents spam)
     const userResult = await pool.query(
       'SELECT id FROM users WHERE phone = $1 AND password_hash IS NULL AND deleted_at IS NULL',
@@ -931,20 +932,25 @@ router.post('/send-claim-otp', validateCheckPhone, async (req, res) => {
       [phone, otpHash]
     );
 
+    const SMS_TIMEOUT_MS = 15000;
     try {
-      await snsClient.publish({
-        Message: `Your SureTalk verification code is: ${otp}. Valid for 10 minutes.`,
-        PhoneNumber: phone,
-        MessageAttributes: {
-          'AWS.SNS.SMS.SMSType': {
-            DataType: 'String',
-            StringValue: 'Transactional'
-          }
-        }
-      }).promise();
-    } catch (snsErr) {
-      console.error('SNS SMS error:', snsErr.code, snsErr.message);
-      return res.status(503).json({ success: false, error: 'SMS gateway unreachable. Please contact support.' });
+      await Promise.race([
+        twilioClient.messages.create({
+          body: `Your SureTalk verification code is: ${otp}. Valid for 10 minutes.`,
+          from: process.env.TWILIO_PHONE_NUMBER,
+          to: phone
+        }),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(Object.assign(new Error('timeout of 8000ms exceeded'), { code: 'ETIMEDOUT' })), SMS_TIMEOUT_MS)
+        )
+      ]);
+    } catch (twilioErr) {
+      console.error('Twilio SMS error:', twilioErr.code, twilioErr.message);
+      const connectivityCodes = ['ECONNABORTED', 'ECONNREFUSED', 'ETIMEDOUT'];
+      if (connectivityCodes.includes(twilioErr.code)) {
+        return res.status(503).json({ success: false, error: 'SMS gateway unreachable. Please contact support.' });
+      }
+      throw twilioErr;
     }
 
     return res.json({ success: true, message: 'OTP sent to your phone number' });
