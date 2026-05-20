@@ -9,6 +9,7 @@ const { authenticate } = require('../middleware/auth');
 const tokenService = require('../utils/tokens');
 const emailService = require('../utils/emailService');
 const twilio = require('twilio');
+const AWS = require('aws-sdk');
 const { syncToIvr } = require('../utils/syncIvr');
 const { normalizeTier, TIERS } = require('../utils/tierMapping');
 const axios = require('axios');
@@ -16,6 +17,8 @@ const axios = require('axios');
 const twilioClient = process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN
   ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
   : null;
+
+const snsClient = new AWS.SNS({ region: process.env.AWS_REGION || 'eu-central-1' });
 
 // Validation middleware
 const validateRegister = [
@@ -905,10 +908,6 @@ router.post('/send-claim-otp', validateCheckPhone, async (req, res) => {
       return res.status(400).json({ success: false, errors: errors.array() });
     }
 
-    if (!twilioClient) {
-      return res.status(503).json({ success: false, error: 'SMS service unavailable' });
-    }
-
     const { phone } = req.body;
 
     // Verify account is IVR-created before sending OTP (prevents spam)
@@ -932,28 +931,20 @@ router.post('/send-claim-otp', validateCheckPhone, async (req, res) => {
       [phone, otpHash]
     );
 
-    // NOTE: If this times out in production, the App Runner service needs outbound internet access
-    // — check VPC NAT Gateway or App Runner network settings.
     try {
-      await twilioClient.messages.create({
-        body: `Your SureTalk verification code is: ${otp}. Valid for 10 minutes.`,
-        from: process.env.TWILIO_PHONE_NUMBER,
-        to: phone
-      });
-    } catch (twilioErr) {
-      console.error('Twilio error:', {
-        code: twilioErr.code,
-        message: twilioErr.message,
-        status: twilioErr.status,
-        moreInfo: twilioErr.moreInfo,
-        stack: twilioErr.stack
-      });
-      const connectivityCodes = ['ECONNABORTED', 'ECONNREFUSED', 'ETIMEDOUT'];
-      if (connectivityCodes.includes(twilioErr.code)) {
-        console.error('Twilio connectivity error:', twilioErr.code, twilioErr.message);
-        return res.status(503).json({ success: false, error: 'SMS gateway unreachable. Please contact support.' });
-      }
-      throw twilioErr;
+      await snsClient.publish({
+        Message: `Your SureTalk verification code is: ${otp}. Valid for 10 minutes.`,
+        PhoneNumber: phone,
+        MessageAttributes: {
+          'AWS.SNS.SMS.SMSType': {
+            DataType: 'String',
+            StringValue: 'Transactional'
+          }
+        }
+      }).promise();
+    } catch (snsErr) {
+      console.error('SNS SMS error:', snsErr.code, snsErr.message);
+      return res.status(503).json({ success: false, error: 'SMS gateway unreachable. Please contact support.' });
     }
 
     return res.json({ success: true, message: 'OTP sent to your phone number' });
