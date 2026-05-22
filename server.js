@@ -466,6 +466,15 @@ app.post('/api/sync/slot', syncAuth, async (req, res) => {
           );
         }
       }
+    } else if (action === 'updateContact') {
+      if (type === 'voiceWill' || type === 'will') {
+        await pool.query(
+          `UPDATE voice_wills SET contact_phone = $1, updated_at = NOW()
+           WHERE user_id = $2 AND will_slot_number = $3 AND deleted_at IS NULL`,
+          [contact || null, dbUserId, slotNumber]
+        );
+      }
+      // Regular voice note slots have no contact_phone — just acknowledge
     } else {
       return res.status(400).json({ success: false, error: 'Invalid action' });
     }
@@ -606,6 +615,11 @@ app.post('/api/sync/will', syncAuth, async (req, res) => {
     }
 
     const dbUserId = userResult.rows[0].id;
+
+    pool.query(
+      `INSERT INTO sync_received_log (source, event_type, payload) VALUES ('ivr', $1, $2)`,
+      [action || 'unknown', JSON.stringify(req.body)]
+    ).catch(err => console.warn('Will audit log error:', err.message));
 
     if (action === 'create' || action === 'update') {
       // Detect whether voiceMessage is a Twilio Recording SID or a URL/S3 key
