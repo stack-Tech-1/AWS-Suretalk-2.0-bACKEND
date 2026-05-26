@@ -4,13 +4,19 @@ const { pool } = require('../config/database');
 const { deleteFromS3 } = require('../utils/s3Storage');
 const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
 const { DynamoDBDocumentClient, GetCommand } = require('@aws-sdk/lib-dynamodb');
+const { NodeHttpHandler } = require('@smithy/node-http-handler');
 
 const dynamoClient = new DynamoDBClient({
   region: process.env.AWS_REGION || 'eu-central-1',
   credentials: {
     accessKeyId: process.env.AWS_ACCESS_KEY_ID,
     secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
-  }
+  },
+  requestHandler: new NodeHttpHandler({
+    requestTimeout: 10000,
+    connectionTimeout: 5000
+  }),
+  maxAttempts: 2
 });
 const dynamodb = DynamoDBDocumentClient.from(dynamoClient);
 
@@ -855,10 +861,19 @@ router.post('/users/:id/resync', authenticateSuperAdmin, async (req, res) => {
       );
       dynamoUser = dynamoResult.Item;
     } catch (dynamoErr) {
-      console.error('DynamoDB lookup failed:', dynamoErr.message);
-      return res.status(500).json({
+      const isTimeout = dynamoErr.name === 'TimeoutError' ||
+                        dynamoErr.message?.includes('timeout') ||
+                        dynamoErr.code === 'ETIMEDOUT';
+      console.error('DynamoDB lookup failed:', {
+        message: dynamoErr.message,
+        name: dynamoErr.name,
+        code: dynamoErr.code
+      });
+      return res.status(isTimeout ? 504 : 500).json({
         success: false,
-        error: `DynamoDB lookup failed: ${dynamoErr.message}`
+        error: isTimeout
+          ? 'IVR system lookup timed out — try again in a moment'
+          : `DynamoDB lookup failed: ${dynamoErr.message}`
       });
     }
 

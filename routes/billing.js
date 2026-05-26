@@ -370,7 +370,9 @@ router.post('/create-portal-session', authenticate, async (req, res) => {
     console.error('Create portal session error:', {
       message: error.message,
       type: error.type,
-      userId: req.user.id
+      code: error.code,
+      param: error.param,
+      userId: req.user?.id
     });
     res.status(500).json({
       success: false,
