@@ -274,6 +274,8 @@ const processScheduledMessages = async () => {
       if (message.recipient_phone &&
           (message.delivery_method === 'phone' || message.delivery_method === 'both')) {
 
+        console.log(`[twilio-call] START | msg=${sm.id} | to=${message.recipient_phone} | from=${process.env.TWILIO_PHONE_NUMBER} | audioUrl=${audioUrl || 'none'} | twilioConfigured=${!!twilioClient}`);
+        const callStart = Date.now();
         try {
           callSid = await makePhoneCall(
             message.recipient_phone,
@@ -282,12 +284,16 @@ const processScheduledMessages = async () => {
             message.custom_message
           );
           deliverySuccess = true;
+          console.log(`[twilio-call] SUCCESS | msg=${sm.id} | SID=${callSid} | elapsed=${Date.now() - callStart}ms`);
           logger.info(`Call delivered for message ${sm.id}, SID: ${callSid}`);
         } catch (callError) {
+          console.error(`[twilio-call] FAIL | msg=${sm.id} | elapsed=${Date.now() - callStart}ms | error=${callError.message} | code=${callError.code || 'n/a'} | status=${callError.status || 'n/a'}`);
           logger.error(`Call delivery failed for message ${sm.id}: ${callError.message || callError}`);
           errorMessages.push(`Call: ${callError.message}`);
         }
 
+        console.log(`[twilio-sms] START | msg=${sm.id} | to=${message.recipient_phone} | from=${process.env.TWILIO_PHONE_NUMBER}`);
+        const smsStart = Date.now();
         try {
           smsSid = await sendSMS(
             message.recipient_phone,
@@ -295,8 +301,10 @@ const processScheduledMessages = async () => {
             playerUrl,
             message.custom_message
           );
+          console.log(`[twilio-sms] SUCCESS | msg=${sm.id} | SID=${smsSid} | elapsed=${Date.now() - smsStart}ms`);
           logger.info(`SMS delivered for message ${sm.id}, SID: ${smsSid}`);
         } catch (smsError) {
+          console.error(`[twilio-sms] FAIL | msg=${sm.id} | elapsed=${Date.now() - smsStart}ms | error=${smsError.message} | code=${smsError.code || 'n/a'} | status=${smsError.status || 'n/a'}`);
           logger.error(`SMS delivery failed for message ${sm.id}: ${smsError.message || smsError}`);
           errorMessages.push(`SMS: ${smsError.message}`);
         }
