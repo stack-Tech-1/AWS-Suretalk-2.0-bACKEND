@@ -1523,6 +1523,131 @@ router.get('/export', authenticate, async (req, res) => {
   }
 });
 
+// ── GET /api/users/export/zip ─────────────────────────────────────────────────
+router.get('/export/zip', authenticate, async (req, res) => {
+  try {
+    const archiver = require('archiver');
+    const { generateDownloadUrl } = require('../utils/s3Storage');
+    const userId = req.user.id;
+    const dateStr = new Date().toISOString().split('T')[0];
+
+    const [profileResult, voiceNotesResult, contactsResult, scheduledResult, activityResult] = await Promise.all([
+      pool.query(
+        `SELECT full_name, email, phone, subscription_tier, subscription_status,
+                profile_image_url, created_at, last_login, settings
+         FROM users WHERE id = $1`, [userId]
+      ),
+      pool.query(
+        `SELECT id, title, description, s3_key, s3_bucket, twilio_recording_sid,
+                file_size_bytes, duration_seconds, is_favorite, is_permanent,
+                play_count, source, tags, created_at
+         FROM voice_notes
+         WHERE user_id = $1 AND deleted_at IS NULL
+         ORDER BY created_at DESC`, [userId]
+      ),
+      pool.query(
+        `SELECT id, name, phone, email, relationship, is_beneficiary,
+                can_receive_messages, created_at
+         FROM contacts WHERE user_id = $1 AND deleted_at IS NULL
+         ORDER BY name`, [userId]
+      ),
+      pool.query(
+        `SELECT sm.id, sm.scheduled_for, sm.delivery_method, sm.delivery_status,
+                sm.delivered_at, sm.recipient_email, sm.custom_message,
+                vn.title as voice_note_title, c.name as recipient_name, sm.created_at
+         FROM scheduled_messages sm
+         LEFT JOIN voice_notes vn ON vn.id = sm.voice_note_id
+         LEFT JOIN contacts c ON c.id = sm.recipient_contact_id
+         WHERE sm.user_id = $1
+         ORDER BY sm.scheduled_for DESC
+         LIMIT 500`, [userId]
+      ),
+      pool.query(
+        `SELECT event_type, metadata, created_at
+         FROM user_events
+         WHERE user_id = $1
+           AND created_at > NOW() - INTERVAL '90 days'
+         ORDER BY created_at DESC
+         LIMIT 500`, [userId]
+      )
+    ]);
+
+    const urlExpirySecs = 7 * 24 * 3600;
+    const urlExpiryDate = new Date(Date.now() + urlExpirySecs * 1000).toISOString();
+
+    const voiceNotesWithUrls = await Promise.all(
+      voiceNotesResult.rows.map(async (note) => {
+        let downloadUrl = null;
+        if (note.s3_key && note.s3_bucket &&
+            !note.s3_key.startsWith('RE') && !note.s3_key.startsWith('http')) {
+          try {
+            downloadUrl = await generateDownloadUrl(note.s3_key, note.s3_bucket, urlExpirySecs);
+          } catch { /* skip if URL generation fails */ }
+        }
+        const { s3_key, s3_bucket, ...rest } = note;
+        return {
+          ...rest,
+          source: note.twilio_recording_sid ? 'phone_call' : (note.source || 'app'),
+          download_url: downloadUrl,
+          download_url_expires: downloadUrl ? urlExpiryDate : null,
+          download_note: !downloadUrl
+            ? (note.twilio_recording_sid
+                ? 'Recorded via phone call — contact support to retrieve this file'
+                : 'No audio file available')
+            : null
+        };
+      })
+    );
+
+    const profile = profileResult.rows[0];
+    const settings = profile?.settings || {};
+    const { settings: _settings, ...profileWithoutSettings } = profile || {};
+
+    const readme = [
+      'SureTalk Data Export',
+      '====================',
+      `Exported: ${new Date().toLocaleString()}`,
+      `Account: ${profile?.email || ''}`,
+      '',
+      'Files in this archive:',
+      '  profile.json              — Your profile and account settings',
+      '  voice_notes.json          — All voice notes with audio download links',
+      '  contacts.json             — Your contacts',
+      '  scheduled_messages.json   — Scheduled and delivered messages',
+      '  activity_log.json         — Account activity (last 90 days)',
+      '',
+      'Audio Download Links:',
+      '  Each voice note in voice_notes.json includes a "download_url" field.',
+      '  These links are valid for 7 days from the export date.',
+      '  After that, generate a new export to get fresh links.',
+      '',
+      'Questions? Contact support@suretalknow.com',
+    ].join('\n');
+
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="SureTalk-Export-${dateStr}.zip"`);
+
+    const archive = archiver('zip', { zlib: { level: 6 } });
+    archive.on('error', (err) => { throw err; });
+    archive.pipe(res);
+
+    archive.append(readme, { name: 'README.txt' });
+    archive.append(JSON.stringify({ ...profileWithoutSettings, settings, exported_at: new Date().toISOString() }, null, 2), { name: 'profile.json' });
+    archive.append(JSON.stringify(voiceNotesWithUrls, null, 2), { name: 'voice_notes.json' });
+    archive.append(JSON.stringify(contactsResult.rows, null, 2), { name: 'contacts.json' });
+    archive.append(JSON.stringify(scheduledResult.rows, null, 2), { name: 'scheduled_messages.json' });
+    archive.append(JSON.stringify(activityResult.rows, null, 2), { name: 'activity_log.json' });
+
+    await archive.finalize();
+
+  } catch (error) {
+    console.error('ZIP export error:', error);
+    if (!res.headersSent) {
+      res.status(500).json({ success: false, error: 'Export failed' });
+    }
+  }
+});
+
 // ── GET /api/users/profile-image-url ─────────────────────────────────────────
 router.get('/profile-image-url', authenticate, async (req, res) => {
   try {
