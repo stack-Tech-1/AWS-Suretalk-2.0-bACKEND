@@ -1,15 +1,13 @@
 // C:\Users\SMC\Documents\GitHub\AWS-Suretalk-2.0-bACKEND\server.js
 require('dotenv').config();
 
-// Must run before any other require that touches the network.
+// Keepalive agent for AWS SDK and Stripe only.
 // AWS NAT gateway silently drops idle TCP connections after ~350 seconds.
-// keepAliveMsecs: 60s keeps them alive; freeSocketTimeout: 45s clears sockets
-// that have been idle so they're never reused when already dead.
+// Do NOT set https.globalAgent — it interferes with the Twilio SDK's own HTTP client.
 const https = require('https');
-https.globalAgent = new https.Agent({
+const keepAliveAgent = new https.Agent({
   keepAlive: true,
   keepAliveMsecs: 60_000,
-  maxSockets: 50,
   freeSocketTimeout: 45_000
 });
 
@@ -39,7 +37,7 @@ AWS.config.update({
   region: process.env.AWS_REGION || 'eu-central-1',
   accessKeyId: process.env.AWS_ACCESS_KEY_ID,
   secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
-  httpOptions: { agent: https.globalAgent }
+  httpOptions: { agent: keepAliveAgent }
 });
 
 

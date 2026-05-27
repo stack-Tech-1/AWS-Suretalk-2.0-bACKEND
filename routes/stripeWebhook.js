@@ -6,8 +6,9 @@ const { pool } = require('../config/database');
 const { syncToIvr } = require('../utils/syncIvr');
 const { ivrTierName } = require('../utils/tierMapping');
 
+const _stripeAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 60_000, freeSocketTimeout: 45_000 });
 const stripe = process.env.STRIPE_SECRET_KEY
-  ? new Stripe(process.env.STRIPE_SECRET_KEY, { httpAgent: https.globalAgent })
+  ? new Stripe(process.env.STRIPE_SECRET_KEY, { httpAgent: _stripeAgent })
   : null;
 
 // Map Stripe price IDs to internal tier names

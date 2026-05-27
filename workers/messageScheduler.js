@@ -144,6 +144,20 @@ const processScheduledMessages = async () => {
       [now]
     );
     lockedRows = result.rows;
+    // Increment delivery_attempts immediately while the row is still locked.
+    // This prevents the next cron tick from re-picking up the same message
+    // if delivery takes longer than 60 seconds (e.g. two 30s Twilio timeouts).
+    if (lockedRows.length > 0) {
+      const ids = lockedRows.map(r => r.id);
+      await client.query(
+        `UPDATE scheduled_messages
+         SET delivery_attempts = delivery_attempts + 1,
+             last_attempt_at   = $1,
+             updated_at        = $1
+         WHERE id = ANY($2)`,
+        [now, ids]
+      );
+    }
     await client.query('COMMIT');
   } catch (error) {
     await client.query('ROLLBACK').catch(() => {});
@@ -296,24 +310,21 @@ const processScheduledMessages = async () => {
       if (deliverySuccess) {
         await pool.query(
           `UPDATE scheduled_messages
-           SET delivery_status = 'delivered',
-               delivered_at = $1,
-               delivery_attempts = delivery_attempts + 1,
-               twilio_call_sid = $3,
+           SET delivery_status    = 'delivered',
+               delivered_at       = $1,
+               twilio_call_sid    = $3,
                twilio_message_sid = $4,
-               updated_at = $1
+               updated_at         = $1
            WHERE id = $2`,
           [now, sm.id, callSid || null, smsSid || null]
         );
       } else {
         await pool.query(
           `UPDATE scheduled_messages
-           SET delivery_attempts = delivery_attempts + 1,
-               last_attempt_at = $1,
-               error_message = $3,
-               updated_at = $1
-           WHERE id = $2`,
-          [now, sm.id, errorMessages.join(' | ') || 'All delivery methods failed']
+           SET error_message = $2,
+               updated_at    = $3
+           WHERE id = $1`,
+          [sm.id, errorMessages.join(' | ') || 'All delivery methods failed', now]
         );
       }
     } catch (error) {

@@ -8,9 +8,9 @@ const Stripe = require('stripe');
 const https = require('https');
 const { normalizeTier } = require('../utils/tierMapping');
 
-// Initialize Stripe
+const _stripeAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 60_000, freeSocketTimeout: 45_000 });
 const stripe = process.env.STRIPE_SECRET_KEY
-  ? new Stripe(process.env.STRIPE_SECRET_KEY, { httpAgent: https.globalAgent })
+  ? new Stripe(process.env.STRIPE_SECRET_KEY, { httpAgent: _stripeAgent })
   : null;
 
 // Get billing plans
