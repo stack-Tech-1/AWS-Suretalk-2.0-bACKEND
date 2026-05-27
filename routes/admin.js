@@ -1476,7 +1476,7 @@ router.post('/register-request', authenticate, [
       const offset = (page - 1) * limit;
 
       const queryParams = [];
-      let whereClause = `WHERE u.is_admin = true OR u.admin_status IS NOT NULL`;
+      let whereClause = `WHERE u.admin_status IN ('pending', 'approved', 'rejected')`;
 
       if (status && status !== 'all') {
         queryParams.push(status);
