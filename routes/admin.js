@@ -493,6 +493,41 @@ router.post('/wills/:id/release', authenticateAdmin, async (req, res) => {
   }
 });
 
+// Delete voice will (admin)
+router.delete('/wills/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const willQuery = await pool.query(
+      `SELECT id, title, user_id FROM voice_wills WHERE id = $1`,
+      [id]
+    );
+
+    if (willQuery.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'Voice will not found'
+      });
+    }
+
+    await pool.query(`DELETE FROM voice_wills WHERE id = $1`, [id]);
+
+    logAdminAudit({ userId: req.user.id, action: 'DELETE_WILL', targetId: id, oldValue: willQuery.rows[0], newValue: null, ipAddress: req.ip });
+
+    res.json({
+      success: true,
+      message: 'Voice will deleted successfully'
+    });
+
+  } catch (error) {
+    console.error('Delete voice will error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to delete voice will'
+    });
+  }
+});
+
 // Get system logs
 router.get('/logs', authenticateAdmin, async (req, res) => {
   try {
