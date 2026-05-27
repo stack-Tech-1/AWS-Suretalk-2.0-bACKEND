@@ -199,8 +199,9 @@ router.post('/login', validateLogin, async (req, res) => {
 
     // Find user with email_verified field
     const userQuery = await pool.query(
-      `SELECT id, email, phone, full_name, password_hash, subscription_tier, subscription_status, 
-        profile_image_url, last_login, is_admin, admin_status, email_verified
+      `SELECT id, email, phone, full_name, password_hash, subscription_tier, subscription_status,
+        profile_image_url, last_login, is_admin, admin_status, email_verified,
+        two_factor_enabled, two_factor_secret
         FROM users WHERE email = $1 AND deleted_at IS NULL`,
       [email]
     );
@@ -248,6 +249,21 @@ router.post('/login', validateLogin, async (req, res) => {
       return res.status(403).json({
         success: false,
         error: 'Account is not active'
+      });
+    }
+
+    // If 2FA is enabled, issue a short-lived tempToken instead of full auth tokens
+    if (user.two_factor_enabled) {
+      const tempToken = jwt.sign(
+        { userId: user.id, step: '2fa_required' },
+        process.env.JWT_SECRET,
+        { expiresIn: '5m' }
+      );
+      return res.json({
+        success: true,
+        requiresTwoFactor: true,
+        tempToken,
+        message: '2FA verification required'
       });
     }
 
@@ -1080,6 +1096,182 @@ router.get('/test-twilio-account', async (req, res) => {
 });
 
 
+
+// ─── 2FA Routes ───────────────────────────────────────────────────────────────
+
+// Start 2FA setup — generates secret + QR code, saves pending secret (not yet enabled)
+router.post('/2fa/setup', authenticate, async (req, res) => {
+  try {
+    const speakeasy = require('speakeasy');
+    const qrcode = require('qrcode');
+
+    const userResult = await pool.query('SELECT email FROM users WHERE id = $1', [req.user.id]);
+    const email = userResult.rows[0]?.email;
+
+    const secret = speakeasy.generateSecret({
+      name: `SureTalk (${email})`,
+      length: 20
+    });
+    const qrCode = await qrcode.toDataURL(secret.otpauth_url);
+
+    await pool.query(
+      'UPDATE users SET two_factor_secret = $1 WHERE id = $2',
+      [secret.base32, req.user.id]
+    );
+
+    res.json({ success: true, data: { secret: secret.base32, qrCode } });
+  } catch (error) {
+    console.error('2FA setup error:', error);
+    res.status(500).json({ success: false, error: 'Failed to start 2FA setup' });
+  }
+});
+
+// Confirm 2FA setup — verifies first TOTP, enables 2FA, returns backup codes
+router.post('/2fa/setup-verify', authenticate, async (req, res) => {
+  try {
+    const speakeasy = require('speakeasy');
+    const { token } = req.body;
+    if (!token) return res.status(400).json({ success: false, error: 'Token required' });
+
+    const userResult = await pool.query(
+      'SELECT two_factor_secret FROM users WHERE id = $1', [req.user.id]
+    );
+    const secret = userResult.rows[0]?.two_factor_secret;
+    if (!secret) return res.status(400).json({ success: false, error: '2FA setup not started' });
+
+    const valid = speakeasy.totp.verify({ secret, encoding: 'base32', token, window: 1 });
+    if (!valid) return res.status(400).json({ success: false, error: 'Invalid code. Try again.' });
+
+    const crypto = require('crypto');
+    const backupCodes = Array.from({ length: 10 }, () =>
+      crypto.randomBytes(4).toString('hex').toUpperCase()
+    );
+    const hashedCodes = backupCodes.map(c =>
+      crypto.createHash('sha256').update(c).digest('hex')
+    );
+
+    await pool.query(
+      'UPDATE users SET two_factor_enabled = true, two_factor_backup_codes = $1 WHERE id = $2',
+      [JSON.stringify(hashedCodes), req.user.id]
+    );
+
+    res.json({ success: true, data: { backupCodes } });
+  } catch (error) {
+    console.error('2FA setup-verify error:', error);
+    res.status(500).json({ success: false, error: 'Failed to enable 2FA' });
+  }
+});
+
+// Disable 2FA — requires current TOTP to confirm
+router.post('/2fa/disable', authenticate, async (req, res) => {
+  try {
+    const speakeasy = require('speakeasy');
+    const { token } = req.body;
+    if (!token) return res.status(400).json({ success: false, error: 'Token required' });
+
+    const userResult = await pool.query(
+      'SELECT two_factor_secret FROM users WHERE id = $1', [req.user.id]
+    );
+    const secret = userResult.rows[0]?.two_factor_secret;
+    if (!secret) return res.status(400).json({ success: false, error: '2FA is not enabled' });
+
+    const valid = speakeasy.totp.verify({ secret, encoding: 'base32', token, window: 1 });
+    if (!valid) return res.status(400).json({ success: false, error: 'Invalid authentication code' });
+
+    await pool.query(
+      `UPDATE users SET two_factor_enabled = false, two_factor_secret = NULL,
+       two_factor_backup_codes = '[]' WHERE id = $1`,
+      [req.user.id]
+    );
+
+    res.json({ success: true, message: '2FA has been disabled' });
+  } catch (error) {
+    console.error('2FA disable error:', error);
+    res.status(500).json({ success: false, error: 'Failed to disable 2FA' });
+  }
+});
+
+// Complete login with TOTP — exchanges tempToken + TOTP code for full auth tokens
+router.post('/2fa/verify', async (req, res) => {
+  try {
+    const speakeasy = require('speakeasy');
+    const { tempToken, token } = req.body;
+    if (!tempToken || !token) {
+      return res.status(400).json({ success: false, error: 'tempToken and token are required' });
+    }
+
+    let payload;
+    try {
+      payload = jwt.verify(tempToken, process.env.JWT_SECRET);
+    } catch {
+      return res.status(401).json({ success: false, error: 'Session expired. Please log in again.' });
+    }
+    if (payload.step !== '2fa_required') {
+      return res.status(400).json({ success: false, error: 'Invalid token type' });
+    }
+
+    const result = await pool.query(
+      `SELECT id, email, full_name, subscription_tier, subscription_status,
+              profile_image_url, last_login, is_admin, admin_status,
+              two_factor_secret
+       FROM users WHERE id = $1 AND deleted_at IS NULL`,
+      [payload.userId]
+    );
+    if (result.rows.length === 0) {
+      return res.status(401).json({ success: false, error: 'User not found' });
+    }
+    const user = result.rows[0];
+
+    const valid = speakeasy.totp.verify({
+      secret: user.two_factor_secret,
+      encoding: 'base32',
+      token,
+      window: 1
+    });
+    if (!valid) {
+      return res.status(400).json({ success: false, error: 'Invalid authentication code' });
+    }
+
+    await pool.query('UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = $1', [user.id]);
+
+    const accessToken = jwt.sign(
+      { userId: user.id, email: user.email, tier: user.subscription_tier, isAdmin: user.is_admin || false },
+      process.env.JWT_SECRET,
+      { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
+    );
+    const refreshToken = jwt.sign(
+      { userId: user.id },
+      process.env.JWT_REFRESH_SECRET,
+      { expiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '30d' }
+    );
+
+    const { normalizeTier } = require('../utils/tierMapping');
+    res.json({
+      success: true,
+      message: 'Login successful',
+      data: {
+        token: accessToken,
+        refreshToken,
+        user: {
+          id: user.id,
+          email: user.email,
+          full_name: user.full_name,
+          subscription_tier: normalizeTier(user.subscription_tier),
+          subscription_status: user.subscription_status,
+          profile_image_url: user.profile_image_url,
+          last_login: user.last_login,
+          is_admin: user.is_admin,
+          admin_status: user.admin_status
+        }
+      }
+    });
+  } catch (error) {
+    console.error('2FA verify error:', error);
+    res.status(500).json({ success: false, error: 'Verification failed' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 router.post('/test-twilio-messages', async (req, res) => {
   const auth = Buffer.from(`${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`).toString('base64');
