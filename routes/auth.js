@@ -218,6 +218,12 @@ router.post('/login', validateLogin, async (req, res) => {
     // Check password
     const isPasswordValid = await bcrypt.compare(password, user.password_hash);
     if (!isPasswordValid) {
+      pool.query(
+        `INSERT INTO system_logs (user_id, level, service, message, metadata, ip_address, user_agent)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [user.id, 'warning', 'auth', 'Failed login attempt',
+          JSON.stringify({ email }), req.ip || req.connection?.remoteAddress, req.get('user-agent') || '']
+      ).catch(err => console.error('system_log write failed:', err));
       return res.status(401).json({
         success: false,
         error: 'Invalid credentials'
@@ -272,6 +278,13 @@ router.post('/login', validateLogin, async (req, res) => {
       'UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = $1',
       [user.id]
     );
+
+    pool.query(
+      `INSERT INTO system_logs (user_id, level, service, message, metadata, ip_address, user_agent)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [user.id, 'info', 'auth', 'User logged in',
+        JSON.stringify({ email: user.email }), req.ip || req.connection?.remoteAddress, req.get('user-agent') || '']
+    ).catch(err => console.error('system_log write failed:', err));
 
     const token = jwt.sign(
       { 
@@ -609,6 +622,13 @@ router.post('/change-password', authenticate, [
       [newPasswordHash, req.user.id]
     );
 
+    pool.query(
+      `INSERT INTO system_logs (user_id, level, service, message, metadata, ip_address, user_agent)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [req.user.id, 'info', 'security', 'Password changed',
+        JSON.stringify({ email: req.user.email }), req.ip || req.connection?.remoteAddress, req.get('user-agent') || '']
+    ).catch(err => console.error('system_log write failed:', err));
+
     res.json({
       success: true,
       message: 'Password changed successfully'
@@ -625,8 +645,12 @@ router.post('/change-password', authenticate, [
 
 // Logout (client-side token invalidation)
 router.post('/logout', authenticate, async (req, res) => {
-  // Note: For true logout functionality, implement token blacklist
-  // This is a client-side logout (clear tokens from client)
+  pool.query(
+    `INSERT INTO system_logs (user_id, level, service, message, metadata, ip_address, user_agent)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [req.user.id, 'info', 'auth', 'User logged out',
+      JSON.stringify({ email: req.user.email }), req.ip || req.connection?.remoteAddress, req.get('user-agent') || '']
+  ).catch(err => console.error('system_log write failed:', err));
   res.json({
     success: true,
     message: 'Logged out successfully'
@@ -1229,10 +1253,23 @@ router.post('/2fa/verify', async (req, res) => {
       window: 1
     });
     if (!valid) {
+      pool.query(
+        `INSERT INTO system_logs (user_id, level, service, message, metadata, ip_address, user_agent)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [user.id, 'warning', 'auth', 'Failed 2FA attempt',
+          JSON.stringify({ email: user.email }), req.ip || req.connection?.remoteAddress, req.get('user-agent') || '']
+      ).catch(err => console.error('system_log write failed:', err));
       return res.status(400).json({ success: false, error: 'Invalid authentication code' });
     }
 
     await pool.query('UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = $1', [user.id]);
+
+    pool.query(
+      `INSERT INTO system_logs (user_id, level, service, message, metadata, ip_address, user_agent)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [user.id, 'info', 'auth', '2FA verified',
+        JSON.stringify({ email: user.email }), req.ip || req.connection?.remoteAddress, req.get('user-agent') || '']
+    ).catch(err => console.error('system_log write failed:', err));
 
     const accessToken = jwt.sign(
       { userId: user.id, email: user.email, tier: user.subscription_tier, isAdmin: user.is_admin || false },

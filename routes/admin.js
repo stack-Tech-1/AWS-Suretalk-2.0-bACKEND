@@ -531,62 +531,78 @@ router.delete('/wills/:id', authenticateAdmin, async (req, res) => {
 // Get system logs
 router.get('/logs', authenticateAdmin, async (req, res) => {
   try {
-    const { page = 1, limit = 100, level, service, startDate, endDate } = req.query;
+    const { page = 1, limit = 100, level, service, startDate, endDate, search } = req.query;
     const offset = (page - 1) * limit;
 
-    let query = `
-      SELECT 
-        sl.*,
-        u.email as user_email,
-        (SELECT COUNT(*) FROM system_logs WHERE 1=1) as total_count
-      FROM system_logs sl
-      LEFT JOIN users u ON sl.user_id = u.id
-      WHERE 1=1
-    `;
-
+    let baseWhere = `WHERE 1=1`;
     const queryParams = [];
     let paramCount = 1;
 
-    // Apply filters
     if (level && level !== 'all') {
-      query += ` AND sl.level = $${paramCount}`;
+      baseWhere += ` AND sl.level = $${paramCount}`;
       queryParams.push(level);
       paramCount++;
     }
 
     if (service && service !== 'all') {
-      query += ` AND sl.service = $${paramCount}`;
+      baseWhere += ` AND sl.service = $${paramCount}`;
       queryParams.push(service);
       paramCount++;
     }
 
     if (startDate) {
-      query += ` AND sl.created_at >= $${paramCount}`;
+      baseWhere += ` AND sl.created_at >= $${paramCount}`;
       queryParams.push(new Date(startDate));
       paramCount++;
     }
 
     if (endDate) {
-      query += ` AND sl.created_at <= $${paramCount}`;
+      baseWhere += ` AND sl.created_at <= $${paramCount}`;
       queryParams.push(new Date(endDate));
       paramCount++;
     }
 
-    // Order and pagination
-    query += ` ORDER BY sl.created_at DESC LIMIT $${paramCount} OFFSET $${paramCount + 1}`;
-    queryParams.push(parseInt(limit), offset);
+    if (search) {
+      baseWhere += ` AND (sl.message ILIKE $${paramCount} OR u.email ILIKE $${paramCount} OR sl.ip_address ILIKE $${paramCount})`;
+      queryParams.push(`%${search}%`);
+      paramCount++;
+    }
 
-    const result = await pool.query(query, queryParams);
+    const countQuery = `
+      SELECT COUNT(*) as total
+      FROM system_logs sl
+      LEFT JOIN users u ON sl.user_id = u.id
+      ${baseWhere}
+    `;
+
+    const dataQuery = `
+      SELECT sl.*, u.email as user_email
+      FROM system_logs sl
+      LEFT JOIN users u ON sl.user_id = u.id
+      ${baseWhere}
+      ORDER BY sl.created_at DESC
+      LIMIT $${paramCount} OFFSET $${paramCount + 1}
+    `;
+
+    const countParams = [...queryParams];
+    queryParams.push(parseInt(limit), parseInt(offset));
+
+    const [countResult, dataResult] = await Promise.all([
+      pool.query(countQuery, countParams),
+      pool.query(dataQuery, queryParams)
+    ]);
+
+    const total = parseInt(countResult.rows[0].total);
 
     res.json({
       success: true,
       data: {
-        logs: result.rows,
+        logs: dataResult.rows,
         pagination: {
           page: parseInt(page),
           limit: parseInt(limit),
-          total: result.rows[0]?.total_count || 0,
-          totalPages: Math.ceil((result.rows[0]?.total_count || 0) / limit)
+          total,
+          totalPages: Math.ceil(total / parseInt(limit))
         }
       }
     });
@@ -602,14 +618,20 @@ router.get('/logs', authenticateAdmin, async (req, res) => {
 
 // In routes/admin.js - Add these new routes:
 
-// Delete user (admin only)
+// Delete user (admin only) — hard delete with FK cleanup
 router.delete('/users/:id', authenticateAdmin, async (req, res) => {
-  try {
-    const { id } = req.params;
+  const { id } = req.params;
 
-    // Check if user exists
+  if (req.user.id === id) {
+    return res.status(400).json({
+      success: false,
+      error: 'You cannot delete your own account'
+    });
+  }
+
+  try {
     const userCheck = await pool.query(
-      'SELECT id FROM users WHERE id = $1 AND deleted_at IS NULL',
+      'SELECT id, email, full_name FROM users WHERE id = $1',
       [id]
     );
 
@@ -620,27 +642,40 @@ router.delete('/users/:id', authenticateAdmin, async (req, res) => {
       });
     }
 
-    // Soft delete - set deleted_at timestamp
-    await pool.query(
-      'UPDATE users SET deleted_at = CURRENT_TIMESTAMP WHERE id = $1',
-      [id]
-    );
+    const deletedUser = userCheck.rows[0];
 
-    // Log the deletion
-    await pool.query(
+    await pool.query('BEGIN');
+
+    // NULL out non-cascaded FK references so the DELETE doesn't error
+    await pool.query(`UPDATE system_logs SET user_id = NULL WHERE user_id = $1`, [id]);
+    await pool.query(`UPDATE lifecycle_rules SET created_by = NULL WHERE created_by = $1`, [id]);
+    await pool.query(`UPDATE voice_wills SET released_by = NULL WHERE released_by = $1`, [id]);
+    await pool.query(`UPDATE users SET approved_by_admin_id = NULL WHERE approved_by_admin_id = $1`, [id]);
+    await pool.query(`UPDATE users SET rejected_by_admin_id = NULL WHERE rejected_by_admin_id = $1`, [id]);
+    await pool.query(`UPDATE users SET requested_by_admin_id = NULL WHERE requested_by_admin_id = $1`, [id]);
+
+    // Hard delete — cascades contacts, voice_notes, voice_wills, scheduled_messages,
+    // billing_history, user_sessions, notifications, push_subscriptions, analytics_events
+    await pool.query(`DELETE FROM users WHERE id = $1`, [id]);
+
+    await pool.query('COMMIT');
+
+    // Log after commit (using admin's own user_id so it persists)
+    pool.query(
       `INSERT INTO system_logs (user_id, level, service, message, metadata)
-       VALUES ($1, 'warn', 'admin', 'User deleted by admin', $2)`,
-      [req.user.id, JSON.stringify({ deletedUserId: id })]
-    );
+       VALUES ($1, 'warn', 'admin', 'User permanently deleted by admin', $2)`,
+      [req.user.id, JSON.stringify({ deletedUserId: id, email: deletedUser.email })]
+    ).catch(err => console.error('system_log write failed:', err));
 
     logAdminAudit({ userId: req.user.id, action: 'DELETE_USER', targetId: id, ipAddress: req.ip });
 
     res.json({
       success: true,
-      message: 'User deleted successfully'
+      message: 'User permanently deleted'
     });
 
   } catch (error) {
+    await pool.query('ROLLBACK').catch(() => {});
     console.error('Delete user error:', error);
     res.status(500).json({
       success: false,
@@ -1340,7 +1375,7 @@ router.post('/register-request', authenticate, [
     body('email').isEmail().normalizeEmail(),
     body('phone').isMobilePhone(),
     body('fullName').notEmpty().trim(),
-    body('password').isLength({ min: 10 }),
+    body('password').isLength({ min: 12 }),
     body('reason').notEmpty().trim(),
     body('department').optional().trim(),
     body('requestedBy').optional().trim()
@@ -1437,11 +1472,23 @@ router.post('/register-request', authenticate, [
   // Get pending admin requests (for existing admins)
   router.get('/pending-requests', authenticateAdmin, async (req, res) => {
     try {
-      const { page = 1, limit = 20 } = req.query;
+      const { page = 1, limit = 20, status } = req.query;
       const offset = (page - 1) * limit;
-  
+
+      const queryParams = [];
+      let whereClause = `WHERE u.is_admin = true OR u.admin_status IS NOT NULL`;
+
+      if (status && status !== 'all') {
+        queryParams.push(status);
+        whereClause = `WHERE u.admin_status = $${queryParams.length}`;
+      }
+
+      queryParams.push(parseInt(limit), offset);
+      const limitParam = queryParams.length - 1;
+      const offsetParam = queryParams.length;
+
       const result = await pool.query(
-        `SELECT 
+        `SELECT
             u.id,
             u.email,
             u.phone,
@@ -1455,13 +1502,13 @@ router.post('/register-request', authenticate, [
             COUNT(*) OVER() AS total_count
             FROM users u
             LEFT JOIN users ru ON u.requested_by_admin_id = ru.id
-            WHERE u.admin_status = 'pending'
+            ${whereClause}
             ORDER BY u.created_at DESC
-            LIMIT $1 OFFSET $2
+            LIMIT $${limitParam} OFFSET $${offsetParam}
             `,
-        [parseInt(limit), offset]
+        queryParams
       );
-  
+
       res.json({
         success: true,
         data: {
@@ -1473,12 +1520,12 @@ router.post('/register-request', authenticate, [
           pagination: {
             page: parseInt(page),
             limit: parseInt(limit),
-            total: result.rows[0]?.total_count || 0,
+            total: parseInt(result.rows[0]?.total_count || 0),
             totalPages: Math.ceil((result.rows[0]?.total_count || 0) / limit)
           }
         }
       });
-  
+
     } catch (error) {
       console.error('Get pending requests error:', error);
       res.status(500).json({
