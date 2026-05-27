@@ -710,6 +710,11 @@ app.post('/api/sync/credential', syncAuth, async (req, res) => {
   }
 
   try {
+    await pool.query(
+      `INSERT INTO sync_received_log (source, event_type, payload) VALUES ('ivr', $1, $2)`,
+      [action, JSON.stringify(req.body)]
+    );
+
     // If userId changed (oldUserId provided and different), update phone
     if (oldUserId && oldUserId !== userId) {
       await pool.query(
