@@ -1548,7 +1548,7 @@ router.get('/export/zip', authenticate, async (req, res) => {
       pool.query(
         `SELECT id, name, phone, email, relationship, is_beneficiary,
                 can_receive_messages, created_at
-         FROM contacts WHERE user_id = $1 AND deleted_at IS NULL
+         FROM contacts WHERE user_id = $1
          ORDER BY name`, [userId]
       ),
       pool.query(
