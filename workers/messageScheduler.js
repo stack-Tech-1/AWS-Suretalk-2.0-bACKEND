@@ -245,7 +245,7 @@ const processScheduledMessages = async () => {
           deliverySuccess = true;
           logger.info(`Email delivered for message ${sm.id}`);
         } catch (emailError) {
-          logger.error(`Email delivery failed for message ${sm.id}:`, emailError.message);
+          logger.error(`Email delivery failed for message ${sm.id}: ${emailError.message || emailError}`);
           errorMessages.push(`Email: ${emailError.message}`);
         }
       }
@@ -264,7 +264,7 @@ const processScheduledMessages = async () => {
           deliverySuccess = true;
           logger.info(`Call delivered for message ${sm.id}, SID: ${callSid}`);
         } catch (callError) {
-          logger.error(`Call delivery failed for message ${sm.id}:`, callError.message);
+          logger.error(`Call delivery failed for message ${sm.id}: ${callError.message || callError}`);
           errorMessages.push(`Call: ${callError.message}`);
         }
 
@@ -277,7 +277,7 @@ const processScheduledMessages = async () => {
           );
           logger.info(`SMS delivered for message ${sm.id}, SID: ${smsSid}`);
         } catch (smsError) {
-          logger.error(`SMS delivery failed for message ${sm.id}:`, smsError.message);
+          logger.error(`SMS delivery failed for message ${sm.id}: ${smsError.message || smsError}`);
           errorMessages.push(`SMS: ${smsError.message}`);
         }
       }
@@ -306,7 +306,7 @@ const processScheduledMessages = async () => {
         );
       }
     } catch (error) {
-      console.error(`Error processing message ${sm.id}:`, error);
+      logger.error(`Error processing message ${sm.id}: ${error.message || error}`);
     }
   }
 

@@ -1,5 +1,18 @@
 // C:\Users\SMC\Documents\GitHub\AWS-Suretalk-2.0-bACKEND\server.js
 require('dotenv').config();
+
+// Must run before any other require that touches the network.
+// AWS NAT gateway silently drops idle TCP connections after ~350 seconds.
+// keepAliveMsecs: 60s keeps them alive; freeSocketTimeout: 45s clears sockets
+// that have been idle so they're never reused when already dead.
+const https = require('https');
+https.globalAgent = new https.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 60_000,
+  maxSockets: 50,
+  freeSocketTimeout: 45_000
+});
+
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
@@ -25,7 +38,8 @@ const backupRoutes = require('./routes/backup');
 AWS.config.update({
   region: process.env.AWS_REGION || 'eu-central-1',
   accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
+  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+  httpOptions: { agent: https.globalAgent }
 });
 
 

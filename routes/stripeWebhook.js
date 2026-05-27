@@ -1,12 +1,13 @@
 const express = require('express');
 const router = express.Router();
 const Stripe = require('stripe');
+const https = require('https');
 const { pool } = require('../config/database');
 const { syncToIvr } = require('../utils/syncIvr');
 const { ivrTierName } = require('../utils/tierMapping');
 
 const stripe = process.env.STRIPE_SECRET_KEY
-  ? new Stripe(process.env.STRIPE_SECRET_KEY)
+  ? new Stripe(process.env.STRIPE_SECRET_KEY, { httpAgent: https.globalAgent })
   : null;
 
 // Map Stripe price IDs to internal tier names

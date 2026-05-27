@@ -5,11 +5,12 @@ const { body, validationResult } = require('express-validator');
 const { authenticate } = require('../middleware/auth');
 const { pool } = require('../config/database');
 const Stripe = require('stripe');
+const https = require('https');
 const { normalizeTier } = require('../utils/tierMapping');
 
 // Initialize Stripe
-const stripe = process.env.STRIPE_SECRET_KEY 
-  ? new Stripe(process.env.STRIPE_SECRET_KEY)
+const stripe = process.env.STRIPE_SECRET_KEY
+  ? new Stripe(process.env.STRIPE_SECRET_KEY, { httpAgent: https.globalAgent })
   : null;
 
 // Get billing plans
