@@ -1553,7 +1553,7 @@ router.get('/export/zip', authenticate, async (req, res) => {
       ),
       pool.query(
         `SELECT sm.id, sm.scheduled_for, sm.delivery_method, sm.delivery_status,
-                sm.delivered_at, sm.recipient_email, sm.custom_message,
+                sm.delivered_at, sm.recipient_email,
                 vn.title as voice_note_title, c.name as recipient_name, sm.created_at
          FROM scheduled_messages sm
          LEFT JOIN voice_notes vn ON vn.id = sm.voice_note_id
@@ -1563,8 +1563,8 @@ router.get('/export/zip', authenticate, async (req, res) => {
          LIMIT 500`, [userId]
       ),
       pool.query(
-        `SELECT event_type, metadata, created_at
-         FROM user_events
+        `SELECT event_type, event_data AS metadata, created_at
+         FROM analytics_events
          WHERE user_id = $1
            AND created_at > NOW() - INTERVAL '90 days'
          ORDER BY created_at DESC

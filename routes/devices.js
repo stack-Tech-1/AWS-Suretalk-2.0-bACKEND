@@ -13,16 +13,16 @@ router.get('/', authenticate, async (req, res) => {
 
     // Get user sessions from system_logs (simulated device tracking)
     const devicesQuery = await pool.query(
-      `SELECT DISTINCT 
-         client_ip as ip_address,
+      `SELECT DISTINCT
+         ip_address,
          user_agent,
          MAX(created_at) as last_activity,
          COUNT(*) as activity_count
-       FROM system_logs 
-       WHERE user_id = $1 
+       FROM system_logs
+       WHERE user_id = $1
          AND service = 'auth'
          AND created_at > CURRENT_TIMESTAMP - INTERVAL '30 days'
-       GROUP BY client_ip, user_agent
+       GROUP BY ip_address, user_agent
        ORDER BY MAX(created_at) DESC`,
       [userId]
     );
