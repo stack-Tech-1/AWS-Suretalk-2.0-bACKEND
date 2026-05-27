@@ -133,7 +133,7 @@ const processScheduledMessages = async () => {
     await client.query('BEGIN');
     const result = await client.query(
       `SELECT id, voice_note_id, user_id, recipient_contact_id,
-              recipient_email, delivery_method, custom_message,
+              recipient_email, recipient_phone, delivery_method, custom_message,
               delivery_attempts
        FROM scheduled_messages
        WHERE delivery_status = 'scheduled'
@@ -182,6 +182,12 @@ const processScheduledMessages = async () => {
       }
 
       const message = { ...sm, ...detailResult.rows[0] };
+      // Contact JOIN can return null phone — fall back to the phone stored on the scheduled message itself
+      if (!message.recipient_phone && sm.recipient_phone) {
+        message.recipient_phone = sm.recipient_phone;
+      }
+
+      logger.info(`[scheduler] message ${sm.id}: method=${message.delivery_method}, email=${message.recipient_email || 'none'}, phone=${message.recipient_phone || 'none'}`);
 
       let downloadUrl = null;
       if (message.s3_key && message.s3_bucket &&
@@ -280,6 +286,11 @@ const processScheduledMessages = async () => {
           logger.error(`SMS delivery failed for message ${sm.id}: ${smsError.message || smsError}`);
           errorMessages.push(`SMS: ${smsError.message}`);
         }
+      }
+
+      if (!deliverySuccess && errorMessages.length === 0) {
+        logger.warn(`[scheduler] message ${sm.id}: no delivery attempted — method=${message.delivery_method}, email=${message.recipient_email || 'none'}, phone=${message.recipient_phone || 'none'}`);
+        errorMessages.push('No matching recipient data for delivery method');
       }
 
       if (deliverySuccess) {
