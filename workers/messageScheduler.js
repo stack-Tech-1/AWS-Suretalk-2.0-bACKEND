@@ -111,7 +111,12 @@ const sendSMS = async (to, senderName, downloadUrl, customMessage) => {
     ? `${customMessage}\n\nListen to your voice note: ${downloadUrl}`
     : `You have a voice message from ${senderName} on SureTalk.\n\nListen here: ${downloadUrl}`;
 
-  const smsMessage = await twilioClient.messages.create({ to, from: fromNumber, body });
+  const smsMessage = await twilioClient.messages.create({
+    to,
+    from: fromNumber,
+    body,
+    statusCallback: process.env.TWILIO_SMS_STATUS_CALLBACK_URL || undefined
+  });
   logger.info(`SMS sent to ${to}, message SID: ${smsMessage.sid}`);
   return smsMessage.sid;
 };

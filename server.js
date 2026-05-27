@@ -227,6 +227,8 @@ app.get('/api/test-stripe-auth', async (req, res) => {
 // Dedicated Stripe webhook handler — registered before billing router so it takes priority
 app.use('/api/billing/webhook', express.raw({ type: 'application/json' }), require('./routes/stripeWebhook'));
 app.use('/api/billing', require('./routes/billing'));
+// Twilio status webhooks — no auth, Twilio POSTs urlencoded to these
+app.use('/api/webhooks/twilio', require('./routes/twilioWebhook'));
 
 // Other API Routes
 app.use('/api/admin/login', adminSlowDown, adminRateLimit);
