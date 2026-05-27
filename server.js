@@ -360,6 +360,7 @@ app.post('/api/sync/slot', syncAuth, async (req, res) => {
     voiceMessage,     // this is the s3_key or full URL — use as unique identifier
     createdAt,
     action,
+    contact,          // contact phone for updateContact action
     source = 'ivr',
     type              // optional: 'will' routes to voice_wills instead of voice_notes
   } = req.body;
