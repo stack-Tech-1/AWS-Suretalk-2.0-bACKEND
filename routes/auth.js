@@ -165,9 +165,9 @@ router.post('/register', validateRegister, async (req, res) => {
           full_name: createdUser.full_name,
           email_verified: createdUser.email_verified
         },
-        // Include verification token for production/testing
-        ...(process.env.NODE_ENV === 'production' && { 
-          verificationToken 
+        // Include verification token only in development (never expose in production)
+        ...(process.env.NODE_ENV !== 'production' && {
+          verificationToken
         })
       }
     });
@@ -643,8 +643,14 @@ router.post('/change-password', authenticate, [
   }
 });
 
-// Logout (client-side token invalidation)
+// Logout — invalidate all tokens issued before this moment
 router.post('/logout', authenticate, async (req, res) => {
+  // Stamp last_logout_at so the authenticate middleware rejects tokens with iat before this time
+  pool.query(
+    'UPDATE users SET last_logout_at = NOW() WHERE id = $1',
+    [req.user.id]
+  ).catch(err => console.error('logout timestamp update failed:', err));
+
   pool.query(
     `INSERT INTO system_logs (user_id, level, service, message, metadata, ip_address, user_agent)
      VALUES ($1, $2, $3, $4, $5, $6, $7)`,
@@ -963,6 +969,18 @@ router.post('/send-claim-otp', validateCheckPhone, async (req, res) => {
       });
     }
 
+    // Rate limit: max 3 OTP sends per phone per 10 minutes
+    const recentOtps = await pool.query(
+      `SELECT COUNT(*) FROM phone_otps WHERE phone = $1 AND created_at > NOW() - INTERVAL '10 minutes'`,
+      [phone]
+    );
+    if (parseInt(recentOtps.rows[0].count, 10) >= 3) {
+      return res.status(429).json({
+        success: false,
+        error: 'Too many OTP requests. Please wait 10 minutes before trying again.'
+      });
+    }
+
     const otp = String(Math.floor(100000 + Math.random() * 900000));
     const otpHash = await bcrypt.hash(otp, 10);
 
@@ -1106,20 +1124,6 @@ router.post('/claim-account', validateClaimAccount, async (req, res) => {
     return res.status(500).json({ success: false, error: 'Server error' });
   }
 });
-
-router.get('/test-twilio-account', async (req, res) => {
-  if (!twilioClient) {
-    return res.status(500).json({ error: 'Twilio client not initialized' });
-  }
-  try {
-    const account = await twilioClient.api.accounts(process.env.TWILIO_ACCOUNT_SID).fetch();
-    res.json({ success: true, account: { status: account.status, friendlyName: account.friendlyName } });
-  } catch (err) {
-    res.status(500).json({ error: err.message, code: err.code });
-  }
-});
-
-
 
 // ─── 2FA Routes ───────────────────────────────────────────────────────────────
 
@@ -1305,30 +1309,6 @@ router.post('/2fa/verify', async (req, res) => {
   } catch (error) {
     console.error('2FA verify error:', error);
     res.status(500).json({ success: false, error: 'Verification failed' });
-  }
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-
-router.post('/test-twilio-messages', async (req, res) => {
-  const auth = Buffer.from(`${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`).toString('base64');
-  const url = `https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_ACCOUNT_SID}/Messages.json`;
-  const data = new URLSearchParams({
-    To: '+1234567890', // dummy number
-    From: process.env.TWILIO_PHONE_NUMBER,
-    Body: 'Test'
-  });
-  try {
-    const response = await axios.post(url, data, {
-      headers: {
-        'Authorization': `Basic ${auth}`,
-        'Content-Type': 'application/x-www-form-urlencoded'
-      },
-      timeout: 30000
-    });
-    res.json({ success: true, data: response.data });
-  } catch (err) {
-    res.status(500).json({ error: err.message, code: err.code });
   }
 });
 

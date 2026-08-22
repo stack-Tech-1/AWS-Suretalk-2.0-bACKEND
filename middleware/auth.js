@@ -41,16 +41,24 @@ const authenticate = async (req, res, next) => {
 
     // Check if user exists and is active
     const userQuery = await pool.query(
-        `SELECT id, email, phone, full_name, subscription_tier, subscription_status, profile_image_url, is_admin FROM users WHERE id = $1 AND deleted_at IS NULL`,
+        `SELECT id, email, phone, full_name, subscription_tier, subscription_status, profile_image_url, is_admin, last_logout_at FROM users WHERE id = $1 AND deleted_at IS NULL`,
         [decoded.userId]
       );
-      
+
     if (userQuery.rows.length === 0) {
       throw new Error('User not found');
     }
 
     const user = userQuery.rows[0];
     user.subscription_tier = normalizeTier(user.subscription_tier);
+
+    // Reject tokens issued before the user's last logout (server-side invalidation)
+    if (user.last_logout_at && decoded.iat) {
+      const tokenIssuedAt = decoded.iat * 1000; // JWT iat is in seconds
+      if (tokenIssuedAt < new Date(user.last_logout_at).getTime()) {
+        return res.status(401).json({ success: false, error: 'Session expired. Please log in again.' });
+      }
+    }
 
     // Check subscription status
     const validStatuses = ['active', 'trialing', 'past_due'];

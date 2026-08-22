@@ -902,11 +902,18 @@ function getTierFromPriceId(priceId) {
   return tier;
 }
 
-// Manual upgrade/downgrade (for admin or manual handling)
+// Manual tier change — admin only. Regular users upgrade via Stripe Checkout.
 router.post('/change-tier', authenticate, [
   body('tier').isIn(['LITE', 'ESSENTIAL', 'LEGACY_VAULT_PREMIUM'])
 ], async (req, res) => {
   try {
+    if (!req.user.is_admin) {
+      return res.status(403).json({
+        success: false,
+        error: 'Forbidden. Use the billing portal to change your subscription.'
+      });
+    }
+
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
       return res.status(400).json({
@@ -916,7 +923,7 @@ router.post('/change-tier', authenticate, [
     }
 
     const { tier } = req.body;
-    const userId = req.user.id;
+    const userId = req.body.userId || req.user.id;
 
     // Get current tier
     const currentTierQuery = await pool.query(

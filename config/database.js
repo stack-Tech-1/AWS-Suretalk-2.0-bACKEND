@@ -68,6 +68,7 @@ const pool = new Pool({
   max: 20,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 2000,
+  statement_timeout: 15000,
   keepAlive: true,
   keepAliveInitialDelayMillis: 20000
 });

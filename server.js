@@ -177,64 +177,6 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Temporary: test outbound connectivity to Stripe's API servers
-app.get('/api/test-stripe-connection', async (req, res) => {
-  const https = require('https');
-  const start = Date.now();
-
-  try {
-    await new Promise((resolve, reject) => {
-      const req = https.get('https://api.stripe.com', { timeout: 5000 }, (response) => {
-        resolve(response.statusCode);
-      });
-      req.on('timeout', () => reject(new Error('Connection timed out after 5s')));
-      req.on('error', (err) => reject(err));
-    });
-
-    res.json({
-      success: true,
-      message: 'Stripe API reachable',
-      responseTimeMs: Date.now() - start
-    });
-  } catch (err) {
-    res.json({
-      success: false,
-      error: err.message,
-      responseTimeMs: Date.now() - start
-    });
-  }
-});
-
-// Temporary: test Stripe API key auth
-app.get('/api/test-stripe-auth', async (req, res) => {
-  try {
-    const Stripe = require('stripe');
-    const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
-
-    // This is the fastest possible Stripe API call
-    const result = await Promise.race([
-      stripe.balance.retrieve(),
-      new Promise((_, reject) =>
-        setTimeout(() => reject(new Error('Timed out after 8s')), 8000)
-      )
-    ]);
-
-    res.json({
-      success: true,
-      message: 'Stripe auth working',
-      available: result.available?.length
-    });
-  } catch (err) {
-    res.json({
-      success: false,
-      error: err.message,
-      type: err.type || 'unknown',
-      code: err.code || 'unknown',
-      statusCode: err.statusCode || 'unknown'
-    });
-  }
-});
-
 // API Routes - IMPORTANT: Webhook route must be defined BEFORE routes that need JSON
 // Dedicated Stripe webhook handler — registered before billing router so it takes priority
 app.use('/api/billing/webhook', express.raw({ type: 'application/json' }), require('./routes/stripeWebhook'));
