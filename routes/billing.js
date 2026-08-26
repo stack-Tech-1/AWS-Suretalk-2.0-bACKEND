@@ -902,28 +902,60 @@ function getTierFromPriceId(priceId) {
   return tier;
 }
 
-// Manual tier change — admin only. Regular users upgrade via Stripe Checkout.
+// Tier change endpoint.
+//
+// Rules:
+//   - Paid upgrades (ESSENTIAL / LEGACY_VAULT_PREMIUM) are always blocked for regular
+//     users — they must go through Stripe Checkout so a real payment is collected.
+//   - Downgrade to LITE for a user who has an active Stripe subscription: the frontend
+//     must send the user to the Stripe Customer Portal to cancel. The subscription.deleted
+//     webhook then resets them to LITE automatically. We return code:'USE_PORTAL' to
+//     signal this to the frontend.
+//   - Downgrade to LITE for a user with no Stripe subscription (e.g. IVR-only user):
+//     allowed directly — there is no Stripe subscription to cancel.
+//   - Admins bypass all of the above and can change any user to any tier.
 router.post('/change-tier', authenticate, [
   body('tier').isIn(['LITE', 'ESSENTIAL', 'LEGACY_VAULT_PREMIUM'])
 ], async (req, res) => {
   try {
-    if (!req.user.is_admin) {
-      return res.status(403).json({
-        success: false,
-        error: 'Forbidden. Use the billing portal to change your subscription.'
-      });
-    }
-
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
-      return res.status(400).json({
-        success: false,
-        errors: errors.array()
-      });
+      return res.status(400).json({ success: false, errors: errors.array() });
     }
 
     const { tier } = req.body;
-    const userId = req.body.userId || req.user.id;
+    // Admins can target any user; regular users can only act on themselves.
+    const userId = req.user.is_admin ? (req.body.userId || req.user.id) : req.user.id;
+
+    // ── Regular user rules ──────────────────────────────────────────────────
+    if (!req.user.is_admin) {
+      // Block all paid-tier upgrades — must pay through Stripe Checkout
+      if (tier !== 'LITE') {
+        return res.status(403).json({
+          success: false,
+          code: 'USE_CHECKOUT',
+          error: 'Please use the upgrade flow to switch to a paid plan.'
+        });
+      }
+
+      // Downgrade to LITE: check whether the user has an active Stripe subscription
+      const subRow = await pool.query(
+        'SELECT stripe_subscription_id FROM users WHERE id = $1',
+        [userId]
+      );
+      const stripeSubId = subRow.rows[0]?.stripe_subscription_id;
+
+      if (stripeSubId) {
+        // Has a Stripe subscription — must cancel it through the portal.
+        // The subscription.deleted webhook will reset them to LITE automatically.
+        return res.status(200).json({
+          success: false,
+          code: 'USE_PORTAL',
+          error: 'Please cancel your subscription through the billing portal to downgrade to the free plan.'
+        });
+      }
+      // No Stripe subscription (IVR user or already free) — fall through to direct change
+    }
 
     // Get current tier
     const currentTierQuery = await pool.query(
