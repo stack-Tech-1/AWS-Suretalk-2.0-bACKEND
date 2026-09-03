@@ -4,6 +4,12 @@ const router = express.Router();
 const { body, validationResult } = require('express-validator');
 const { authenticate } = require('../middleware/auth');
 const { pool } = require('../config/database');
+const emailService = require('../utils/emailService');
+const { syncToIvr } = require('../utils/syncIvr');
+
+const stripe = process.env.STRIPE_SECRET_KEY
+  ? require('stripe')(process.env.STRIPE_SECRET_KEY)
+  : null;
 
 // Get user settings
 router.get('/', authenticate, async (req, res) => {
@@ -503,7 +509,7 @@ router.post('/export', authenticate, async (req, res) => {
 
 // Delete user account
 router.delete('/account', authenticate, [
-  body('confirmation').equals('DELETE MY ACCOUNT')
+  body('confirmation').equals('DELETE')
 ], async (req, res) => {
   try {
     if (req.isImpersonating) {
@@ -521,26 +527,50 @@ router.delete('/account', authenticate, [
     const userId = req.user.id;
     const { reason = 'No reason provided' } = req.body;
 
-    // Mark user as deleted (soft delete)
+    // Fetch user info needed for cleanup steps
+    const userRow = await pool.query(
+      'SELECT email, full_name, stripe_subscription_id, stripe_customer_id FROM users WHERE id = $1',
+      [userId]
+    );
+    const user = userRow.rows[0];
+    if (!user) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+
+    // 1. Cancel Stripe subscription immediately (non-blocking — don't fail deletion if Stripe is down)
+    if (stripe && user.stripe_subscription_id) {
+      stripe.subscriptions.cancel(user.stripe_subscription_id)
+        .catch(err => console.error(`Failed to cancel Stripe subscription on account deletion: ${err.message}`));
+    }
+
+    // 2. Soft-delete the user (keep the row for legal compliance — never hard-delete)
     await pool.query(
-      'UPDATE users SET deleted_at = CURRENT_TIMESTAMP WHERE id = $1',
+      `UPDATE users
+       SET deleted_at             = CURRENT_TIMESTAMP,
+           subscription_status    = 'cancelled',
+           stripe_subscription_id = NULL,
+           updated_at             = CURRENT_TIMESTAMP
+       WHERE id = $1`,
       [userId]
     );
 
-    // Log deletion event
+    // 3. Log the deletion
     await pool.query(
       `INSERT INTO system_logs (user_id, level, service, message, metadata)
-       VALUES ($1, 'warning', 'account', 'Account deletion requested', $2)`,
+       VALUES ($1, 'warning', 'account', 'Account deleted by user', $2)`,
       [userId, JSON.stringify({ reason, timestamp: new Date().toISOString() })]
     );
 
-    // In production, schedule actual data deletion after grace period
-    // For now, just mark as deleted
+    // 4. Notify IVR system to deactivate the phone account
+    syncToIvr({ userId, subscriptionStatus: 'cancelled' }, 'delete-user');
+
+    // 5. Send goodbye email
+    emailService.sendAccountDeletedEmail(user.email, user.full_name)
+      .catch(err => console.error(`Failed to send account deletion email: ${err.message}`));
 
     res.json({
       success: true,
-      message: 'Account deletion initiated. You will be logged out shortly.',
-      note: 'Your data will be permanently deleted after 30 days.'
+      message: 'Your account has been deleted. You will be logged out shortly.'
     });
 
   } catch (error) {

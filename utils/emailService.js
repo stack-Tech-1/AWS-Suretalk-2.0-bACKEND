@@ -429,6 +429,48 @@ class EmailService {
   }
 
   // ══════════════════════════════════════════════════════════════════════════
+  // 9. ACCOUNT DELETED
+  // ══════════════════════════════════════════════════════════════════════════
+  async sendAccountDeletedEmail(toEmail, userName) {
+    const html = this._wrap({
+      title: 'Account Deleted',
+      preheader: 'Your SureTalk account has been deleted.',
+      headerAccent: BRAND.navy,
+      toEmail,
+      body: `
+        <p class="greeting">Hi ${userName},</p>
+        <p>Your SureTalk account has been successfully deleted. We're sorry to see you go.</p>
+        <div class="info-box">
+          <p style="margin:0">
+            <strong>What this means:</strong><br>
+            Your account access has been removed immediately. Any active subscription has been cancelled — you will not be charged again.
+            Your personal data is retained for a period required by applicable law before being permanently removed.
+          </p>
+        </div>
+        <p>If you change your mind, you're always welcome back. Simply create a new account at <a href="${this.siteUrl}/signup" style="color:${BRAND.blue}">suretalknow.com</a>.</p>
+        <p>If you did not request this deletion or believe this was made in error, please contact our support team immediately by replying to this email.</p>
+        <div class="divider"></div>
+        <p style="font-size:13px;color:${BRAND.muted}">Thank you for using SureTalk. We hope to see you again someday.</p>`
+    });
+
+    return this._send({
+      to: toEmail,
+      subject: 'Your SureTalk account has been deleted',
+      html,
+      text: this._text('Account Deleted', [
+        `Hi ${userName},`,
+        '',
+        'Your SureTalk account has been successfully deleted.',
+        'Any active subscription has been cancelled — you will not be charged again.',
+        '',
+        'If this was a mistake, please reply to this email immediately.',
+        '',
+        `Create a new account anytime at ${this.siteUrl}/signup`
+      ])
+    });
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
   // 8. TRIAL ENDING IN 3 DAYS
   // ══════════════════════════════════════════════════════════════════════════
   async sendTrialEndingEmail(toEmail, userName, { trialEndDate, tier }) {

@@ -42,7 +42,12 @@ router.post('/register', validateRegister, async (req, res) => {
       });
     }
 
-    const { email, phone, password, fullName, subscriptionTier } = req.body;
+    const { email, phone, password, fullName, subscriptionTier, agreeToTerms, smsConsent } = req.body;
+
+    // Terms of Service must be accepted
+    if (!agreeToTerms) {
+      return res.status(400).json({ success: false, error: 'You must accept the Terms of Service to create an account.' });
+    }
 
     // Check if user already exists
     const existingUser = await pool.query(
@@ -89,11 +94,12 @@ router.post('/register', validateRegister, async (req, res) => {
     // Create user with email_verified = false
     const newUser = await pool.query(
       `INSERT INTO users (
-        email, phone, password_hash, full_name, 
+        email, phone, password_hash, full_name,
         subscription_tier, storage_limit_gb, contacts_limit, voice_notes_limit,
-        subscription_status, email_verified, source
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'active', false, 'app')
-      RETURNING id, email, phone, full_name, subscription_tier, 
+        subscription_status, email_verified, source,
+        tos_accepted_at, tos_version, sms_consent_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'active', false, 'app', NOW(), '1.0', $9)
+      RETURNING id, email, phone, full_name, subscription_tier,
                 storage_limit_gb, contacts_limit, voice_notes_limit,
                 created_at, email_verified, source`,
       [
@@ -104,7 +110,8 @@ router.post('/register', validateRegister, async (req, res) => {
         normalizedTier,
         storageLimitGb,
         contactsLimit,
-        voiceNotesLimit
+        voiceNotesLimit,
+        smsConsent ? new Date() : null
       ]
     );
 /*
