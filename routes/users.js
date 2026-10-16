@@ -834,59 +834,67 @@ router.post('/support/knowledge-base/:id/vote', authenticate, [
   }
 });
 
+// True only for timezone names the runtime recognises, e.g. "Africa/Lagos" or "UTC"
+const isValidTimeZone = (tz) => {
+  if (typeof tz !== 'string' || !tz || tz.length > 64) return false;
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: tz });
+    return true;
+  } catch {
+    return false;
+  }
+};
 
 // Get user activity analytics
 router.get('/activity', authenticate, async (req, res) => {
   try {
-    const { period = 'week', timezone = 'UTC' } = req.query;
-    
-    let dateRange;
-    const now = new Date();
-    
-    switch (period) {
-      case 'day':
-        dateRange = `DATE(created_at AT TIME ZONE '${timezone}') = CURRENT_DATE AT TIME ZONE '${timezone}'`;
-        break;
-      case 'week':
-        dateRange = `created_at >= NOW() - INTERVAL '7 days'`;
-        break;
-      case 'month':
-        dateRange = `created_at >= NOW() - INTERVAL '30 days'`;
-        break;
-      default:
-        dateRange = `created_at >= NOW() - INTERVAL '7 days'`;
-    }
+    const { period = 'week' } = req.query;
 
-    // Get daily activity for the period
+    // Only accept real IANA timezone names (e.g. "Africa/Lagos"). The value is always
+    // passed to SQL as a bound parameter ($2), never interpolated into the query text.
+    const timezone = isValidTimeZone(req.query.timezone) ? req.query.timezone : 'UTC';
+
+    // created_at is a UTC timestamp without time zone; convert it to the user's local time
+    const localCreatedAt = `((created_at AT TIME ZONE 'UTC') AT TIME ZONE $2)`;
+    const periodDays = { day: 1, week: 7, month: 30 }[period] || 7;
+
+    // Get daily activity for the period (calendar days in the user's timezone, including today)
     const dailyQuery = await pool.query(
       `WITH daily_stats AS (
-        SELECT 
-          DATE(created_at AT TIME ZONE $2) as date,
+        SELECT
+          DATE(${localCreatedAt}) as date,
           COUNT(*) FILTER (WHERE event_type = 'voice_note_created') as notes_created,
           COUNT(*) FILTER (WHERE event_type = 'voice_note_played') as notes_played,
           COUNT(*) FILTER (WHERE event_type = 'voice_note_shared') as notes_shared,
           COUNT(*) FILTER (WHERE event_type = 'voice_note_downloaded') as notes_downloaded,
           COUNT(*) FILTER (WHERE event_type = 'contact_added') as contacts_added
         FROM analytics_events
-        WHERE user_id = $1 AND ${dateRange}
-        GROUP BY DATE(created_at AT TIME ZONE $2)
+        WHERE user_id = $1
+          AND DATE(${localCreatedAt}) >= (NOW() AT TIME ZONE $2)::date - $3::int
+        GROUP BY DATE(${localCreatedAt})
         ORDER BY date
       )
       SELECT * FROM daily_stats`,
-      [req.user.id, timezone]
+      [req.user.id, timezone, periodDays - 1]
     );
 
-    // Get weekly summary
+    // Rolling last 7 days ending today (user's timezone), one row per day even when empty
     const weeklyQuery = await pool.query(
-      `SELECT 
-        EXTRACT(DOW FROM created_at) as day_of_week,
-        COUNT(*) FILTER (WHERE event_type = 'voice_note_created') as notes_created,
-        COUNT(*) FILTER (WHERE event_type = 'voice_note_played') as notes_played
-      FROM analytics_events
-      WHERE user_id = $1 AND created_at >= NOW() - INTERVAL '7 days'
-      GROUP BY EXTRACT(DOW FROM created_at)
-      ORDER BY day_of_week`,
-      [req.user.id]
+      `SELECT
+        to_char(d.day, 'YYYY-MM-DD') as date,
+        COUNT(ae.id) FILTER (WHERE ae.event_type = 'voice_note_created') as notes_created,
+        COUNT(ae.id) FILTER (WHERE ae.event_type = 'voice_note_played') as notes_played
+      FROM generate_series(
+        ((NOW() AT TIME ZONE $2)::date - 6)::timestamp,
+        (NOW() AT TIME ZONE $2)::date::timestamp,
+        INTERVAL '1 day'
+      ) AS d(day)
+      LEFT JOIN analytics_events ae
+        ON ae.user_id = $1
+        AND DATE((ae.created_at AT TIME ZONE 'UTC') AT TIME ZONE $2) = d.day::date
+      GROUP BY d.day
+      ORDER BY d.day`,
+      [req.user.id, timezone]
     );
 
     // Get voice note play statistics
@@ -909,15 +917,13 @@ router.get('/activity', authenticate, async (req, res) => {
     );
 
     // Format the data for the chart
-    const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-    const weeklyData = days.map((dayName, index) => {
-      const dayStats = weeklyQuery.rows.find(row => parseInt(row.day_of_week) === index);
-      return {
-        day: dayName,
-        notes: dayStats ? parseInt(dayStats.notes_created) : 0,
-        listens: dayStats ? parseInt(dayStats.notes_played) : 0
-      };
-    });
+    const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+    const weeklyData = weeklyQuery.rows.map(row => ({
+      date: row.date,
+      day: dayNames[new Date(`${row.date}T00:00:00Z`).getUTCDay()],
+      notes: parseInt(row.notes_created) || 0,
+      listens: parseInt(row.notes_played) || 0
+    }));
 
     // Get total statistics
     const totalsQuery = await pool.query(
