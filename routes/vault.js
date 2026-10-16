@@ -8,10 +8,12 @@ const {
   generateUploadUrl,
   generateDownloadUrl,
   deleteFromS3,
-  BUCKETS
+  BUCKETS,
+  isOwnS3Key
 } = require('../utils/s3Storage');
 const { syncToIvr } = require('../utils/syncIvr');
 const { resolveIvrPlaybackUrl } = require('../utils/resolveAudioUrl');
+const { signedProxyRecordingPath } = require('../utils/audioSigning');
 const Twilio = require('twilio');
 const twilioClient = process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN
   ? new Twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
@@ -120,7 +122,7 @@ router.get('/wills', authenticate, validateTier('LEGACY_VAULT_PREMIUM'), async (
           if (source === 'ivr') {
             const sid = will.twilio_recording_sid ||
               (will.s3_key?.startsWith('RE') && !will.s3_key?.includes('/') ? will.s3_key : null);
-            if (sid) downloadUrl = `/audio/recording/${sid}`;
+            if (sid) downloadUrl = signedProxyRecordingPath(sid);
           } else if (will.s3_key && will.s3_bucket) {
             downloadUrl = await generateDownloadUrl(will.s3_key, will.s3_bucket, 3600);
           }
@@ -132,8 +134,8 @@ router.get('/wills', authenticate, validateTier('LEGACY_VAULT_PREMIUM'), async (
         let beneficiaryNames = [];
         if (will.beneficiaries && will.beneficiaries.length > 0) {
           const beneficiaryQuery = await pool.query(
-            'SELECT name FROM contacts WHERE id = ANY($1)',
-            [will.beneficiaries]
+            'SELECT name FROM contacts WHERE id = ANY($1) AND user_id = $2',
+            [will.beneficiaries, req.user.id]
           );
           beneficiaryNames = beneficiaryQuery.rows.map(b => b.name);
         }
@@ -205,6 +207,21 @@ router.post('/wills', authenticate, validateTier('LEGACY_VAULT_PREMIUM'), [
       verificationRequired
     } = req.body;
 
+    // The file must be one uploaded by this user (key issued by /upload-url)
+    if (!isOwnS3Key(s3Key, req.user.id)) {
+      return res.status(400).json({ success: false, error: 'Invalid recording file' });
+    }
+
+    // Keep only beneficiaries that are this user's own contacts
+    let ownBeneficiaries = [];
+    if (Array.isArray(beneficiaries) && beneficiaries.length > 0) {
+      const owned = await pool.query(
+        'SELECT id FROM contacts WHERE id = ANY($1::uuid[]) AND user_id = $2',
+        [beneficiaries, req.user.id]
+      );
+      ownBeneficiaries = owned.rows.map(r => r.id);
+    }
+
     // Create voice will record
     const result = await pool.query(
       `INSERT INTO voice_wills (
@@ -220,7 +237,7 @@ router.post('/wills', authenticate, validateTier('LEGACY_VAULT_PREMIUM'), [
         s3Bucket,
         releaseCondition,
         releaseDate || null,
-        beneficiaries || [],
+        ownBeneficiaries,
         executors || [],
         verificationRequired !== false // Default to true
       ]
@@ -533,7 +550,7 @@ router.get('/wills/:id', authenticate, async (req, res) => {
       if (source === 'ivr') {
         const sid = will.twilio_recording_sid ||
           (will.s3_key?.startsWith('RE') && !will.s3_key?.includes('/') ? will.s3_key : null);
-        if (sid) downloadUrl = `/audio/recording/${sid}`;
+        if (sid) downloadUrl = signedProxyRecordingPath(sid);
       } else if (will.s3_key && will.s3_bucket) {
         downloadUrl = await generateDownloadUrl(will.s3_key, will.s3_bucket, 3600);
       }

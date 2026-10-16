@@ -24,6 +24,7 @@ const { v4: uuidv4 } = require('uuid');
 const { normalizeTier } = require('./utils/tierMapping');
 const axios = require('axios');
 const { authenticate } = require('./middleware/auth');
+const { requireAudioSignature, signedEc2RecordingUrl, signedEc2S3Url, TTL: AUDIO_TTL } = require('./utils/audioSigning');
 const EC2_STREAM_URL = process.env.EC2_STREAM_URL || 'https://test-api.suretalknow.com';
 
 const settingsRoutes = require('./routes/settings');
@@ -110,9 +111,12 @@ app.options('*', cors(corsOptions));
 app.use(cors(corsOptions));
 
 // Rate limiting
+// General per-IP limit. Kept generous because many real users can share one IP (offices, schools,
+// mobile carriers); abuse-prone endpoints get the stricter limits below.
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: process.env.NODE_ENV === 'development' ? 1000 : 300,
+  // GENERAL_RATE_LIMIT lets a staging copy raise the limit for load tests
+  max: Number(process.env.GENERAL_RATE_LIMIT) || (process.env.NODE_ENV === 'development' ? 5000 : 1500),
   message: 'Too many requests from this IP, please try again later.',
   standardHeaders: true,
   legacyHeaders: false,
@@ -142,6 +146,41 @@ const authSlowDown = slowDown({
   delayAfter: 50,
   delayMs: () => 500
 });
+
+// Strict per-IP limits on abuse-prone auth endpoints (in addition to the general limiter)
+const jsonLimitMessage = (error) => ({ success: false, error });
+
+// Password / 2FA guessing — only failed attempts count
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  skipSuccessfulRequests: true,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: jsonLimitMessage('Too many login attempts from this network. Please try again in 15 minutes.')
+});
+
+// Endpoints that send an email or SMS (costs money, can be used to spam people)
+const messageSendLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: jsonLimitMessage('Too many requests from this network. Please try again later.')
+});
+
+// Lookups that reveal whether an account exists
+const lookupLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: jsonLimitMessage('Too many requests from this network. Please try again later.')
+});
+
+app.use(['/api/auth/login', '/api/auth/2fa/verify', '/api/auth/admin-login'], loginLimiter);
+app.use(['/api/auth/register', '/api/auth/forgot-password', '/api/auth/resend-verification', '/api/auth/send-claim-otp'], messageSendLimiter);
+app.use(['/api/auth/check-phone', '/api/auth/claim-account', '/api/auth/reset-password'], lookupLimiter);
 
 // IMPORTANT: Custom body parser that excludes webhook routes
 app.use((req, res, next) => {
@@ -696,8 +735,8 @@ app.post('/api/sync/credential', syncAuth, async (req, res) => {
 
 
 
-// Proxy Twilio recording stream (for IVR recordings)
-app.get('/api/audio/recording/:recordingSid', async (req, res) => {
+// Proxy Twilio recording stream (for IVR recordings) — requires a signed link (see utils/audioSigning)
+app.get('/api/audio/recording/:recordingSid', requireAudioSignature(req => `rec:${req.params.recordingSid}`, logger), async (req, res) => {
   const { recordingSid } = req.params;
 
   if (!recordingSid || !recordingSid.startsWith('RE')) {
@@ -707,7 +746,7 @@ app.get('/api/audio/recording/:recordingSid', async (req, res) => {
   try {
     const response = await axios({
       method: 'GET',
-      url: `${EC2_STREAM_URL}/api/stream-recording/${recordingSid}`,
+      url: signedEc2RecordingUrl(EC2_STREAM_URL, recordingSid, AUDIO_TTL.call),
       responseType: 'stream',
       timeout: 30000
     });
@@ -723,8 +762,8 @@ app.get('/api/audio/recording/:recordingSid', async (req, res) => {
   }
 });
 
-// Proxy S3 recording stream (for app recordings)
-app.get('/api/audio/s3/:s3Key(*)', async (req, res) => {
+// Proxy S3 recording stream (for app recordings) — requires a signed link (see utils/audioSigning)
+app.get('/api/audio/s3/:s3Key(*)', requireAudioSignature(req => `s3:${req.params.s3Key}`, logger), async (req, res) => {
   const { s3Key } = req.params;
 
   if (!s3Key) {
@@ -734,7 +773,7 @@ app.get('/api/audio/s3/:s3Key(*)', async (req, res) => {
   try {
     const response = await axios({
       method: 'GET',
-      url: `${EC2_STREAM_URL}/api/stream-s3-recording/${s3Key}`,
+      url: signedEc2S3Url(EC2_STREAM_URL, s3Key, AUDIO_TTL.call),
       responseType: 'stream',
       timeout: 30000
     });

@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../config/database');
 const { generateDownloadUrl } = require('../utils/s3Storage');
+const { signedEc2RecordingUrl, TTL: AUDIO_TTL } = require('../utils/audioSigning');
 
 // PUBLIC endpoint — no authentication required
 // Token acts as the access credential
@@ -53,7 +54,8 @@ router.get('/public/:token', async (req, res) => {
       }
     } else if (data.twilio_recording_sid) {
       const EC2_URL = process.env.EC2_STREAM_URL || 'https://test-api.suretalknow.com';
-      audioUrl = `${EC2_URL}/api/stream-recording/${data.twilio_recording_sid}`;
+      // Signed link, regenerated on every visit to the play page
+      audioUrl = signedEc2RecordingUrl(EC2_URL, data.twilio_recording_sid, AUDIO_TTL.app);
     }
 
     // Track play count (fire-and-forget)

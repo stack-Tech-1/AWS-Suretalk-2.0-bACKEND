@@ -11,6 +11,7 @@ const AWS = require('aws-sdk');
 const twilio = require('twilio');
 const { generateDownloadUrl } = require('../utils/s3Storage');
 const logger = require('../utils/logger');
+const { signedEc2RecordingUrl, signedEc2S3Url, TTL: AUDIO_TTL } = require('../utils/audioSigning');
 
 const twilioClient = process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN
   ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
@@ -239,13 +240,14 @@ const processScheduledMessages = async () => {
       // Build audio URL for Twilio <Play> — must be publicly accessible and serve audio/mpeg
       const EC2_URL = process.env.EC2_STREAM_URL || 'https://test-api.suretalknow.com';
 
+      // Signed links (utils/audioSigning) — valid long enough for Twilio to fetch during the call
       let audioUrl;
       if (message.twilio_recording_sid) {
         // IVR recording — use existing Twilio stream endpoint
-        audioUrl = `${EC2_URL}/api/stream-recording/${message.twilio_recording_sid}`;
+        audioUrl = signedEc2RecordingUrl(EC2_URL, message.twilio_recording_sid, AUDIO_TTL.call);
       } else if (message.s3_key && !message.s3_key.startsWith('http') && !message.s3_key.startsWith('RE')) {
         // App recording in S3 — use EC2 S3 stream endpoint (serves audio/mpeg)
-        audioUrl = `${EC2_URL}/api/stream-s3-recording/${message.s3_key}`;
+        audioUrl = signedEc2S3Url(EC2_URL, message.s3_key, AUDIO_TTL.call);
       } else {
         // No audio available — TwiML will be TTS-only
         audioUrl = null;

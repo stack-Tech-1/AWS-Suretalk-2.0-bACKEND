@@ -12,6 +12,7 @@ const twilio = require('twilio');
 const { syncToIvr } = require('../utils/syncIvr');
 const { normalizeTier, TIERS } = require('../utils/tierMapping');
 const axios = require('axios');
+const { requireTurnstile } = require('../middleware/turnstile');
 
 const twilioClient = process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN
   ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
@@ -32,7 +33,7 @@ const validateLogin = [
 ];
 
 // Register new user - UPDATED VERSION
-router.post('/register', validateRegister, async (req, res) => {
+router.post('/register', requireTurnstile, validateRegister, async (req, res) => {
   try {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
@@ -208,7 +209,7 @@ router.post('/login', validateLogin, async (req, res) => {
     const userQuery = await pool.query(
       `SELECT id, email, phone, full_name, password_hash, subscription_tier, subscription_status,
         profile_image_url, last_login, is_admin, admin_status, email_verified,
-        two_factor_enabled, two_factor_secret
+        two_factor_enabled, two_factor_secret, account_locked_until
         FROM users WHERE email = $1 AND deleted_at IS NULL`,
       [email]
     );
@@ -222,9 +223,32 @@ router.post('/login', validateLogin, async (req, res) => {
 
     const user = userQuery.rows[0];
 
+    // Account lockout after repeated wrong passwords (password guessing protection)
+    if (user.account_locked_until && new Date(user.account_locked_until) > new Date()) {
+      const minutesLeft = Math.ceil((new Date(user.account_locked_until) - new Date()) / 60000);
+      return res.status(429).json({
+        success: false,
+        error: `Too many failed login attempts. Please try again in ${minutesLeft} minute${minutesLeft === 1 ? '' : 's'} or reset your password.`,
+        lockedMinutes: minutesLeft
+      });
+    }
+
     // Check password
     const isPasswordValid = await bcrypt.compare(password, user.password_hash);
     if (!isPasswordValid) {
+      // Count the failure; lock for 15 min at 5 failures, 1 h at 10, 24 h at 15+
+      await pool.query(
+        `UPDATE users
+            SET failed_login_attempts = COALESCE(failed_login_attempts, 0) + 1,
+                account_locked_until = CASE
+                  WHEN COALESCE(failed_login_attempts, 0) + 1 >= 15 THEN CURRENT_TIMESTAMP + INTERVAL '24 hours'
+                  WHEN COALESCE(failed_login_attempts, 0) + 1 >= 10 THEN CURRENT_TIMESTAMP + INTERVAL '1 hour'
+                  WHEN COALESCE(failed_login_attempts, 0) + 1 >= 5  THEN CURRENT_TIMESTAMP + INTERVAL '15 minutes'
+                  ELSE account_locked_until
+                END
+          WHERE id = $1`,
+        [user.id]
+      ).catch(err => console.error('failed-login counter update failed:', err));
       pool.query(
         `INSERT INTO system_logs (user_id, level, service, message, metadata, ip_address, user_agent)
          VALUES ($1, $2, $3, $4, $5, $6, $7)`,
@@ -236,6 +260,12 @@ router.post('/login', validateLogin, async (req, res) => {
         error: 'Invalid credentials'
       });
     }
+
+    // Correct password — clear the failed-attempt counter
+    pool.query(
+      'UPDATE users SET failed_login_attempts = 0, account_locked_until = NULL WHERE id = $1 AND (failed_login_attempts > 0 OR account_locked_until IS NOT NULL)',
+      [user.id]
+    ).catch(err => console.error('failed-login counter reset failed:', err));
 
     // IMPORTANT: Check if user is admin - admins bypass email verification
     if (user.is_admin && user.admin_status !== 'approved') {
@@ -396,7 +426,7 @@ router.get('/verify-email', async (req, res) => {
 });
 
 // Resend verification email
-router.post('/resend-verification', [
+router.post('/resend-verification', requireTurnstile, [
   body('email').isEmail().normalizeEmail()
 ], async (req, res) => {
   try {
@@ -671,7 +701,7 @@ router.post('/logout', authenticate, async (req, res) => {
 });
 
 // Request password reset
-router.post('/forgot-password', [
+router.post('/forgot-password', requireTurnstile, [
   body('email').isEmail().normalizeEmail()
 ], async (req, res) => {
   try {
@@ -765,8 +795,9 @@ router.post('/reset-password', [
     const newPasswordHash = await bcrypt.hash(newPassword, saltRounds);
 
     // Update password
+    // A successful reset also lifts any failed-login lockout
     await pool.query(
-      'UPDATE users SET password_hash = $1 WHERE id = $2',
+      'UPDATE users SET password_hash = $1, failed_login_attempts = 0, account_locked_until = NULL WHERE id = $2',
       [newPasswordHash, decoded.userId]
     );
 
@@ -951,7 +982,7 @@ router.post('/check-phone', validateCheckPhone, async (req, res) => {
 
 // POST /api/auth/send-claim-otp
 // Generate a 6-digit OTP, store hashed, send via Twilio SMS
-router.post('/send-claim-otp', validateCheckPhone, async (req, res) => {
+router.post('/send-claim-otp', requireTurnstile, validateCheckPhone, async (req, res) => {
   try {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {

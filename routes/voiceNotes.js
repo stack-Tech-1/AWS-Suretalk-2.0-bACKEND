@@ -4,11 +4,12 @@ const router = express.Router();
 const { body, validationResult } = require('express-validator');
 const { authenticate, validateTier, recordAnalyticsEvent } = require('../middleware/auth');
 const { pool } = require('../config/database');
-const { generateUploadUrl, generateDownloadUrl, deleteFromS3, uploadToS3, BUCKETS } = require('../utils/s3Storage');
+const { generateUploadUrl, generateDownloadUrl, deleteFromS3, uploadToS3, BUCKETS, isOwnS3Key } = require('../utils/s3Storage');
 const { v4: uuidv4 } = require('uuid');
 const { createNotification } = require('./notifications');
 const { syncToIvr } = require('../utils/syncIvr');
 const { resolveIvrPlaybackUrl } = require('../utils/resolveAudioUrl');
+const { signedProxyRecordingPath, signedEc2S3Url, TTL: AUDIO_TTL } = require('../utils/audioSigning');
 const Twilio = require('twilio');
 const twilioClient = process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN
   ? new Twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
@@ -153,7 +154,7 @@ router.get('/:id', authenticate, async (req, res) => {
     // blocks the browser from loading audio cross-origin.
     const isTwilioSid = note.s3_key?.startsWith('RE') && note.s3_key?.length > 30 && !note.s3_key?.includes('/');
     const downloadUrl = isTwilioSid
-      ? `${req.protocol}://${req.get('host')}/api/audio/recording/${note.s3_key}`
+      ? `${req.protocol}://${req.get('host')}/api${signedProxyRecordingPath(note.s3_key)}`
       : await generateDownloadUrl(note.s3_key, note.s3_bucket, 3600);
 
     // Increment play count
@@ -348,7 +349,12 @@ router.post('/', authenticate, [
       contactPending,
       slotNumber
     } = req.body;
-    
+
+    // The file must be one uploaded by this user (key issued by /upload-url)
+    if (!isOwnS3Key(s3Key, req.user.id)) {
+      return res.status(400).json({ success: false, error: 'Invalid recording file' });
+    }
+
     // Process tags - handle both array and string formats
     let processedTags = [];
     if (tags) {
@@ -509,9 +515,9 @@ router.post('/', authenticate, [
             contactPhone = contactResult.rows[0]?.phone || '';
           }
 
-          // Build audio URL for IVR playback via EC2 stream
+          // Build audio URL for IVR playback via EC2 stream — stored by the IVR, so long-lived signature
           const s3Key = note.s3_key;
-          const audioUrl = `${process.env.EC2_STREAM_URL}/api/stream-s3-recording/${s3Key}`;
+          const audioUrl = signedEc2S3Url(process.env.EC2_STREAM_URL, s3Key, AUDIO_TTL.ivr);
 
           // Try slots starting from candidateSlot, skip on 409 conflict
           let assignedSlot = null;
@@ -849,7 +855,7 @@ router.get('/:id/download', authenticate, async (req, res) => {
     const { s3_key, s3_bucket } = result.rows[0];
     const isTwilioSid = s3_key?.startsWith('RE') && s3_key?.length > 30 && !s3_key?.includes('/');
     const downloadUrl = isTwilioSid
-      ? `${req.protocol}://${req.get('host')}/api/audio/recording/${s3_key}`
+      ? `${req.protocol}://${req.get('host')}/api${signedProxyRecordingPath(s3_key)}`
       : await generateDownloadUrl(s3_key, s3_bucket, 3600);
 
     res.json({

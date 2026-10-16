@@ -2,7 +2,11 @@ const jwt = require('jsonwebtoken');
 const { pool } = require('../config/database');
 const { normalizeTier } = require('../utils/tierMapping');
 
-// Module-level store for per-user rate limiting (200 req / 15 min)
+// Module-level store for per-user rate limiting (PER_USER_LIMIT req / 15 min).
+// A normal session can make many requests (the dashboard loads ~7 at once, the voice notes list
+// fetches a link per note), so this only stops runaway clients and scripted abuse.
+// PER_USER_RATE_LIMIT lets a staging copy raise the limit for load tests
+const PER_USER_LIMIT = Number(process.env.PER_USER_RATE_LIMIT) || 1000;
 const _perUserLimits = new Map();
 
 // Authentication middleware
@@ -69,7 +73,7 @@ const authenticate = async (req, res, next) => {
     req.user = user;
     req.token = token;
 
-    // Per-user rate limit: 200 requests per 15 minutes
+    // Per-user rate limit: PER_USER_LIMIT requests per 15 minutes
     const _now = Date.now();
     const _window = 15 * 60 * 1000;
     let _entry = _perUserLimits.get(user.id);
@@ -77,7 +81,7 @@ const authenticate = async (req, res, next) => {
       _entry = { count: 0, resetTime: _now + _window };
       _perUserLimits.set(user.id, _entry);
     }
-    if (_entry.count >= 200) {
+    if (_entry.count >= PER_USER_LIMIT) {
       return res.status(429).json({ success: false, error: 'Rate limit exceeded. Please try again later.' });
     }
     _entry.count++;

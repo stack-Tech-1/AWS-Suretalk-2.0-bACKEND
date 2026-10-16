@@ -157,8 +157,14 @@ const getObjectMetadata = async (key, bucket) => {
   return metadata;
 };
 
+// True when an S3 key was issued to this user by generateS3Key ("<folder>/<userId>/...").
+// Used to stop a client from attaching another user's recording to their own note or will.
+const isOwnS3Key = (s3Key, userId) =>
+  typeof s3Key === 'string' && !s3Key.includes('..') && s3Key.split('/')[1] === String(userId);
+
 module.exports = {
   BUCKETS,
+  isOwnS3Key,
   generateUploadUrl,
   generateDownloadUrl,
   uploadToS3,
