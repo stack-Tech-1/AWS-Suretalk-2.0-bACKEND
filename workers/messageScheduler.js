@@ -76,15 +76,25 @@ const sendEmail = async (to, title, message, downloadUrl, senderName) => {
   logger.info(`Email sent via SES to ${to}`);
 };
 
+// Escape text placed inside TwiML (XML). Signed audio URLs contain "&", and custom messages and
+// sender names are user-supplied — unescaped they break the call or inject TwiML verbs.
+const xmlEscape = (value) => String(value)
+  .replace(/&/g, '&amp;')
+  .replace(/</g, '&lt;')
+  .replace(/>/g, '&gt;')
+  .replace(/"/g, '&quot;')
+  .replace(/'/g, '&apos;');
+
 // Twilio phone call
 const makePhoneCall = async (to, senderName, audioUrl, customMessage) => {
   if (!twilioClient) throw new Error('Twilio not configured');
   const fromNumber = process.env.TWILIO_PHONE_NUMBER;
   if (!fromNumber) throw new Error('TWILIO_PHONE_NUMBER not set in environment');
 
-  const introText = customMessage
+  const introText = xmlEscape(customMessage
     ? customMessage
-    : `Hello! You have a voice message from ${senderName} on SureTalk.`;
+    : `Hello! You have a voice message from ${senderName} on SureTalk.`);
+  audioUrl = audioUrl ? xmlEscape(audioUrl) : audioUrl;
 
   const twiml = audioUrl
     ? '<?xml version="1.0" encoding="UTF-8"?><Response><Say voice="Polly.Joanna" language="en-US">' + introText + '</Say><Pause length="1"/><Say voice="Polly.Joanna" language="en-US">Here is your message:</Say><Pause length="1"/><Play>' + audioUrl + '</Play><Pause length="1"/><Say voice="Polly.Joanna" language="en-US">This message was delivered by SureTalk. Goodbye.</Say></Response>'
