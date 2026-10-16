@@ -76,10 +76,10 @@ const incrementFailedAttempts = async (userId) => {
   await pool.query(
     `UPDATE users 
      SET failed_login_attempts = failed_login_attempts + 1,
-         account_locked_until = CASE 
-           WHEN failed_login_attempts >= 4 THEN CURRENT_TIMESTAMP + INTERVAL '30 minutes'
-           WHEN failed_login_attempts >= 7 THEN CURRENT_TIMESTAMP + INTERVAL '2 hours'
+         account_locked_until = CASE
            WHEN failed_login_attempts >= 10 THEN CURRENT_TIMESTAMP + INTERVAL '24 hours'
+           WHEN failed_login_attempts >= 7 THEN CURRENT_TIMESTAMP + INTERVAL '2 hours'
+           WHEN failed_login_attempts >= 4 THEN CURRENT_TIMESTAMP + INTERVAL '30 minutes'
            ELSE account_locked_until
          END
      WHERE id = $1`,
@@ -99,8 +99,7 @@ const resetFailedAttempts = async (userId) => {
 router.post('/admin-login', [
   body('email').isEmail().normalizeEmail(),
   body('password').notEmpty(),
-  body('captchaToken').optional().notEmpty(),
-  body('twoFactorToken').optional().notEmpty()
+  body('captchaToken').optional().notEmpty()
 ], async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -112,7 +111,7 @@ if (!errors.isEmpty()) {
   });
 }
 
-    const { email, password, captchaToken, twoFactorToken } = req.body;
+    const { email, password } = req.body;
     const clientIP = getClientIP(req);
     const userAgent = req.get('user-agent');
 
@@ -144,11 +143,11 @@ if (!errors.isEmpty()) {
 
     // Find user
     const userQuery = await pool.query(
-      `SELECT id, email, phone, full_name, password_hash, 
-              subscription_tier, subscription_status, profile_image_url, 
+      `SELECT id, email, phone, full_name, password_hash,
+              subscription_tier, subscription_status, profile_image_url,
               last_login, is_admin, admin_status, two_factor_enabled,
               two_factor_secret, failed_login_attempts, account_locked_until
-       FROM users 
+       FROM users
        WHERE email = $1 AND deleted_at IS NULL`,
       [email]
     );
@@ -162,6 +161,27 @@ if (!errors.isEmpty()) {
     }
 
     const user = userQuery.rows[0];
+
+    // Check if account is locked
+    if (await isAccountLocked(user.id)) {
+      await logLoginAttempt(email, clientIP, userAgent, false, 'Account locked', true);
+      return res.status(403).json({
+        success: false,
+        error: 'Account temporarily locked due to multiple failed attempts',
+        lockedUntil: user.account_locked_until
+      });
+    }
+
+    // Check password before revealing anything about the account's admin status
+    const isPasswordValid = await bcrypt.compare(password, user.password_hash);
+    if (!isPasswordValid) {
+      await incrementFailedAttempts(user.id);
+      await logLoginAttempt(email, clientIP, userAgent, false, 'Invalid password', true);
+      return res.status(401).json({
+        success: false,
+        error: 'Invalid credentials'
+      });
+    }
 
     // Check if admin
     if (!user.is_admin) {
@@ -177,133 +197,29 @@ if (!errors.isEmpty()) {
       await logLoginAttempt(email, clientIP, userAgent, false, 'Admin not approved', true);
       return res.status(403).json({
         success: false,
-        error: user.admin_status === 'pending' 
-          ? 'Admin access pending approval' 
+        error: user.admin_status === 'pending'
+          ? 'Admin access pending approval'
           : 'Admin access not approved'
       });
     }
 
-    // Check if account is locked
-    if (await isAccountLocked(user.id)) {
-      await logLoginAttempt(email, clientIP, userAgent, false, 'Account locked', true);
-      return res.status(403).json({
-        success: false,
-        error: 'Account temporarily locked due to multiple failed attempts'
-      });
-    }
-
-    // Check password
-    const isPasswordValid = await bcrypt.compare(password, user.password_hash);
-    if (!isPasswordValid) {
-      await incrementFailedAttempts(user.id);
-      await logLoginAttempt(email, clientIP, userAgent, false, 'Invalid password', true);
-      return res.status(401).json({
-        success: false,
-        error: 'Invalid credentials'
-      });
-    }
-
-    // If 2FA is enabled, verify token
+    // If 2FA is enabled, issue a short-lived temp token for the code step (/admin-login/2fa)
     if (user.two_factor_enabled) {
-      if (!twoFactorToken) {
-        // Return temp token for 2FA step
-        const tempToken = jwt.sign(
-          { userId: user.id, step: '2fa_required' },
-          process.env.JWT_SECRET,
-          { expiresIn: '5m' }
-        );
-        
-        return res.json({
-          success: true,
-          requiresTwoFactor: true,
-          tempToken,
-          message: '2FA token required'
-        });
-      }
+      const tempToken = jwt.sign(
+        { userId: user.id, step: 'admin_2fa_required' },
+        process.env.JWT_SECRET,
+        { expiresIn: '5m' }
+      );
 
-      // Verify 2FA token
-      const speakeasy = require('speakeasy');
-      const verified = speakeasy.totp.verify({
-        secret: user.two_factor_secret,
-        encoding: 'base32',
-        token: twoFactorToken
+      return res.json({
+        success: true,
+        requiresTwoFactor: true,
+        tempToken,
+        message: '2FA token required'
       });
-
-      if (!verified) {
-        await logLoginAttempt(email, clientIP, userAgent, false, 'Invalid 2FA token', true);
-        return res.status(401).json({
-          success: false,
-          error: 'Invalid 2FA token'
-        });
-      }
     }
 
-    // Reset failed attempts
-    await resetFailedAttempts(user.id);
-
-    // Update last login info
-    await pool.query(
-      `UPDATE users 
-       SET last_login = CURRENT_TIMESTAMP, 
-           last_login_ip = $1,
-           last_login_at = CURRENT_TIMESTAMP
-       WHERE id = $2`,
-      [clientIP, user.id]
-    );
-
-    // Generate JWT token
-    const token = jwt.sign(
-      { 
-        userId: user.id,
-        email: user.email,
-        isAdmin: true,
-        tier: user.subscription_tier,
-        loginIp: clientIP
-      },
-      process.env.JWT_SECRET,
-      { expiresIn: process.env.JWT_EXPIRES_IN || '12h' } // Shorter for admin
-    );
-
-    const refreshToken = jwt.sign(
-      { 
-        userId: user.id,
-        purpose: 'admin_refresh',
-        loginIp: clientIP
-      },
-      process.env.JWT_REFRESH_SECRET,
-      { expiresIn: '7d' }
-    );
-
-    // Remove sensitive data
-    const { password_hash, two_factor_secret, ...userWithoutSensitive } = user;
-
-    // Log successful attempt
-    await logLoginAttempt(email, clientIP, userAgent, true, null, true);
-
-    // Create admin session
-    const sessionToken = crypto.randomBytes(32).toString('hex');
-    await pool.query(
-      `INSERT INTO user_sessions 
-       (user_id, session_token, device_type, user_agent, ip_address, is_admin_session)
-       VALUES ($1, $2, 'admin_console', $3, $4, true)`,
-      [user.id, sessionToken, userAgent, clientIP]
-    );
-
-    res.json({
-      success: true,
-      message: 'Admin login successful',
-      data: {
-        user: userWithoutSensitive,
-        token,
-        refreshToken,
-        sessionToken,
-        sessionInfo: {
-          ip: clientIP,
-          device: 'Admin Console',
-          timestamp: new Date().toISOString()
-        }
-      }
-    });
+    await issueAdminSession(user, clientIP, userAgent, res);
 
   } catch (error) {
     console.error('Admin login error:', error);
@@ -315,52 +231,161 @@ if (!errors.isEmpty()) {
   }
 });
 
-// 2FA setup endpoint
-router.post('/admin/2fa/setup', async (req, res) => {
+// Admin login step 2 — exchanges the temp token + authenticator code (or a backup code) for the admin session
+router.post('/admin-login/2fa', [
+  body('tempToken').notEmpty(),
+  body('code').isString().trim().notEmpty()
+], async (req, res) => {
+  const clientIP = getClientIP(req);
+  const userAgent = req.get('user-agent');
   try {
-    const { userId } = req.body;
-    
-    const speakeasy = require('speakeasy');
-    const qrcode = require('qrcode');
-    
-    const secret = speakeasy.generateSecret({
-      name: `SureTalk Admin (${userId})`
-    });
-    
-    // Save secret to user
-    await pool.query(
-      'UPDATE users SET two_factor_secret = $1 WHERE id = $2',
-      [secret.base32, userId]
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, error: 'Enter your 6-digit code' });
+    }
+
+    let payload;
+    try {
+      payload = jwt.verify(req.body.tempToken, process.env.JWT_SECRET);
+    } catch {
+      return res.status(401).json({ success: false, error: 'Session expired. Please sign in again.' });
+    }
+    if (payload.step !== 'admin_2fa_required') {
+      return res.status(401).json({ success: false, error: 'Session expired. Please sign in again.' });
+    }
+
+    const userQuery = await pool.query(
+      `SELECT id, email, phone, full_name, password_hash,
+              subscription_tier, subscription_status, profile_image_url,
+              last_login, is_admin, admin_status, two_factor_enabled,
+              two_factor_secret, two_factor_backup_codes, failed_login_attempts, account_locked_until
+       FROM users
+       WHERE id = $1 AND deleted_at IS NULL`,
+      [payload.userId]
     );
-    
-    // Generate QR code
-    const qrCodeUrl = await qrcode.toDataURL(secret.otpauth_url);
-    
-    res.json({
-      success: true,
-      data: {
-        secret: secret.base32,
-        qrCode: qrCodeUrl,
-        backupCodes: generateBackupCodes()
+    const user = userQuery.rows[0];
+    if (!user || !user.is_admin || user.admin_status !== 'approved' || !user.two_factor_enabled) {
+      return res.status(403).json({ success: false, error: 'Admin access required' });
+    }
+
+    if (await isAccountLocked(user.id)) {
+      await logLoginAttempt(user.email, clientIP, userAgent, false, 'Account locked', true);
+      return res.status(403).json({
+        success: false,
+        error: 'Account temporarily locked due to multiple failed attempts',
+        lockedUntil: user.account_locked_until
+      });
+    }
+
+    const code = req.body.code.replace(/\s+/g, '');
+    let verified = false;
+
+    if (/^\d{6}$/.test(code)) {
+      const speakeasy = require('speakeasy');
+      verified = speakeasy.totp.verify({
+        secret: user.two_factor_secret,
+        encoding: 'base32',
+        token: code,
+        window: 1
+      });
+    } else {
+      // Backup code — each one works once
+      let storedCodes = user.two_factor_backup_codes || [];
+      if (typeof storedCodes === 'string') {
+        try { storedCodes = JSON.parse(storedCodes); } catch { storedCodes = []; }
       }
-    });
-    
+      const hashed = crypto.createHash('sha256').update(code.toUpperCase()).digest('hex');
+      if (Array.isArray(storedCodes) && storedCodes.includes(hashed)) {
+        verified = true;
+        await pool.query(
+          'UPDATE users SET two_factor_backup_codes = $1 WHERE id = $2',
+          [JSON.stringify(storedCodes.filter(c => c !== hashed)), user.id]
+        );
+      }
+    }
+
+    if (!verified) {
+      await incrementFailedAttempts(user.id);
+      await logLoginAttempt(user.email, clientIP, userAgent, false, 'Invalid 2FA token', true);
+      return res.status(401).json({ success: false, error: 'Invalid code' });
+    }
+
+    await issueAdminSession(user, clientIP, userAgent, res);
+
   } catch (error) {
-    console.error('2FA setup error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to setup 2FA'
-    });
+    console.error('Admin 2FA login error:', error);
+    res.status(500).json({ success: false, error: 'Verification failed' });
   }
 });
 
-// Generate backup codes
-function generateBackupCodes() {
-  const codes = [];
-  for (let i = 0; i < 10; i++) {
-    codes.push(crypto.randomBytes(4).toString('hex').toUpperCase());
-  }
-  return codes;
+// Creates the admin session after all checks pass and sends the tokens
+async function issueAdminSession(user, clientIP, userAgent, res) {
+  // Reset failed attempts
+  await resetFailedAttempts(user.id);
+
+  // Update last login info
+  await pool.query(
+    `UPDATE users
+     SET last_login = CURRENT_TIMESTAMP,
+         last_login_ip = $1,
+         last_login_at = CURRENT_TIMESTAMP
+     WHERE id = $2`,
+    [clientIP, user.id]
+  );
+
+  // Generate JWT token
+  const token = jwt.sign(
+    {
+      userId: user.id,
+      email: user.email,
+      isAdmin: true,
+      tier: user.subscription_tier,
+      loginIp: clientIP
+    },
+    process.env.JWT_SECRET,
+    { expiresIn: process.env.JWT_EXPIRES_IN || '12h' } // Shorter for admin
+  );
+
+  const refreshToken = jwt.sign(
+    {
+      userId: user.id,
+      purpose: 'admin_refresh',
+      loginIp: clientIP
+    },
+    process.env.JWT_REFRESH_SECRET,
+    { expiresIn: '7d' }
+  );
+
+  // Remove sensitive data
+  const { password_hash, two_factor_secret, two_factor_backup_codes, ...userWithoutSensitive } = user;
+
+  // Log successful attempt
+  await logLoginAttempt(user.email, clientIP, userAgent, true, null, true);
+
+  // Create admin session
+  const sessionToken = crypto.randomBytes(32).toString('hex');
+  await pool.query(
+    `INSERT INTO user_sessions
+     (user_id, session_token, device_type, user_agent, ip_address, is_admin_session)
+     VALUES ($1, $2, 'admin_console', $3, $4, true)`,
+    [user.id, sessionToken, userAgent, clientIP]
+  );
+
+  res.json({
+    success: true,
+    message: 'Admin login successful',
+    data: {
+      user: userWithoutSensitive,
+      token,
+      refreshToken,
+      sessionToken,
+      sessionInfo: {
+        ip: clientIP,
+        device: 'Admin Console',
+        timestamp: new Date().toISOString()
+      }
+    }
+  });
 }
 
 
