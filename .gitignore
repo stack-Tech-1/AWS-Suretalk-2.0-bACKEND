@@ -1,7 +1,7 @@
-# Secrets and Environment Variables
+# Secrets and Environment Variables — never commit any env file (real values live in AppRunner)
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
 
 # Dependency directories
 node_modules/
