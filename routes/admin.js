@@ -2927,287 +2927,108 @@ router.post('/logs/clear-old', authenticateAdmin, [
   }
 });
 
-// Get all system settings
+// ==================== PLATFORM SETTINGS ====================
+// Only settings the app actually enforces live here (see utils/platformSettings.js).
+// Rate limits and upload size are set in the server environment and shown read-only.
+
+// Mirrors the limits configured in server.js / middleware/auth.js / utils/s3Storage.js
+const currentLimits = () => ({
+  generalPerIp: Number(process.env.GENERAL_RATE_LIMIT) || (process.env.NODE_ENV === 'development' ? 5000 : 1500),
+  perUser: Number(process.env.PER_USER_RATE_LIMIT) || 1000,
+  windowMinutes: 15,
+  failedLoginsPerIp: 20,
+  messageSendsPerHour: 10,
+  uploadMaxMb: 100,
+  generalOverridden: !!process.env.GENERAL_RATE_LIMIT,
+  perUserOverridden: !!process.env.PER_USER_RATE_LIMIT
+});
+
 router.get('/settings', authenticateAdmin, async (req, res) => {
   try {
-    const settings = await pool.query(`
-      SELECT category, setting_key, setting_value, setting_type, 
-             description, is_encrypted, requires_restart
-      FROM system_settings
-      ORDER BY category, setting_key
-    `);
-
-    // Group settings by category
-    const groupedSettings = {};
-    settings.rows.forEach(setting => {
-      if (!groupedSettings[setting.category]) {
-        groupedSettings[setting.category] = {};
-      }
-      
-      // Parse value based on type
-      let value = setting.setting_value;
-      if (setting.setting_type === 'boolean') {
-        value = value === 'true';
-      } else if (setting.setting_type === 'number') {
-        value = parseFloat(value);
-      } else if (setting.setting_type === 'json') {
-        try {
-          value = JSON.parse(value);
-        } catch (e) {
-          value = {};
-        }
-      }
-      
-      groupedSettings[setting.category][setting.setting_key] = value;
-    });
-
-    // Get service status (you can implement real monitoring later)
-    const serviceStatus = [
-      { name: 'API Gateway', status: 'operational', uptime: '99.9%' },
-      { name: 'Database', status: 'operational', uptime: '99.95%' },
-      { name: 'Storage', status: 'operational', uptime: '99.8%' },
-      { name: 'Payment Processing', status: 'operational', uptime: '99.8%' },
-      { name: 'Email Service', status: 'operational', uptime: '99.7%' },
-      { name: 'SMS Gateway', status: 'operational', uptime: '99.5%' },
-    ];
+    const { getPlatformSettings } = require('../utils/platformSettings');
+    const [settings, admins] = await Promise.all([
+      getPlatformSettings(),
+      pool.query(
+        `SELECT COUNT(*)::int AS total,
+                COUNT(*) FILTER (WHERE COALESCE(two_factor_enabled, false) = false)::int AS without_2fa
+         FROM users
+         WHERE is_admin = true AND admin_status = 'approved' AND deleted_at IS NULL`
+      )
+    ]);
 
     res.json({
       success: true,
       data: {
-        settings: groupedSettings,
-        serviceStatus,
-        lastUpdated: new Date().toISOString()
+        settings,
+        limits: currentLimits(),
+        admins: admins.rows[0]
       }
     });
-
   } catch (error) {
     console.error('Get settings error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to fetch settings'
-    });
+    res.status(500).json({ success: false, error: 'Failed to fetch settings' });
   }
 });
 
-// Update system settings
 router.put('/settings', authenticateAdmin, [
-  body('category').notEmpty(),
-  body('key').notEmpty(),
-  body('value').notEmpty()
+  body('key').isIn(['maintenanceMode', 'maintenanceMessage', 'require2FA']),
+  body('value').exists()
 ], async (req, res) => {
   try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({
-        success: false,
-        errors: errors.array()
-      });
+    if (!validationResult(req).isEmpty()) {
+      return res.status(400).json({ success: false, error: 'Unknown setting' });
+    }
+    const { getPlatformSettings, saveSetting } = require('../utils/platformSettings');
+    const { key, value } = req.body;
+
+    if (key === 'maintenanceMessage' && !String(value).trim()) {
+      return res.status(400).json({ success: false, error: 'The maintenance message cannot be empty' });
     }
 
-    const { category, key, value } = req.body;
-    
-    // Determine type
-    let settingType = 'string';
-    let settingValue = value;
-    
-    if (typeof value === 'boolean') {
-      settingType = 'boolean';
-      settingValue = value.toString();
-    } else if (typeof value === 'number') {
-      settingType = 'number';
-      settingValue = value.toString();
-    } else if (typeof value === 'object') {
-      settingType = 'json';
-      settingValue = JSON.stringify(value);
+    // Don't let an admin require 2FA while their own account would be locked out by it
+    if (key === 'require2FA' && value === true) {
+      const me = await pool.query('SELECT two_factor_enabled FROM users WHERE id = $1', [req.user.id]);
+      if (!me.rows[0]?.two_factor_enabled) {
+        return res.status(400).json({
+          success: false,
+          code: 'OWN_2FA_REQUIRED',
+          error: 'Turn on two-step verification for your own account first (Security & audit page).'
+        });
+      }
     }
 
-    // Upsert setting
-    const result = await pool.query(`
-      INSERT INTO system_settings (category, setting_key, setting_value, setting_type, updated_by)
-      VALUES ($1, $2, $3, $4, $5)
-      ON CONFLICT (category, setting_key) DO UPDATE 
-      SET setting_value = EXCLUDED.setting_value,
-          setting_type = EXCLUDED.setting_type,
-          updated_at = CURRENT_TIMESTAMP
-      RETURNING *
-    `, [category, key, settingValue, settingType, req.user.id]);
+    const before = (await getPlatformSettings())[key];
+    const saved = await saveSetting(key, value);
 
-    // Log the setting change
-    await pool.query(
+    const label = { maintenanceMode: 'Maintenance mode', maintenanceMessage: 'Maintenance message', require2FA: 'Require 2FA for admins' }[key];
+    pool.query(
       `INSERT INTO system_logs (user_id, level, service, message, metadata)
-       VALUES ($1, 'info', 'settings', 'Setting updated', $2)`,
-      [req.user.id, JSON.stringify({
-        category,
-        key,
-        value: settingValue,
-        type: settingType
-      })]
-    );
+       VALUES ($1, $2, 'settings', $3, $4)`,
+      [
+        req.user.id,
+        key === 'maintenanceMode' && saved ? 'warning' : 'info',
+        typeof saved === 'boolean' ? `${label} turned ${saved ? 'on' : 'off'}` : `${label} updated`,
+        JSON.stringify({ key, value: saved })
+      ]
+    ).catch(err => console.error('system_log write failed:', err));
+    logAdminAudit({ userId: req.user.id, action: 'UPDATE_SETTINGS', targetId: key, oldValue: { [key]: before }, newValue: { [key]: saved }, ipAddress: req.ip });
 
-    logAdminAudit({ userId: req.user.id, action: 'UPDATE_SETTINGS', newValue: { category, key, value: settingValue }, ipAddress: req.ip });
-
-    res.json({
-      success: true,
-      message: 'Setting updated successfully',
-      data: result.rows[0]
-    });
-
+    res.json({ success: true, data: { key, value: saved } });
   } catch (error) {
     console.error('Update setting error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to update setting'
-    });
+    res.status(500).json({ success: false, error: 'Failed to update setting' });
   }
 });
 
-// Bulk update settings
-router.put('/settings/bulk', authenticateAdmin, [
-  body('updates').isArray()
-], async (req, res) => {
-  try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({
-        success: false,
-        errors: errors.array()
-      });
-    }
-
-    const { updates } = req.body;
-    const results = [];
-
-    for (const update of updates) {
-      const { category, key, value } = update;
-      
-      let settingType = 'string';
-      let settingValue = value;
-      
-      if (typeof value === 'boolean') {
-        settingType = 'boolean';
-        settingValue = value.toString();
-      } else if (typeof value === 'number') {
-        settingType = 'number';
-        settingValue = value.toString();
-      } else if (typeof value === 'object') {
-        settingType = 'json';
-        settingValue = JSON.stringify(value);
-      }
-
-      const result = await pool.query(`
-        INSERT INTO system_settings (category, setting_key, setting_value, setting_type, updated_by)
-        VALUES ($1, $2, $3, $4, $5)
-        ON CONFLICT (category, setting_key) DO UPDATE 
-        SET setting_value = EXCLUDED.setting_value,
-            setting_type = EXCLUDED.setting_type,
-            updated_at = CURRENT_TIMESTAMP
-        RETURNING *
-      `, [category, key, settingValue, settingType, req.user.id]);
-
-      results.push(result.rows[0]);
-    }
-
-    // Log bulk update
-    await pool.query(
-      `INSERT INTO system_logs (user_id, level, service, message, metadata)
-       VALUES ($1, 'info', 'settings', 'Bulk settings update', $2)`,
-      [req.user.id, JSON.stringify({
-        updateCount: updates.length,
-        categories: [...new Set(updates.map(u => u.category))]
-      })]
-    );
-
-    logAdminAudit({ userId: req.user.id, action: 'BULK_UPDATE_SETTINGS', newValue: { updateCount: updates.length }, ipAddress: req.ip });
-
-    res.json({
-      success: true,
-      message: `${updates.length} settings updated successfully`,
-      data: { results }
-    });
-
-  } catch (error) {
-    console.error('Bulk update settings error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to update settings'
-    });
-  }
-});
-
-// Reset to defaults
-router.post('/settings/reset', authenticateAdmin, async (req, res) => {
-  try {
-    // You might want to backup current settings first
-    await pool.query('DELETE FROM system_settings WHERE created_by = $1', [req.user.id]);
-    
-    // Insert default settings
-    const defaultSettings = [
-      { category: 'system', key: 'maintenanceMode', value: false, type: 'boolean' },
-      { category: 'system', key: 'apiRateLimit', value: 1000, type: 'number' },
-      { category: 'system', key: 'maxFileSize', value: 50, type: 'number' },
-      { category: 'system', key: 'sessionTimeout', value: 30, type: 'number' },
-      { category: 'security', key: 'require2FA', value: false, type: 'boolean' },
-      { category: 'security', key: 'ipWhitelist', value: false, type: 'boolean' },
-      { category: 'security', key: 'auditLogging', value: true, type: 'boolean' },
-      { category: 'security', key: 'encryption', value: 'aes-256', type: 'string' },
-      { category: 'notifications', key: 'emailAlerts', value: true, type: 'boolean' },
-      { category: 'notifications', key: 'slackAlerts', value: true, type: 'boolean' },
-      { category: 'notifications', key: 'smsAlerts', value: false, type: 'boolean' },
-      { category: 'notifications', key: 'criticalOnly', value: false, type: 'boolean' },
-      { category: 'billing', key: 'autoInvoice', value: true, type: 'boolean' },
-      { category: 'billing', key: 'taxEnabled', value: true, type: 'boolean' },
-      { category: 'billing', key: 'currency', value: 'USD', type: 'string' },
-      { category: 'billing', key: 'gracePeriod', value: 14, type: 'number' },
-    ];
-
-    for (const setting of defaultSettings) {
-      await pool.query(
-        `INSERT INTO system_settings (category, setting_key, setting_value, setting_type, created_by)
-         VALUES ($1, $2, $3, $4, $5)`,
-        [setting.category, setting.key, setting.value.toString(), setting.type, req.user.id]
-      );
-    }
-
-    logAdminAudit({ userId: req.user.id, action: 'RESET_SETTINGS', ipAddress: req.ip });
-
-    res.json({
-      success: true,
-      message: 'Settings reset to defaults successfully'
-    });
-
-  } catch (error) {
-    console.error('Reset settings error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to reset settings'
-    });
-  }
-});
-
-// Get service status (you can connect this to real monitoring later)
+// Live service checks (same as the dashboard's System health)
 router.get('/settings/service-status', authenticateAdmin, async (req, res) => {
   try {
-    // This is a simplified version - you'd want to connect to actual monitoring
-    const serviceStatus = [
-      { name: 'API Gateway', status: 'operational', uptime: '99.9%' },
-      { name: 'Database', status: 'operational', uptime: '99.95%' },
-      { name: 'Storage', status: 'operational', uptime: '99.8%' },
-      { name: 'Payment Processing', status: 'operational', uptime: '99.8%' },
-      { name: 'Email Service', status: 'operational', uptime: '99.7%' },
-      { name: 'SMS Gateway', status: 'operational', uptime: '99.5%' },
-    ];
-
-    res.json({
-      success: true,
-      data: serviceStatus
-    });
-
+    const { getSystemHealth } = require('../utils/systemHealth');
+    const health = await getSystemHealth({ force: req.query.refresh === '1' });
+    res.json({ success: true, data: health });
   } catch (error) {
     console.error('Get service status error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to fetch service status'
-    });
+    res.status(500).json({ success: false, error: 'Failed to check services' });
   }
 });
 

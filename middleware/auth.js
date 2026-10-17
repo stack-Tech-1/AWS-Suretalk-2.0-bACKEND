@@ -1,6 +1,7 @@
 const jwt = require('jsonwebtoken');
 const { pool } = require('../config/database');
 const { normalizeTier } = require('../utils/tierMapping');
+const { getPlatformSettings } = require('../utils/platformSettings');
 
 // Module-level store for per-user rate limiting (PER_USER_LIMIT req / 15 min).
 // A normal session can make many requests (the dashboard loads ~7 at once, the voice notes list
@@ -114,7 +115,7 @@ const authenticateAdmin = async (req, res, next) => {
     try {
       await authenticate(req, res, async () => {
         const adminCheck = await pool.query(
-          'SELECT is_admin, admin_status FROM users WHERE id = $1',
+          'SELECT is_admin, admin_status, two_factor_enabled FROM users WHERE id = $1',
           [req.user.id]
         );
   
@@ -133,7 +134,20 @@ const authenticateAdmin = async (req, res, next) => {
             error: 'Admin access required'
           });
         }
-  
+
+        // "Require 2FA for all admins" (Settings page): until this admin turns 2FA on, only the
+        // 2FA status check works; setting 2FA up uses /api/auth/2fa/*, which isn't admin-gated
+        if (!admin.two_factor_enabled && !req.originalUrl.startsWith('/api/auth/admin/2fa/status')) {
+          const { require2FA } = await getPlatformSettings();
+          if (require2FA) {
+            return res.status(403).json({
+              success: false,
+              code: 'ADMIN_2FA_REQUIRED',
+              error: 'Two-step verification is required for admin accounts. Turn it on to continue.'
+            });
+          }
+        }
+
         next();
       });
     } catch (error) {

@@ -216,6 +216,11 @@ app.get('/health', (req, res) => {
   });
 });
 
+// Maintenance mode (switched on from the admin Settings page)
+const { maintenanceGate, maintenanceStatus } = require('./middleware/maintenance');
+app.get('/api/status/maintenance', maintenanceStatus);
+app.use(maintenanceGate);
+
 // API Routes - IMPORTANT: Webhook route must be defined BEFORE routes that need JSON
 // Dedicated Stripe webhook handler — registered before billing router so it takes priority
 app.use('/api/billing/webhook', express.raw({ type: 'application/json' }), require('./routes/stripeWebhook'));
