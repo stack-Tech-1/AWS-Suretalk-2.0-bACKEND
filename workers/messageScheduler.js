@@ -13,6 +13,9 @@ const { generateDownloadUrl } = require('../utils/s3Storage');
 const logger = require('../utils/logger');
 const { signedEc2RecordingUrl, signedEc2S3Url, TTL: AUDIO_TTL } = require('../utils/audioSigning');
 
+// After this many failed attempts a message is marked 'failed' (an admin can retry it)
+const MAX_ATTEMPTS = 3;
+
 const twilioClient = process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN
   ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
   : null;
@@ -149,10 +152,13 @@ const processScheduledMessages = async () => {
        FROM scheduled_messages
        WHERE delivery_status = 'scheduled'
          AND scheduled_for <= $1
-         AND delivery_attempts < 3
+         AND delivery_attempts < $2
+         -- Phone-line (IVR) schedules are delivered by the executeScheduledCall Lambda; the copy synced
+         -- here is for display only. Delivering it too would call and text the recipient twice.
+         AND COALESCE(metadata->>'source', 'app') <> 'ivr'
        FOR UPDATE SKIP LOCKED
        LIMIT 50`,
-      [now]
+      [now, MAX_ATTEMPTS]
     );
     lockedRows = result.rows;
     // Increment delivery_attempts immediately while the row is still locked.
@@ -194,9 +200,11 @@ const processScheduledMessages = async () => {
       );
 
       if (detailResult.rows.length === 0) {
+        // The voice note was deleted — retrying can't help, so fail it now
         await pool.query(
           `UPDATE scheduled_messages
-           SET delivery_attempts = delivery_attempts + 1,
+           SET delivery_status = 'failed',
+               failed_at = $1,
                last_attempt_at = $1,
                error_message = 'Voice note or user not found',
                updated_at = $1
@@ -339,12 +347,16 @@ const processScheduledMessages = async () => {
           [now, sm.id, callSid || null, smsSid || null]
         );
       } else {
+        // delivery_attempts was already incremented when the row was locked
+        const finalAttempt = (sm.delivery_attempts || 0) + 1 >= MAX_ATTEMPTS;
         await pool.query(
           `UPDATE scheduled_messages
-           SET error_message = $2,
-               updated_at    = $3
+           SET error_message   = $2,
+               updated_at      = $3,
+               delivery_status = CASE WHEN $4::boolean THEN 'failed' ELSE delivery_status END,
+               failed_at       = CASE WHEN $4::boolean THEN $3 ELSE failed_at END
            WHERE id = $1`,
-          [sm.id, errorMessages.join(' | ') || 'All delivery methods failed', now]
+          [sm.id, errorMessages.join(' | ') || 'All delivery methods failed', now, finalAttempt]
         );
       }
     } catch (error) {
