@@ -862,88 +862,109 @@ router.get('/profile', authenticate, async (req, res) => {
   }); 
 
   
-  // Request admin access
+  // Request admin access (public form at /admin/register).
+  // Needs the registration code from ADMIN_REGISTRATION_CODE when that's set; super admins are emailed.
+  const crypto = require('crypto');
+  const codeMatches = (given) => {
+    const expected = process.env.ADMIN_REGISTRATION_CODE;
+    if (!expected) return true; // not configured — anyone can apply (approval is still required)
+    const a = Buffer.from(String(given || '').trim().toUpperCase());
+    const b = Buffer.from(expected.trim().toUpperCase());
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+  };
+
 router.post(
     '/admin/request',
+    requireTurnstile,
     [
       body('email').isEmail().normalizeEmail(),
-      body('phone').notEmpty().isLength({ min: 10 }),
-      body('password').isLength({ min: 8 }),
-      body('fullName').notEmpty().trim(),
-      body('reason').notEmpty().trim(),
-      body('department').optional().trim()
+      body('phone').trim().matches(/^\+?[0-9\s\-()]{10,20}$/),
+      body('password').isLength({ min: 12, max: 200 }),
+      body('fullName').trim().isLength({ min: 2, max: 255 }),
+      body('reason').trim().isLength({ min: 10, max: 2000 }),
+      body('department').optional({ checkFalsy: true }).trim().isLength({ max: 255 })
     ],
     async (req, res) => {
       try {
         const errors = validationResult(req);
         if (!errors.isEmpty()) {
-          return res.status(400).json({
-            success: false,
-            errors: errors.array()
-          });
+          const field = errors.array()[0].path;
+          const messages = {
+            email: 'Enter a valid email address',
+            phone: 'Enter a valid phone number, including the country code',
+            password: 'Password must be at least 12 characters',
+            fullName: 'Enter your full name',
+            reason: 'Tell us why you need admin access (at least 10 characters)',
+          };
+          return res.status(400).json({ success: false, error: messages[field] || 'Check the form and try again' });
         }
-  
-        const {
-          email,
-          phone,
-          password,
-          fullName,
-          subscriptionTier,
-        } = req.body;
-  
-        // Check if user already exists
-        const existingUser = await pool.query(
-          'SELECT id FROM users WHERE email = $1 OR phone = $2',
-          [email, phone]
-        );
-  
+        if (!codeMatches(req.body.registrationCode)) {
+          return res.status(403).json({ success: false, code: 'BAD_REGISTRATION_CODE', error: 'That registration code isn\'t valid. Ask your SureTalk contact for the current code.' });
+        }
+
+        const { email, phone, password, fullName, reason, department } = req.body;
+        const existingUser = await pool.query('SELECT id FROM users WHERE LOWER(email) = LOWER($1) OR phone = $2', [email, phone]);
         if (existingUser.rows.length > 0) {
-          return res.status(400).json({
-            success: false,
-            error: 'User with this email or phone already exists'
-          });
+          return res.status(400).json({ success: false, error: 'An account with this email or phone already exists' });
         }
-  
-        // Hash password
+
         const passwordHash = await bcrypt.hash(password, 10);
-  
-        // Create pending admin user
         const result = await pool.query(
-          `
-          INSERT INTO users (
-            email,
-            phone,
-            password_hash,
-            full_name,
-            is_admin,
-            admin_status,
-            subscription_tier
-          )
-          VALUES ($1, $2, $3, $4, true, 'pending', $5)
-          RETURNING id, email, full_name, is_admin, admin_status, created_at
-          `,
-          [email, phone, passwordHash, fullName, subscriptionTier] 
+          `INSERT INTO users (email, phone, password_hash, full_name, is_admin, admin_status,
+                              admin_reason, admin_department, subscription_tier, subscription_status)
+           VALUES ($1, $2, $3, $4, true, 'pending', $5, $6, 'LITE', 'active')
+           RETURNING id, email, full_name, created_at`,
+          [email, phone, passwordHash, fullName, reason, department || null]
         );
-  
-        res.status(201).json({
-          success: true,
-          message: 'Admin request submitted and pending approval',
-          data: {
-            user: result.rows[0]
-          }
-        });
-  
+        const applicant = result.rows[0];
+
+        pool.query(
+          `INSERT INTO system_logs (user_id, level, service, message, metadata, ip_address, user_agent)
+           VALUES ($1, 'info', 'admin', 'Admin access requested', $2, $3, $4)`,
+          [applicant.id, JSON.stringify({ email, department: department || null }), req.ip || null, req.get('user-agent') || '']
+        ).catch(err => console.error('system_log write failed:', err.message));
+
+        // Tell the super admins (they're the only ones who can approve)
+        pool.query('SELECT email FROM users WHERE is_super_admin = true AND deleted_at IS NULL')
+          .then(r => Promise.all(r.rows.map(sa => emailService.sendAdminRequestNotification(sa.email, {
+            applicantName: fullName, applicantEmail: email, department, reason
+          }))))
+          .catch(err => console.error('Admin request notification failed:', err.message));
+
+        res.status(201).json({ success: true, message: 'Admin request submitted and pending approval' });
       } catch (error) {
         console.error('Admin request error:', error);
-        res.status(500).json({
-          success: false,
-          error: 'Failed to submit admin request'
-        });
+        res.status(500).json({ success: false, error: 'Failed to submit admin request' });
       }
     }
   );
-  
-  
+
+  // Status of an admin access request (pending page). Needs the applicant's password, so it reveals
+  // nothing to someone who only knows the email address.
+router.post('/admin/request-status', [
+    body('email').isEmail().normalizeEmail(),
+    body('password').isString().notEmpty()
+  ], async (req, res) => {
+    try {
+      if (!validationResult(req).isEmpty()) return res.status(400).json({ success: false, error: 'Enter your email and password' });
+      const r = await pool.query(
+        'SELECT password_hash, admin_status, rejection_notes FROM users WHERE LOWER(email) = LOWER($1) AND deleted_at IS NULL',
+        [req.body.email]
+      );
+      const u = r.rows[0];
+      if (!u || !(await bcrypt.compare(req.body.password, u.password_hash))) {
+        return res.status(401).json({ success: false, error: 'Incorrect email or password' });
+      }
+      if (!['pending', 'approved', 'rejected'].includes(u.admin_status)) {
+        return res.status(404).json({ success: false, error: 'No admin access request found for this account' });
+      }
+      res.json({ success: true, data: { status: u.admin_status, reason: u.admin_status === 'rejected' ? (u.rejection_notes || null) : null } });
+    } catch (error) {
+      console.error('Admin request status error:', error);
+      res.status(500).json({ success: false, error: 'Could not check your request' });
+    }
+  });
+
 
 // ─── IVR Account Claiming Flow ───────────────────────────────────────────────
 

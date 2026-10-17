@@ -548,6 +548,75 @@ class EmailService {
       ])
     });
   }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // 10. NEW ADMIN ACCESS REQUEST (to super admins)
+  // ══════════════════════════════════════════════════════════════════════════
+  async sendAdminRequestNotification(toEmail, { applicantName, applicantEmail, department, reason }) {
+    const esc = (s) => String(s || '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    const reviewUrl = `${this.siteUrl}/adminDashboard/admin-requests`;
+    const html = this._wrap({
+      title: 'New admin access request',
+      preheader: `${applicantName} asked for access to the SureTalk admin console.`,
+      headerAccent: BRAND.navy,
+      toEmail,
+      body: `
+        <p class="greeting">Hi,</p>
+        <p><strong>${esc(applicantName)}</strong> (${esc(applicantEmail)}) has asked for access to the SureTalk admin console.</p>
+        <div class="info-box">
+          <p style="margin:0">
+            ${department ? `<strong>Department:</strong> ${esc(department)}<br>` : ''}
+            <strong>Reason:</strong> ${esc(reason) || '—'}
+          </p>
+        </div>
+        <div style="text-align:center;margin:28px 0"><a href="${reviewUrl}" class="btn">Review the request</a></div>
+        <p style="font-size:13px;color:${BRAND.muted}">Only approve people you know. Admins can see every user's data.</p>`
+    });
+    return this._send({
+      to: toEmail,
+      subject: `Admin access request from ${applicantName}`,
+      html,
+      text: this._text('New admin access request', [
+        `${applicantName} (${applicantEmail}) asked for admin access.`,
+        department ? `Department: ${department}` : '',
+        `Reason: ${reason || '—'}`,
+        '',
+        `Review it here: ${reviewUrl}`
+      ])
+    });
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // 11. ADMIN ACCESS DECISION (to the applicant)
+  // ══════════════════════════════════════════════════════════════════════════
+  async sendAdminRequestDecision(toEmail, userName, { approved, reason }) {
+    const esc = (s) => String(s || '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    const loginUrl = `${this.siteUrl}/admin/login`;
+    const html = this._wrap({
+      title: approved ? 'Admin access approved' : 'Admin access request',
+      preheader: approved ? 'You can now sign in to the SureTalk admin console.' : 'An update on your SureTalk admin access request.',
+      headerAccent: BRAND.navy,
+      toEmail,
+      body: approved ? `
+        <p class="greeting">Hi ${esc(userName)},</p>
+        <p>Your request for access to the SureTalk admin console has been <strong>approved</strong>.</p>
+        <div style="text-align:center;margin:28px 0"><a href="${loginUrl}" class="btn">Sign in to the admin console</a></div>
+        <p style="font-size:13px;color:${BRAND.muted}">For your account's safety, turn on two-step verification after you sign in (Security &amp; audit page).</p>`
+      : `
+        <p class="greeting">Hi ${esc(userName)},</p>
+        <p>Your request for access to the SureTalk admin console was <strong>not approved</strong>.</p>
+        ${reason ? `<div class="info-box"><p style="margin:0"><strong>Reason:</strong> ${esc(reason)}</p></div>` : ''}
+        <p>If you think this is a mistake, reply to this email.</p>`
+    });
+    return this._send({
+      to: toEmail,
+      subject: approved ? 'Your SureTalk admin access is approved' : 'Your SureTalk admin access request',
+      html,
+      text: this._text(approved ? 'Admin access approved' : 'Admin access request', approved
+        ? [`Hi ${userName},`, '', 'Your admin access request was approved.', `Sign in: ${loginUrl}`]
+        : [`Hi ${userName},`, '', 'Your admin access request was not approved.', reason ? `Reason: ${reason}` : '', 'Reply to this email if you think this is a mistake.'])
+    });
+  }
 }
 
 module.exports = new EmailService();

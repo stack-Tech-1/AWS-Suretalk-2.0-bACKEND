@@ -178,8 +178,8 @@ const lookupLimiter = rateLimit({
   message: jsonLimitMessage('Too many requests from this network. Please try again later.')
 });
 
-app.use(['/api/auth/login', '/api/auth/2fa/verify', '/api/auth/admin-login'], loginLimiter);
-app.use(['/api/auth/register', '/api/auth/forgot-password', '/api/auth/resend-verification', '/api/auth/send-claim-otp'], messageSendLimiter);
+app.use(['/api/auth/login', '/api/auth/2fa/verify', '/api/auth/admin-login', '/api/auth/admin/request-status'], loginLimiter);
+app.use(['/api/auth/register', '/api/auth/forgot-password', '/api/auth/resend-verification', '/api/auth/send-claim-otp', '/api/auth/admin/request'], messageSendLimiter);
 app.use(['/api/auth/check-phone', '/api/auth/claim-account', '/api/auth/reset-password'], lookupLimiter);
 
 // IMPORTANT: Custom body parser that excludes webhook routes
@@ -241,6 +241,7 @@ app.use('/api/admin', require('./routes/adminWills'));
 app.use('/api/admin', require('./routes/adminScheduled'));
 app.use('/api/admin', require('./routes/adminLogs'));
 app.use('/api/admin', require('./routes/adminStorage'));
+app.use('/api/admin', require('./routes/adminRequests'));
 app.use('/api/admin', require('./routes/admin'));
 app.use('/api/settings', settingsRoutes);
 app.use('/api/devices', devicesRoutes);

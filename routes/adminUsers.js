@@ -259,7 +259,7 @@ router.post('/users/bulk', authenticateAdmin, [
 router.post('/users', authenticateAdmin, [
   body('email').isEmail().normalizeEmail(),
   body('fullName').trim().isLength({ min: 1, max: 255 }),
-  body('phone').optional({ checkFalsy: true }).matches(/^\+[1-9]\d{7,14}$/),
+  body('phone').matches(/^\+[1-9]\d{7,14}$/), // users.phone is NOT NULL UNIQUE
   body('subscriptionTier').optional().isIn(TIERS),
   body('sendSetupEmail').optional().isBoolean()
 ], async (req, res) => {
@@ -270,7 +270,7 @@ router.post('/users', authenticateAdmin, [
       const messages = {
         email: 'Enter a valid email address',
         fullName: 'Enter the person\'s name',
-        phone: 'Phone must be in international format, e.g. +2348012345678',
+        phone: 'Enter a phone number in international format, e.g. +2348012345678',
       };
       return res.status(400).json({ success: false, error: messages[field] || 'Check the form and try again' });
     }
