@@ -83,4 +83,64 @@ router.get('/public/:token', async (req, res) => {
   }
 });
 
+// PUBLIC — a released voice will, opened from the private link an admin's release sent to a beneficiary.
+// The token is the credential; each opening is counted.
+router.get('/will/:token', async (req, res) => {
+  try {
+    const { token } = req.params;
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(token)) {
+      return res.status(404).json({ success: false, error: 'This link is invalid' });
+    }
+
+    const result = await pool.query(
+      `SELECT l.id AS link_id, l.recipient_name, l.expires_at, l.revoked_at,
+              vw.*, u.full_name AS owner_name
+       FROM will_release_links l
+       JOIN voice_wills vw ON vw.id = l.will_id
+       JOIN users u ON u.id = vw.user_id
+       WHERE l.token = $1`,
+      [token]
+    );
+    const row = result.rows[0];
+    if (!row || row.revoked_at || row.deleted_at || row.admin_removed_at || !row.is_released) {
+      return res.status(404).json({ success: false, error: 'This link is no longer available' });
+    }
+    if (new Date() > new Date(row.expires_at)) {
+      return res.status(410).json({ success: false, error: 'This link has expired', expiredAt: row.expires_at });
+    }
+
+    const { willAudioUrl } = require('./adminWills');
+    let audioUrl = null;
+    try {
+      audioUrl = await willAudioUrl(row);
+    } catch (err) {
+      console.warn('Could not resolve will audio for link', row.link_id, err.message);
+    }
+
+    pool.query(
+      `UPDATE will_release_links SET play_count = play_count + 1,
+              first_played_at = COALESCE(first_played_at, NOW()), last_played_at = NOW()
+       WHERE id = $1`,
+      [row.link_id]
+    ).catch(err => console.warn('Will link count failed:', err.message));
+
+    res.set('Cache-Control', 'no-store');
+    res.json({
+      success: true,
+      data: {
+        ownerName: row.owner_name || 'Someone',
+        recipientName: row.recipient_name || null,
+        title: row.title || null,
+        releasedAt: row.released_at,
+        expiresAt: row.expires_at,
+        audioUrl,
+        canPlay: !!audioUrl
+      }
+    });
+  } catch (error) {
+    console.error('Will link error:', error);
+    res.status(500).json({ success: false, error: 'Failed to load this voice will' });
+  }
+});
+
 module.exports = router;

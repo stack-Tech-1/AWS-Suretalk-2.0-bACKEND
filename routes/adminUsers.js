@@ -19,8 +19,8 @@ const TIERS = ['LITE', 'ESSENTIAL', 'LEGACY_VAULT_PREMIUM'];
 // Same limits Stripe checkout and the webhook apply (routes/billing.js, routes/stripeWebhook.js)
 const TIER_LIMITS = {
   LITE:                 { storageGb: 1,  contacts: 3,  voiceNotes: 3,   price: 0 },
-  ESSENTIAL:            { storageGb: 5,  contacts: 9,  voiceNotes: 100, price: 4.99 },
-  LEGACY_VAULT_PREMIUM: { storageGb: 50, contacts: 25, voiceNotes: 500, price: 9.99 },
+  ESSENTIAL:            { storageGb: 5,  contacts: 9,  voiceNotes: 100, price: 6.99 },
+  LEGACY_VAULT_PREMIUM: { storageGb: 50, contacts: 25, voiceNotes: 500, price: 12.99 },
 };
 const ACTIVE_STATUSES = ['active', 'trialing', 'past_due']; // statuses middleware/auth.js lets in
 

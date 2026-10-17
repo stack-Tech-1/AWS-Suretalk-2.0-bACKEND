@@ -103,9 +103,9 @@ router.get('/wills', authenticate, validateTier('LEGACY_VAULT_PREMIUM'), async (
 
     const result = await pool.query(
       `SELECT vw.*, 
-              (SELECT COUNT(*) FROM voice_wills WHERE user_id = $1) as total_count
+              (SELECT COUNT(*) FROM voice_wills WHERE user_id = $1 AND deleted_at IS NULL AND admin_removed_at IS NULL) as total_count
        FROM voice_wills vw
-       WHERE vw.user_id = $1
+       WHERE vw.user_id = $1 AND vw.deleted_at IS NULL AND vw.admin_removed_at IS NULL
        ORDER BY vw.created_at DESC
        LIMIT $2 OFFSET $3`,
       [req.user.id, parseInt(limit), offset]
@@ -390,7 +390,7 @@ router.get('/stats', authenticate, validateTier('LEGACY_VAULT_PREMIUM'), async (
 
     // Add voice wills count
     const willsQuery = await pool.query(
-      'SELECT COUNT(*) as total_wills FROM voice_wills WHERE user_id = $1',
+      'SELECT COUNT(*) as total_wills FROM voice_wills WHERE user_id = $1 AND deleted_at IS NULL AND admin_removed_at IS NULL',
       [req.user.id]
     );
 
@@ -533,7 +533,7 @@ router.get('/scheduled-messages', authenticate, validateTier('LEGACY_VAULT_PREMI
 router.get('/wills/:id', authenticate, async (req, res) => {
   try {
     const willResult = await pool.query(
-      'SELECT * FROM voice_wills WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL',
+      'SELECT * FROM voice_wills WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL AND admin_removed_at IS NULL',
       [req.params.id, req.user.id]
     );
 

@@ -507,6 +507,47 @@ class EmailService {
       ])
     });
   }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // 9. VOICE WILL RELEASED TO A BENEFICIARY
+  // ══════════════════════════════════════════════════════════════════════════
+  async sendWillReleasedEmail(toEmail, recipientName, { ownerName, listenUrl, expiresDate }) {
+    const esc = (s) => String(s || '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    const owner = esc(ownerName) || 'Someone';
+    const html = this._wrap({
+      title: 'A voice will has been shared with you',
+      preheader: `${ownerName || 'Someone'} left a voice will for you on SureTalk.`,
+      headerAccent: BRAND.navy,
+      toEmail,
+      body: `
+        <p class="greeting">Hi ${esc(recipientName) || 'there'},</p>
+        <p><strong>${owner}</strong> recorded a voice will on SureTalk and named you as someone who should hear it. It has now been released to you.</p>
+        <div style="text-align:center;margin:28px 0">
+          <a href="${listenUrl}" class="btn">Listen to the voice will</a>
+        </div>
+        <div class="info-box">
+          <p style="margin:0">
+            This private link was created for you. Please don't forward it.<br>
+            It works until <strong>${esc(expiresDate)}</strong>.
+          </p>
+        </div>
+        <p style="font-size:13px;color:${BRAND.muted}">If you weren't expecting this or think it reached you by mistake, reply to this email and our team will help.</p>`
+    });
+
+    return this._send({
+      to: toEmail,
+      subject: `${ownerName || 'Someone'} left a voice will for you on SureTalk`,
+      html,
+      text: this._text('A voice will has been shared with you', [
+        `Hi ${recipientName || 'there'},`,
+        '',
+        `${ownerName || 'Someone'} recorded a voice will on SureTalk and named you as someone who should hear it.`,
+        `Listen here (private link, works until ${expiresDate}): ${listenUrl}`,
+        '',
+        'If you think this reached you by mistake, reply to this email.'
+      ])
+    });
+  }
 }
 
 module.exports = new EmailService();

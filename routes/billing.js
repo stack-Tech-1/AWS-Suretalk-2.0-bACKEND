@@ -40,7 +40,7 @@ router.get('/plans', authenticate, async (req, res) => {
       {
         id: 'essential',
         name: 'SureTalk Essential',
-        price: 4.99,
+        price: 6.99,
         currency: 'usd',
         interval: 'month',
         features: [
@@ -61,7 +61,7 @@ router.get('/plans', authenticate, async (req, res) => {
       {
         id: 'premium',
         name: 'Legacy Vault Premium',
-        price: 9.99,
+        price: 12.99,
         currency: 'usd',
         interval: 'month',
         features: [

@@ -1213,8 +1213,8 @@ router.get('/revenue', authenticateSuperAdmin, async (req, res) => {
     // Tier pricing for MRR estimate (adjust to your actual prices)
     const TIER_PRICE_USD = {
       'LITE': 0,
-      'ESSENTIAL': 9.99,
-      'LEGACY_VAULT_PREMIUM': 19.99
+      'ESSENTIAL': 6.99,
+      'LEGACY_VAULT_PREMIUM': 12.99
     };
 
     const tierBreakdown = tierStats.rows.map(row => ({
