@@ -5,7 +5,7 @@ const jwt = require('jsonwebtoken');
 const { body, validationResult } = require('express-validator');
 const { pool } = require('../config/database');
 const crypto = require('crypto');
-const { authenticate, authenticateAdmin } = require('../middleware/auth');
+const { authenticate, authenticateAdmin, isAccountSuspended } = require('../middleware/auth');
 
 // Helper function to get client IP
 const getClientIP = (req) => {
@@ -181,6 +181,11 @@ if (!errors.isEmpty()) {
         success: false,
         error: 'Invalid credentials'
       });
+    }
+
+    if (await isAccountSuspended(user.id)) {
+      await logLoginAttempt(email, clientIP, userAgent, false, 'Account suspended', true);
+      return res.status(403).json({ success: false, code: 'ACCOUNT_SUSPENDED', error: 'This account has been suspended.' });
     }
 
     // Check if admin

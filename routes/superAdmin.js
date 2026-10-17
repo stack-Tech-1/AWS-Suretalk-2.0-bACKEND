@@ -1,10 +1,15 @@
+// Super admin console — users (plan, suspend, impersonate, IVR re-sync, exports), sync dead letters,
+// activity, sync monitor, system health and revenue.
+// Deleting accounts is soft-only (admin Users page); there is no permanent-erase route by design.
 const express = require('express');
 const router = express.Router();
+const jwt = require('jsonwebtoken');
+const { body, validationResult } = require('express-validator');
 const { pool } = require('../config/database');
-const { deleteFromS3 } = require('../utils/s3Storage');
 const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
 const { DynamoDBDocumentClient, GetCommand } = require('@aws-sdk/lib-dynamodb');
 const { NodeHttpHandler } = require('@smithy/node-http-handler');
+const { applyPlan, setActive, STRIPE_MANAGED, TIER_LIMITS, TIERS } = require('./adminUsers');
 
 const dynamoClient = new DynamoDBClient({
   region: process.env.AWS_REGION || 'eu-central-1',
@@ -12,118 +17,129 @@ const dynamoClient = new DynamoDBClient({
     accessKeyId: process.env.AWS_ACCESS_KEY_ID,
     secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
   },
-  requestHandler: new NodeHttpHandler({
-    requestTimeout: 10000,
-    connectionTimeout: 5000
-  }),
+  requestHandler: new NodeHttpHandler({ requestTimeout: 10000, connectionTimeout: 5000 }),
   maxAttempts: 2
 });
 const dynamodb = DynamoDBDocumentClient.from(dynamoClient);
 
+const isUuid = (v) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(v));
+
 // Super admin authentication middleware
 const authenticateSuperAdmin = async (req, res, next) => {
   try {
-    const jwt = require('jsonwebtoken');
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
       return res.status(401).json({ success: false, error: 'Unauthorized' });
     }
-    const token = authHeader.split(' ')[1];
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const decoded = jwt.verify(authHeader.split(' ')[1], process.env.JWT_SECRET);
+    if (decoded.impersonation) return res.status(403).json({ success: false, error: 'Super admin access required' });
 
     const userResult = await pool.query(
-      'SELECT id, email, full_name, is_admin, is_super_admin FROM users WHERE id = $1',
+      `SELECT id, email, full_name, is_admin, is_super_admin, admin_status, last_logout_at
+       FROM users WHERE id = $1 AND deleted_at IS NULL`,
       [decoded.userId]
     );
-
-    if (userResult.rows.length === 0 ||
-        !userResult.rows[0].is_admin ||
-        !userResult.rows[0].is_super_admin) {
+    const u = userResult.rows[0];
+    if (!u || !u.is_admin || !u.is_super_admin || u.admin_status !== 'approved') {
       return res.status(403).json({ success: false, error: 'Super admin access required' });
     }
-
-    req.user = userResult.rows[0];
+    if (u.last_logout_at && decoded.iat && decoded.iat * 1000 < new Date(u.last_logout_at).getTime()) {
+      return res.status(401).json({ success: false, error: 'Session expired. Please log in again.' });
+    }
+    req.user = u;
     next();
   } catch (err) {
     return res.status(401).json({ success: false, error: 'Invalid token' });
   }
 };
 
-// ── GET /api/super-admin/users ────────────────────────────────────────────────
-// Paginated user list with stats
+async function logAdminAudit({ userId, action, targetId = null, oldValue = null, newValue = null, ipAddress = null }) {
+  try {
+    await pool.query(
+      `INSERT INTO admin_audit_log (admin_user_id, action, target_id, old_value, new_value, ip_address)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [userId, action, targetId, oldValue ? JSON.stringify(oldValue) : null, newValue ? JSON.stringify(newValue) : null, ipAddress]
+    );
+  } catch (err) {
+    console.warn('Admin audit log failed (non-fatal):', err.message);
+  }
+}
+
+const csvCell = (value) => {
+  let text = value === null || value === undefined ? '' : (typeof value === 'object' ? JSON.stringify(value) : String(value));
+  if (/^[=+\-@\t\r]/.test(text)) text = `'${text}`;
+  return `"${text.replace(/"/g, '""')}"`;
+};
+const sendCsv = (res, filename, headers, rows) => {
+  const csv = [headers.map(csvCell).join(','), ...rows.map(r => r.map(csvCell).join(','))].join('\r\n');
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  res.send('﻿' + csv);
+};
+const safeName = (s) => String(s || '').replace(/[^\w.-]+/g, '-').slice(0, 60) || 'user';
+const day = (d) => (d ? new Date(d).toISOString().slice(0, 10) : '');
+
+// sync_received_log's timestamp is processed_at (migration 005); older copies used created_at
+let receivedTimeCol;
+async function receivedTs() {
+  if (receivedTimeCol) return receivedTimeCol;
+  const r = await pool.query(`SELECT column_name FROM information_schema.columns
+                              WHERE table_name = 'sync_received_log' AND column_name IN ('processed_at', 'created_at')`);
+  const cols = r.rows.map(x => x.column_name);
+  receivedTimeCol = cols.includes('processed_at') ? 'processed_at' : (cols[0] || null);
+  return receivedTimeCol;
+}
+
+// Per-user storage/counts as subqueries — joining notes and contacts together multiplied the sums
+const USER_COUNTS = `
+  (SELECT COUNT(*)::int FROM voice_notes vn WHERE vn.user_id = u.id AND vn.deleted_at IS NULL) AS voice_note_count,
+  (SELECT COUNT(*)::int FROM contacts c WHERE c.user_id = u.id) AS contact_count,
+  (SELECT COALESCE(SUM(vn.file_size_bytes), 0)::bigint FROM voice_notes vn WHERE vn.user_id = u.id AND vn.deleted_at IS NULL) AS storage_used_bytes`;
+
+// ── Users ────────────────────────────────────────────────────────────────────
 router.get('/users', authenticateSuperAdmin, async (req, res) => {
   try {
-    const {
-      page = 1,
-      limit = 20,
-      search = '',
-      tier = '',
-      status = '',
-      sort = 'created_at',
-      order = 'desc'
-    } = req.query;
-
-    const offset = (page - 1) * limit;
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 100);
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
     const params = [];
-    let whereClause = 'WHERE 1=1';
-    let paramCount = 1;
-
-    if (search) {
-      whereClause += ` AND (u.email ILIKE $${paramCount} OR u.full_name ILIKE $${paramCount} OR u.phone ILIKE $${paramCount})`;
-      params.push(`%${search}%`);
-      paramCount++;
+    const where = [];
+    const status = req.query.status || '';
+    where.push(status === 'deleted' ? 'u.deleted_at IS NOT NULL' : 'u.deleted_at IS NULL');
+    if (status === 'suspended') where.push('COALESCE(u.is_suspended, false) = true');
+    if (status === 'active') where.push('COALESCE(u.is_suspended, false) = false');
+    if (status === 'admins') where.push('COALESCE(u.is_admin, false) = true');
+    if (req.query.search) {
+      params.push(`%${String(req.query.search).trim()}%`);
+      where.push(`(u.email ILIKE $${params.length} OR u.full_name ILIKE $${params.length} OR u.phone ILIKE $${params.length})`);
     }
-
-    if (tier) {
-      whereClause += ` AND u.subscription_tier = $${paramCount}`;
-      params.push(tier);
-      paramCount++;
+    if (TIERS.includes(req.query.tier)) {
+      params.push(req.query.tier);
+      where.push(`u.subscription_tier = $${params.length}`);
     }
+    const sorts = { created_at: 'u.created_at', full_name: 'u.full_name', email: 'u.email', last_active: 'last_active', storage: 'storage_used_bytes' };
+    const sortCol = sorts[req.query.sort] || 'u.created_at';
+    const order = req.query.order === 'asc' ? 'ASC' : 'DESC';
 
-    if (status === 'suspended') {
-      whereClause += ` AND u.is_suspended = true`;
-    } else if (status === 'active') {
-      whereClause += ` AND (u.is_suspended = false OR u.is_suspended IS NULL)`;
-    }
-
-    const validSorts = ['created_at', 'full_name', 'email', 'subscription_tier', 'last_login'];
-    const sortColumn = validSorts.includes(sort) ? sort : 'created_at';
-    const sortOrder = order === 'asc' ? 'ASC' : 'DESC';
-
-    const query = `
-      SELECT
-        u.id, u.full_name, u.email, u.phone,
-        u.subscription_tier, u.is_admin, u.is_super_admin,
-        u.is_suspended, u.email_verified, u.created_at,
-        u.last_login, u.source,
-        COUNT(DISTINCT vn.id) as voice_note_count,
-        COUNT(DISTINCT c.id) as contact_count,
-        COALESCE(SUM(vn.file_size_bytes), 0) as storage_used_bytes,
-        COUNT(*) OVER() as total_count
-      FROM users u
-      LEFT JOIN voice_notes vn ON vn.user_id = u.id AND vn.deleted_at IS NULL
-      LEFT JOIN contacts c ON c.user_id = u.id
-      ${whereClause}
-      GROUP BY u.id
-      ORDER BY u.${sortColumn} ${sortOrder}
-      LIMIT $${paramCount} OFFSET $${paramCount + 1}
-    `;
-
-    params.push(parseInt(limit), offset);
-    const result = await pool.query(query, params);
-
+    const result = await pool.query(
+      `SELECT u.id, u.full_name, u.email, u.phone, u.subscription_tier, u.subscription_status,
+              COALESCE(u.is_admin, false) AS is_admin, COALESCE(u.is_super_admin, false) AS is_super_admin,
+              COALESCE(u.is_suspended, false) AS is_suspended, u.email_verified, u.created_at, u.deleted_at,
+              u.last_login, COALESCE(u.last_active_at, u.last_login) AS last_active, u.source,
+              ${STRIPE_MANAGED} AS stripe_managed,
+              ${USER_COUNTS},
+              COUNT(*) OVER()::int AS total_count
+       FROM users u
+       WHERE ${where.join(' AND ')}
+       ORDER BY ${sortCol} ${order} NULLS LAST
+       LIMIT ${limit} OFFSET ${(page - 1) * limit}`,
+      params
+    );
     const total = result.rows[0]?.total_count || 0;
-
     res.json({
       success: true,
       data: {
-        users: result.rows,
-        pagination: {
-          page: parseInt(page),
-          limit: parseInt(limit),
-          total: parseInt(total),
-          totalPages: Math.ceil(total / limit)
-        }
+        users: result.rows.map(({ total_count, ...u }) => ({ ...u, storage_used_bytes: Number(u.storage_used_bytes) })),
+        pagination: { page, limit, total, totalPages: Math.max(1, Math.ceil(total / limit)) }
       }
     });
   } catch (err) {
@@ -132,610 +148,252 @@ router.get('/users', authenticateSuperAdmin, async (req, res) => {
   }
 });
 
-// ── GET /api/super-admin/users/export ────────────────────────────────────────
-// IMPORTANT: This route must be defined BEFORE the /users/:id/full route
-// to prevent Express from treating 'export' as an :id param
+// Must stay before /users/:id routes
 router.get('/users/export', authenticateSuperAdmin, async (req, res) => {
   try {
-    const result = await pool.query(`
-      SELECT
-        u.id,
-        u.full_name,
-        u.email,
-        u.phone,
-        u.subscription_tier,
-        u.email_verified,
-        u.is_suspended,
-        u.source,
-        u.created_at,
-        u.last_login,
-        COUNT(DISTINCT vn.id) as voice_note_count,
-        COUNT(DISTINCT c.id) as contact_count,
-        COALESCE(SUM(vn.file_size_bytes), 0) as storage_used_bytes
-      FROM users u
-      LEFT JOIN voice_notes vn ON vn.user_id = u.id AND vn.deleted_at IS NULL
-      LEFT JOIN contacts c ON c.user_id = u.id
-      WHERE u.is_admin = false OR u.is_admin IS NULL
-      GROUP BY u.id
-      ORDER BY u.created_at DESC
-    `);
-
-    // Build CSV
-    const headers = [
-      'ID', 'Full Name', 'Email', 'Phone', 'Tier',
-      'Email Verified', 'Suspended', 'Source',
-      'Joined', 'Last Login', 'Voice Notes', 'Contacts', 'Storage (MB)'
-    ];
-
-    const rows = result.rows.map(user => [
-      user.id,
-      `"${(user.full_name || '').replace(/"/g, '""')}"`,
-      user.email,
-      user.phone || '',
-      user.subscription_tier,
-      user.email_verified ? 'Yes' : 'No',
-      user.is_suspended ? 'Yes' : 'No',
-      user.source || 'app',
-      user.created_at ? new Date(user.created_at).toISOString().split('T')[0] : '',
-      user.last_login ? new Date(user.last_login).toISOString().split('T')[0] : 'Never',
-      user.voice_note_count,
-      user.contact_count,
-      (parseInt(user.storage_used_bytes) / (1024 * 1024)).toFixed(2)
-    ].join(','));
-
-    const csv = [headers.join(','), ...rows].join('\n');
-
-    res.setHeader('Content-Type', 'text/csv');
-    res.setHeader('Content-Disposition', `attachment; filename=suretalk-users-${new Date().toISOString().split('T')[0]}.csv`);
-    res.send(csv);
-
+    const result = await pool.query(
+      `SELECT u.id, u.full_name, u.email, u.phone, u.subscription_tier, u.email_verified,
+              COALESCE(u.is_suspended, false) AS is_suspended, u.source, u.created_at,
+              COALESCE(u.last_active_at, u.last_login) AS last_active, ${USER_COUNTS}
+       FROM users u
+       WHERE u.deleted_at IS NULL AND COALESCE(u.is_admin, false) = false
+       ORDER BY u.created_at DESC`
+    );
+    logAdminAudit({ userId: req.user.id, action: 'SUPER_EXPORT_USERS', newValue: { count: result.rows.length }, ipAddress: req.ip });
+    sendCsv(res, `suretalk-users-${day(new Date())}.csv`,
+      ['ID', 'Full name', 'Email', 'Phone', 'Plan', 'Email verified', 'Suspended', 'Source', 'Joined', 'Last active', 'Voice notes', 'Contacts', 'Storage (MB)'],
+      result.rows.map(u => [u.id, u.full_name, u.email, u.phone, u.subscription_tier, u.email_verified ? 'Yes' : 'No',
+        u.is_suspended ? 'Yes' : 'No', u.source || 'app', day(u.created_at), day(u.last_active) || 'Never',
+        u.voice_note_count, u.contact_count, (Number(u.storage_used_bytes) / (1024 * 1024)).toFixed(2)]));
   } catch (err) {
-    console.error('Export users error:', { message: err.message });
+    console.error('Export users error:', err.message);
     res.status(500).json({ success: false, error: 'Failed to export users' });
   }
 });
 
-// ── POST /api/super-admin/users/:id/impersonate ──────────────────────────────
+// ── Impersonation (5 minutes, audited) ───────────────────────────────────────
 router.post('/users/:id/impersonate', authenticateSuperAdmin, async (req, res) => {
   try {
     const { id } = req.params;
-    const adminId = req.user.id;
+    if (!isUuid(id)) return res.status(404).json({ success: false, error: 'User not found' });
+    if (id === req.user.id) return res.status(400).json({ success: false, error: 'Cannot impersonate yourself' });
 
-    // Cannot impersonate yourself
-    if (id === adminId) {
-      return res.status(400).json({
-        success: false,
-        error: 'Cannot impersonate yourself'
-      });
-    }
+    const target = (await pool.query(
+      `SELECT id, full_name, email, COALESCE(is_admin, false) AS is_admin, COALESCE(is_super_admin, false) AS is_super_admin,
+              COALESCE(is_suspended, false) AS is_suspended, deleted_at
+       FROM users WHERE id = $1`, [id])).rows[0];
+    if (!target || target.deleted_at) return res.status(404).json({ success: false, error: 'User not found' });
+    if (target.is_admin || target.is_super_admin) return res.status(403).json({ success: false, error: 'Cannot impersonate admin accounts' });
+    if (target.is_suspended) return res.status(403).json({ success: false, error: 'Cannot impersonate a suspended account' });
 
-    // Get target user
-    const targetResult = await pool.query(
-      `SELECT id, full_name, email, phone, is_admin, is_super_admin, is_suspended
-       FROM users WHERE id = $1`,
-      [id]
-    );
-
-    if (targetResult.rows.length === 0) {
-      return res.status(404).json({ success: false, error: 'User not found' });
-    }
-
-    const target = targetResult.rows[0];
-
-    // Cannot impersonate admins or super admins
-    if (target.is_admin || target.is_super_admin) {
-      return res.status(403).json({
-        success: false,
-        error: 'Cannot impersonate admin accounts'
-      });
-    }
-
-    // Cannot impersonate suspended users
-    if (target.is_suspended) {
-      return res.status(403).json({
-        success: false,
-        error: 'Cannot impersonate a suspended account'
-      });
-    }
-
-    // Generate impersonation token — 5 minute expiry
-    const jwt = require('jsonwebtoken');
     const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
-
-    const token = jwt.sign(
-      {
-        userId: target.id,
-        impersonation: true,
-        adminId: adminId,
-        exp: Math.floor(expiresAt.getTime() / 1000)
-      },
-      process.env.JWT_SECRET
-    );
-
-    // Store token in database
+    const token = jwt.sign({ userId: target.id, impersonation: true, adminId: req.user.id, exp: Math.floor(expiresAt.getTime() / 1000) }, process.env.JWT_SECRET);
     await pool.query(
-      `INSERT INTO impersonation_tokens
-         (token, admin_id, target_user_id, expires_at)
-       VALUES ($1, $2, $3, $4)`,
-      [token, adminId, id, expiresAt]
+      `INSERT INTO impersonation_tokens (token, admin_id, target_user_id, expires_at) VALUES ($1, $2, $3, $4)`,
+      [token, req.user.id, id, expiresAt]
     );
-
-    // Log the impersonation action
-    await pool.query(
-      `INSERT INTO analytics_events (user_id, event_type, event_data)
-       VALUES ($1, 'super_admin_impersonation_start', $2)`,
-      [adminId, JSON.stringify({
-        targetUserId: id,
-        targetName: target.full_name,
-        targetEmail: target.email,
-        expiresAt: expiresAt.toISOString(),
-        adminEmail: req.user.email
-      })]
-    );
-
-    console.log(`🔐 Impersonation started: admin ${req.user.email} → user ${target.email}`);
+    logAdminAudit({ userId: req.user.id, action: 'IMPERSONATE_USER', targetId: id, newValue: { email: target.email, expiresAt }, ipAddress: req.ip });
 
     res.json({
       success: true,
-      data: {
-        token,
-        expiresAt: expiresAt.toISOString(),
-        targetUser: {
-          id: target.id,
-          fullName: target.full_name,
-          email: target.email
-        },
-        durationMinutes: 5
-      }
+      data: { token, expiresAt: expiresAt.toISOString(), targetUser: { id: target.id, fullName: target.full_name, email: target.email }, durationMinutes: 5 }
     });
-
   } catch (err) {
     console.error('Impersonation error:', err.message);
     res.status(500).json({ success: false, error: 'Failed to start impersonation' });
   }
 });
 
-// ── POST /api/super-admin/impersonate/exit ───────────────────────────────────
 router.post('/impersonate/exit', async (req, res) => {
   try {
-    // This endpoint accepts either admin token or impersonation token
     const authHeader = req.headers.authorization;
-    if (!authHeader?.startsWith('Bearer ')) {
-      return res.status(401).json({ success: false, error: 'Unauthorized' });
-    }
-
+    if (!authHeader?.startsWith('Bearer ')) return res.status(401).json({ success: false, error: 'Unauthorized' });
     const token = authHeader.split(' ')[1];
-    const jwt = require('jsonwebtoken');
-
     let decoded;
-    try {
-      decoded = jwt.verify(token, process.env.JWT_SECRET);
-    } catch (err) {
-      // Token may be expired — still try to deactivate it
-      decoded = jwt.decode(token);
-    }
-
+    try { decoded = jwt.verify(token, process.env.JWT_SECRET); } catch { decoded = jwt.decode(token); }
     if (decoded?.impersonation && decoded?.userId) {
-      // Deactivate the impersonation token
-      await pool.query(
-        `UPDATE impersonation_tokens
-         SET is_active = FALSE, exited_at = NOW()
-         WHERE token = $1`,
-        [token]
-      );
-
-      // Log exit
-      if (decoded.adminId) {
-        await pool.query(
-          `INSERT INTO analytics_events (user_id, event_type, event_data)
-           VALUES ($1, 'super_admin_impersonation_exit', $2)`,
-          [decoded.adminId, JSON.stringify({
-            targetUserId: decoded.userId,
-            exitedAt: new Date().toISOString()
-          })]
-        );
-      }
-
-      console.log(`🔐 Impersonation ended for user ${decoded.userId}`);
+      await pool.query(`UPDATE impersonation_tokens SET is_active = FALSE, exited_at = NOW() WHERE token = $1`, [token]);
+      if (decoded.adminId) logAdminAudit({ userId: decoded.adminId, action: 'IMPERSONATE_EXIT', targetId: decoded.userId });
     }
-
     res.json({ success: true, message: 'Impersonation ended' });
-
   } catch (err) {
     console.error('Impersonation exit error:', err.message);
     res.status(500).json({ success: false, error: 'Failed to exit impersonation' });
   }
 });
 
-// ── GET /api/super-admin/users/:id/export/full ───────────────────────────────
+// ── Per-user exports ─────────────────────────────────────────────────────────
 router.get('/users/:id/export/full', authenticateSuperAdmin, async (req, res) => {
   try {
     const { id } = req.params;
-
+    if (!isUuid(id)) return res.status(404).json({ success: false, error: 'User not found' });
     const [userResult, voiceNotes, contacts, scheduled, vault, activity] = await Promise.all([
-      pool.query(`SELECT id, full_name, email, phone, subscription_tier,
-                         subscription_status, email_verified, source,
-                         created_at, last_login, is_suspended
+      pool.query(`SELECT id, full_name, email, phone, subscription_tier, subscription_status, email_verified, source,
+                         created_at, last_login, COALESCE(is_suspended, false) AS is_suspended, deleted_at
                   FROM users WHERE id = $1`, [id]),
-      pool.query(`SELECT id, title, description, duration_seconds, file_size_bytes,
-                         is_favorite, is_permanent, play_count, source, created_at
-                  FROM voice_notes WHERE user_id = $1 AND deleted_at IS NULL
-                  ORDER BY created_at DESC`, [id]),
-      pool.query(`SELECT id, name, phone, email, relationship, is_beneficiary, created_at
-                  FROM contacts WHERE user_id = $1 ORDER BY created_at DESC`, [id]),
-      pool.query(`SELECT id, delivery_method, delivery_status, scheduled_for,
-                         delivered_at, recipient_phone, recipient_email, created_at
+      pool.query(`SELECT id, title, description, duration_seconds, file_size_bytes, is_favorite, is_permanent, play_count, source, created_at
+                  FROM voice_notes WHERE user_id = $1 AND deleted_at IS NULL ORDER BY created_at DESC`, [id]),
+      pool.query(`SELECT id, name, phone, email, relationship, created_at FROM contacts WHERE user_id = $1 ORDER BY created_at DESC`, [id]),
+      pool.query(`SELECT id, delivery_method, delivery_status, scheduled_for, delivered_at, recipient_phone, recipient_email, created_at
                   FROM scheduled_messages WHERE user_id = $1 ORDER BY created_at DESC`, [id]),
       pool.query(`SELECT id, title, release_condition, release_date, is_released, created_at
-                  FROM voice_wills WHERE user_id = $1 ORDER BY created_at DESC`, [id]),
-      pool.query(`SELECT event_type, event_data, created_at
-                  FROM analytics_events WHERE user_id = $1
-                  AND created_at >= NOW() - INTERVAL '90 days'
-                  ORDER BY created_at DESC LIMIT 1000`, [id])
+                  FROM voice_wills WHERE user_id = $1 AND deleted_at IS NULL ORDER BY created_at DESC`, [id]),
+      pool.query(`SELECT event_type, event_data, created_at FROM analytics_events
+                  WHERE user_id = $1 AND created_at >= NOW() - INTERVAL '90 days' ORDER BY created_at DESC LIMIT 1000`, [id])
     ]);
-
-    if (userResult.rows.length === 0) {
-      return res.status(404).json({ success: false, error: 'User not found' });
-    }
-
-    const exportData = {
-      exportedAt: new Date().toISOString(),
-      exportedBy: req.user.email,
-      user: userResult.rows[0],
-      voiceNotes: voiceNotes.rows,
-      contacts: contacts.rows,
-      scheduledMessages: scheduled.rows,
-      vault: vault.rows,
-      activityLog: activity.rows
-    };
-
-    const filename = `suretalk-user-${userResult.rows[0].full_name?.replace(/\s+/g, '-') || id}-${new Date().toISOString().split('T')[0]}.json`;
-
+    if (!userResult.rows.length) return res.status(404).json({ success: false, error: 'User not found' });
+    logAdminAudit({ userId: req.user.id, action: 'SUPER_EXPORT_USER_DATA', targetId: id, ipAddress: req.ip });
+    const u = userResult.rows[0];
     res.setHeader('Content-Type', 'application/json');
-    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-    res.send(JSON.stringify(exportData, null, 2));
-
+    res.setHeader('Content-Disposition', `attachment; filename="suretalk-user-${safeName(u.full_name || id)}-${day(new Date())}.json"`);
+    res.send(JSON.stringify({
+      exportedAt: new Date().toISOString(), exportedBy: req.user.email, user: u,
+      voiceNotes: voiceNotes.rows, contacts: contacts.rows, scheduledMessages: scheduled.rows, vault: vault.rows, activityLog: activity.rows
+    }, null, 2));
   } catch (err) {
     console.error('Export full user error:', err.message);
     res.status(500).json({ success: false, error: 'Export failed' });
   }
 });
 
-// ── GET /api/super-admin/users/:id/export/billing ────────────────────────────
 router.get('/users/:id/export/billing', authenticateSuperAdmin, async (req, res) => {
   try {
     const { id } = req.params;
-
+    if (!isUuid(id)) return res.status(404).json({ success: false, error: 'User not found' });
     const [userResult, billing] = await Promise.all([
-      pool.query('SELECT full_name, email FROM users WHERE id = $1', [id]),
-      pool.query(`SELECT stripe_invoice_id, amount_cents, currency,
-                         description, status, tier_before, tier_after, created_at
-                  FROM billing_history WHERE user_id = $1
-                  ORDER BY created_at DESC`, [id])
+      pool.query('SELECT full_name FROM users WHERE id = $1', [id]),
+      pool.query(`SELECT stripe_invoice_id, amount_cents, currency, description, status, tier_before, tier_after, created_at
+                  FROM billing_history WHERE user_id = $1 ORDER BY created_at DESC`, [id])
     ]);
-
-    if (userResult.rows.length === 0) {
-      return res.status(404).json({ success: false, error: 'User not found' });
-    }
-
-    const headers = ['Invoice ID', 'Amount', 'Currency', 'Description',
-                     'Status', 'Tier Before', 'Tier After', 'Date'];
-
-    const rows = billing.rows.map(row => [
-      row.stripe_invoice_id || '',
-      `$${(row.amount_cents / 100).toFixed(2)}`,
-      (row.currency || 'USD').toUpperCase(),
-      `"${(row.description || '').replace(/"/g, '""')}"`,
-      row.status || '',
-      row.tier_before || '',
-      row.tier_after || '',
-      row.created_at ? new Date(row.created_at).toISOString().split('T')[0] : ''
-    ].join(','));
-
-    const csv = [headers.join(','), ...rows].join('\n');
-    const user = userResult.rows[0];
-    const filename = `suretalk-billing-${user.full_name?.replace(/\s+/g, '-') || id}-${new Date().toISOString().split('T')[0]}.csv`;
-
-    res.setHeader('Content-Type', 'text/csv');
-    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-    res.send(csv);
-
+    if (!userResult.rows.length) return res.status(404).json({ success: false, error: 'User not found' });
+    sendCsv(res, `suretalk-billing-${safeName(userResult.rows[0].full_name || id)}-${day(new Date())}.csv`,
+      ['Invoice ID', 'Amount', 'Currency', 'Description', 'Status', 'Plan before', 'Plan after', 'Date'],
+      billing.rows.map(b => [b.stripe_invoice_id, (b.amount_cents / 100).toFixed(2), (b.currency || 'USD').toUpperCase(), b.description, b.status, b.tier_before, b.tier_after, day(b.created_at)]));
   } catch (err) {
     console.error('Export billing error:', err.message);
     res.status(500).json({ success: false, error: 'Export failed' });
   }
 });
 
-// ── GET /api/super-admin/users/:id/export/voice-notes ────────────────────────
 router.get('/users/:id/export/voice-notes', authenticateSuperAdmin, async (req, res) => {
   try {
     const { id } = req.params;
-
+    if (!isUuid(id)) return res.status(404).json({ success: false, error: 'User not found' });
     const [userResult, notes] = await Promise.all([
       pool.query('SELECT full_name FROM users WHERE id = $1', [id]),
-      pool.query(`SELECT id, title, description, duration_seconds, file_size_bytes,
-                         file_format, is_favorite, is_permanent, play_count,
-                         last_played, source, s3_bucket, created_at
-                  FROM voice_notes WHERE user_id = $1 AND deleted_at IS NULL
-                  ORDER BY created_at DESC`, [id])
+      pool.query(`SELECT id, title, description, duration_seconds, file_size_bytes, file_format, is_favorite, is_permanent,
+                         play_count, last_played, source, created_at
+                  FROM voice_notes WHERE user_id = $1 AND deleted_at IS NULL ORDER BY created_at DESC`, [id])
     ]);
-
-    if (userResult.rows.length === 0) {
-      return res.status(404).json({ success: false, error: 'User not found' });
-    }
-
-    const headers = ['ID', 'Title', 'Description', 'Duration (s)', 'Size (bytes)',
-                     'Format', 'Favorite', 'Permanent', 'Play Count',
-                     'Last Played', 'Source', 'Bucket', 'Created'];
-
-    const rows = notes.rows.map(note => [
-      note.id,
-      `"${(note.title || '').replace(/"/g, '""')}"`,
-      `"${(note.description || '').replace(/"/g, '""')}"`,
-      note.duration_seconds || 0,
-      note.file_size_bytes || 0,
-      note.file_format || 'mp3',
-      note.is_favorite ? 'Yes' : 'No',
-      note.is_permanent ? 'Yes' : 'No',
-      note.play_count || 0,
-      note.last_played ? new Date(note.last_played).toISOString() : '',
-      note.source || 'app',
-      note.s3_bucket || '',
-      note.created_at ? new Date(note.created_at).toISOString() : ''
-    ].join(','));
-
-    const csv = [headers.join(','), ...rows].join('\n');
-    const filename = `suretalk-voice-notes-${userResult.rows[0].full_name?.replace(/\s+/g, '-') || id}-${new Date().toISOString().split('T')[0]}.csv`;
-
-    res.setHeader('Content-Type', 'text/csv');
-    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-    res.send(csv);
-
+    if (!userResult.rows.length) return res.status(404).json({ success: false, error: 'User not found' });
+    sendCsv(res, `suretalk-voice-notes-${safeName(userResult.rows[0].full_name || id)}-${day(new Date())}.csv`,
+      ['ID', 'Title', 'Description', 'Duration (s)', 'Size (bytes)', 'Format', 'Favorite', 'Permanent', 'Plays', 'Last played', 'Source', 'Created'],
+      notes.rows.map(n => [n.id, n.title, n.description, n.duration_seconds || 0, n.file_size_bytes || 0, n.file_format || 'mp3',
+        n.is_favorite ? 'Yes' : 'No', n.is_permanent ? 'Yes' : 'No', n.play_count || 0, n.last_played ? new Date(n.last_played).toISOString() : '',
+        n.source || 'app', n.created_at ? new Date(n.created_at).toISOString() : '']));
   } catch (err) {
     console.error('Export voice notes error:', err.message);
     res.status(500).json({ success: false, error: 'Export failed' });
   }
 });
 
-// ── GET /api/super-admin/export/sync-logs ────────────────────────────────────
 router.get('/export/sync-logs', authenticateSuperAdmin, async (req, res) => {
   try {
-    const { days = 30 } = req.query;
-
+    const days = Math.min(Math.max(parseInt(req.query.days, 10) || 30, 1), 365);
+    const ts = await receivedTs();
     const [outbox, received] = await Promise.all([
-      pool.query(`SELECT id, event_type, status, attempts,
-                         error_message, created_at, last_attempt_at
-                  FROM sync_outbox
-                  WHERE created_at >= NOW() - INTERVAL '${parseInt(days)} days'
-                  ORDER BY created_at DESC
-                  LIMIT 5000`),
-      pool.query(`SELECT id, source, event_type, created_at
-                  FROM sync_received_log
-                  WHERE created_at >= NOW() - INTERVAL '${parseInt(days)} days'
-                  ORDER BY created_at DESC
-                  LIMIT 5000`)
+      pool.query(`SELECT id, event_type, status, attempts, error_message, created_at, last_attempt_at
+                  FROM sync_outbox WHERE created_at >= NOW() - make_interval(days => $1) ORDER BY created_at DESC LIMIT 5000`, [days]),
+      ts ? pool.query(`SELECT id, source, event_type, ${ts} AS created_at
+                  FROM sync_received_log WHERE ${ts} >= NOW() - make_interval(days => $1) ORDER BY ${ts} DESC LIMIT 5000`, [days]) : { rows: [] }
     ]);
-
-    const outboxHeaders = ['ID', 'Event Type', 'Status', 'Attempts', 'Error', 'Created', 'Last Attempt'];
-    const outboxRows = outbox.rows.map(row => [
-      row.id,
-      row.event_type || '',
-      row.status || '',
-      row.attempts || 0,
-      `"${(row.error_message || '').replace(/"/g, '""')}"`,
-      row.created_at ? new Date(row.created_at).toISOString() : '',
-      row.last_attempt_at ? new Date(row.last_attempt_at).toISOString() : ''
-    ].join(','));
-
-    const receivedHeaders = ['ID', 'Source', 'Event Type', 'Created'];
-    const receivedRows = received.rows.map(row => [
-      row.id,
-      row.source || '',
-      row.event_type || '',
-      row.created_at ? new Date(row.created_at).toISOString() : ''
-    ].join(','));
-
-    const csv = [
-      `# App → IVR Sync Log (last ${days} days)`,
-      outboxHeaders.join(','),
-      ...outboxRows,
-      '',
-      `# IVR → App Sync Log (last ${days} days)`,
-      receivedHeaders.join(','),
-      ...receivedRows
-    ].join('\n');
-
-    const filename = `suretalk-sync-logs-${new Date().toISOString().split('T')[0]}.csv`;
-
-    res.setHeader('Content-Type', 'text/csv');
-    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-    res.send(csv);
-
+    const rows = [
+      ...outbox.rows.map(r => ['App → phone line', r.id, r.event_type, r.status, r.attempts, r.error_message, r.created_at && new Date(r.created_at).toISOString(), r.last_attempt_at && new Date(r.last_attempt_at).toISOString()]),
+      ...received.rows.map(r => ['Phone line → app', r.id, r.event_type, 'received', '', '', r.created_at && new Date(r.created_at).toISOString(), '']),
+    ];
+    sendCsv(res, `suretalk-sync-logs-${day(new Date())}.csv`, ['Direction', 'ID', 'Event', 'Status', 'Attempts', 'Error', 'Created', 'Last attempt'], rows);
   } catch (err) {
     console.error('Export sync logs error:', err.message);
     res.status(500).json({ success: false, error: 'Export failed' });
   }
 });
 
-// ── GET /api/super-admin/users/:id/full ──────────────────────────────────────
-// Complete user profile with all their data
+// ── User profile (explicit columns — never password hashes, 2FA secrets or tokens) ──
 router.get('/users/:id/full', authenticateSuperAdmin, async (req, res) => {
   try {
     const { id } = req.params;
-
-    // User profile
+    if (!isUuid(id)) return res.status(404).json({ success: false, error: 'User not found' });
     const userResult = await pool.query(
-      `SELECT u.*,
-              COUNT(DISTINCT vn.id) as voice_note_count,
-              COUNT(DISTINCT sm.id) as scheduled_count,
-              COALESCE(SUM(vn.file_size_bytes), 0) as storage_used_bytes
-       FROM users u
-       LEFT JOIN voice_notes vn ON vn.user_id = u.id AND vn.deleted_at IS NULL
-       LEFT JOIN scheduled_messages sm ON sm.user_id = u.id
-       WHERE u.id = $1
-       GROUP BY u.id`,
+      `SELECT u.id, u.full_name, u.email, u.phone, u.subscription_tier, u.subscription_status, u.source,
+              u.email_verified, u.created_at, u.updated_at, u.deleted_at, u.last_login,
+              COALESCE(u.last_active_at, u.last_login) AS last_active,
+              COALESCE(u.is_admin, false) AS is_admin, COALESCE(u.is_super_admin, false) AS is_super_admin, u.admin_status,
+              COALESCE(u.is_suspended, false) AS is_suspended, u.suspended_at, u.suspended_reason,
+              COALESCE(u.two_factor_enabled, false) AS two_factor_enabled,
+              u.storage_limit_gb, u.contacts_limit, u.voice_notes_limit,
+              u.stripe_customer_id, u.stripe_subscription_id, ${STRIPE_MANAGED} AS stripe_managed,
+              ${USER_COUNTS},
+              (SELECT COUNT(*)::int FROM scheduled_messages sm WHERE sm.user_id = u.id) AS scheduled_count
+       FROM users u WHERE u.id = $1`,
       [id]
     );
+    if (!userResult.rows.length) return res.status(404).json({ success: false, error: 'User not found' });
 
-    if (userResult.rows.length === 0) {
-      return res.status(404).json({ success: false, error: 'User not found' });
-    }
-
-    // Voice notes (metadata only, no download URLs)
-    const voiceNotesResult = await pool.query(
-      `SELECT id, title, description, duration_seconds, file_size_bytes,
-              is_favorite, is_permanent, play_count, last_played,
-              source, created_at, tags, s3_bucket
-       FROM voice_notes
-       WHERE user_id = $1 AND deleted_at IS NULL
-       ORDER BY created_at DESC
-       LIMIT 50`,
-      [id]
-    );
-
-    // Contacts
-    const contactsResult = await pool.query(
-      `SELECT id, name, phone, email, relationship,
-              is_beneficiary, can_receive_messages, created_at
-       FROM contacts
-       WHERE user_id = $1
-       ORDER BY created_at DESC`,
-      [id]
-    );
-
-    // Scheduled messages
-    const scheduledResult = await pool.query(
-      `SELECT sm.id, sm.delivery_method, sm.delivery_status,
-              sm.scheduled_for, sm.delivered_at, sm.error_message,
-              sm.recipient_email, sm.recipient_phone, sm.created_at,
-              sm.metadata, vn.title as voice_note_title
-       FROM scheduled_messages sm
-       LEFT JOIN voice_notes vn ON sm.voice_note_id = vn.id
-       WHERE sm.user_id = $1
-       ORDER BY sm.created_at DESC
-       LIMIT 50`,
-      [id]
-    );
-
-    // Vault/wills
-    let vaultResult = { rows: [] };
-    try {
-      vaultResult = await pool.query(
-        `SELECT
-          id, title, description,
-          s3_key, s3_bucket,
-          release_condition, release_date,
-          is_released, released_at,
-          beneficiaries, executors,
-          verification_required,
-          created_at
-         FROM voice_wills
-         WHERE user_id = $1
-         ORDER BY created_at DESC`,
-        [id]
-      );
-    } catch (vaultErr) {
-      console.warn('voice_wills query error:', vaultErr.message);
-    }
-
+    const [voiceNotes, contacts, scheduled, vault, billing] = await Promise.all([
+      pool.query(`SELECT id, title, description, duration_seconds, file_size_bytes, is_favorite, is_permanent, play_count, last_played, source, created_at
+                  FROM voice_notes WHERE user_id = $1 AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 50`, [id]),
+      pool.query(`SELECT id, name, phone, email, relationship, created_at FROM contacts WHERE user_id = $1 ORDER BY created_at DESC`, [id]),
+      pool.query(`SELECT sm.id, sm.delivery_method, sm.delivery_status, sm.scheduled_for, sm.delivered_at, sm.error_message,
+                         sm.recipient_email, sm.recipient_phone, sm.created_at, COALESCE(sm.metadata->>'source', 'app') AS source,
+                         vn.title AS voice_note_title
+                  FROM scheduled_messages sm LEFT JOIN voice_notes vn ON sm.voice_note_id = vn.id
+                  WHERE sm.user_id = $1 ORDER BY sm.created_at DESC LIMIT 50`, [id]),
+      pool.query(`SELECT id, title, release_condition, release_date, is_released, released_at, COALESCE(source, 'app') AS source,
+                         admin_removed_at, created_at
+                  FROM voice_wills WHERE user_id = $1 AND deleted_at IS NULL ORDER BY created_at DESC`, [id]).catch(() => ({ rows: [] })),
+      pool.query(`SELECT amount_cents, currency, status, description, created_at FROM billing_history
+                  WHERE user_id = $1 ORDER BY created_at DESC LIMIT 20`, [id]),
+    ]);
+    const u = userResult.rows[0];
     res.json({
       success: true,
       data: {
-        user: userResult.rows[0],
-        voiceNotes: voiceNotesResult.rows,
-        contacts: contactsResult.rows,
-        scheduled: scheduledResult.rows,
-        vault: vaultResult.rows
+        user: { ...u, storage_used_bytes: Number(u.storage_used_bytes) },
+        voiceNotes: voiceNotes.rows, contacts: contacts.rows, scheduled: scheduled.rows, vault: vault.rows,
+        billing: billing.rows, planLimits: TIER_LIMITS
       }
     });
   } catch (err) {
-    console.error('Super admin get user full error:', {
-      message: err.message,
-      code: err.code,
-      detail: err.detail,
-      table: err.table
-    });
+    console.error('Super admin get user full error:', { message: err.message, code: err.code });
     res.status(500).json({ success: false, error: 'Failed to fetch user data' });
   }
 });
 
-// ── GET /api/super-admin/users/:id/footprint ─────────────────────────────────
-// Digital footprint — last 90 days of activity
 router.get('/users/:id/footprint', authenticateSuperAdmin, async (req, res) => {
   try {
     const { id } = req.params;
-    const ninetyDaysAgo = new Date();
-    ninetyDaysAgo.setDate(ninetyDaysAgo.getDate() - 90);
-
-    // All analytics events
-    const eventsResult = await pool.query(
-      `SELECT event_type, event_data, created_at,
-              voice_note_id, contact_id
-       FROM analytics_events
-       WHERE user_id = $1 AND created_at >= $2
-       ORDER BY created_at DESC
-       LIMIT 500`,
-      [id, ninetyDaysAgo]
-    );
-
-    // Login history (from users table last_login + audit log if exists)
-    const loginResult = await pool.query(
-      `SELECT event_type, event_data, created_at
-       FROM analytics_events
-       WHERE user_id = $1
-         AND event_type IN ('login', 'logout', 'login_failed', 'token_refresh')
-         AND created_at >= $2
-       ORDER BY created_at DESC`,
-      [id, ninetyDaysAgo]
-    );
-
-    // Activity summary by day
-    const dailySummaryResult = await pool.query(
-      `SELECT
-         DATE(created_at) as date,
-         COUNT(*) as total_events,
-         COUNT(CASE WHEN event_type = 'voice_note_played' THEN 1 END) as plays,
-         COUNT(CASE WHEN event_type = 'voice_note_created' THEN 1 END) as recordings,
-         COUNT(CASE WHEN event_type = 'voice_note_downloaded' THEN 1 END) as downloads,
-         COUNT(CASE WHEN event_type = 'scheduled_message_created' THEN 1 END) as schedules
-       FROM analytics_events
-       WHERE user_id = $1 AND created_at >= $2
-       GROUP BY DATE(created_at)
-       ORDER BY date DESC`,
-      [id, ninetyDaysAgo]
-    );
-
-    // Event type breakdown
-    const breakdownResult = await pool.query(
-      `SELECT event_type, COUNT(*) as count
-       FROM analytics_events
-       WHERE user_id = $1 AND created_at >= $2
-       GROUP BY event_type
-       ORDER BY count DESC`,
-      [id, ninetyDaysAgo]
-    );
-
-    // Most played voice notes
-    const topPlayedResult = await pool.query(
-      `SELECT vn.id, vn.title, vn.play_count, vn.last_played,
-              vn.duration_seconds, vn.created_at
-       FROM voice_notes vn
-       WHERE vn.user_id = $1 AND vn.deleted_at IS NULL
-       ORDER BY vn.play_count DESC
-       LIMIT 10`,
-      [id]
-    );
-
+    if (!isUuid(id)) return res.status(404).json({ success: false, error: 'User not found' });
+    const since = new Date(Date.now() - 90 * 86400e3);
+    const [events, logins, daily, breakdown, topPlayed] = await Promise.all([
+      pool.query(`SELECT event_type, event_data, created_at, voice_note_id, contact_id FROM analytics_events
+                  WHERE user_id = $1 AND created_at >= $2 ORDER BY created_at DESC LIMIT 500`, [id, since]),
+      // Sign-ins and failed sign-ins are recorded in system_logs
+      pool.query(`SELECT message AS event_type, ip_address::text AS ip_address, user_agent, created_at FROM system_logs
+                  WHERE user_id = $1 AND service = 'auth' AND created_at >= $2 ORDER BY created_at DESC LIMIT 200`, [id, since]),
+      pool.query(`SELECT DATE(created_at) AS date, COUNT(*)::int AS total_events,
+                         COUNT(*) FILTER (WHERE event_type = 'voice_note_played')::int AS plays,
+                         COUNT(*) FILTER (WHERE event_type = 'voice_note_created')::int AS recordings,
+                         COUNT(*) FILTER (WHERE event_type = 'voice_note_downloaded')::int AS downloads,
+                         COUNT(*) FILTER (WHERE event_type = 'scheduled_message_created')::int AS schedules
+                  FROM analytics_events WHERE user_id = $1 AND created_at >= $2 GROUP BY DATE(created_at) ORDER BY date DESC`, [id, since]),
+      pool.query(`SELECT event_type, COUNT(*)::int AS count FROM analytics_events WHERE user_id = $1 AND created_at >= $2
+                  GROUP BY event_type ORDER BY count DESC`, [id, since]),
+      pool.query(`SELECT id, title, play_count, last_played, duration_seconds, created_at FROM voice_notes
+                  WHERE user_id = $1 AND deleted_at IS NULL ORDER BY play_count DESC NULLS LAST LIMIT 10`, [id]),
+    ]);
     res.json({
       success: true,
-      data: {
-        events: eventsResult.rows,
-        loginHistory: loginResult.rows,
-        dailySummary: dailySummaryResult.rows,
-        eventBreakdown: breakdownResult.rows,
-        topPlayed: topPlayedResult.rows,
-        period: '90 days'
-      }
+      data: { events: events.rows, loginHistory: logins.rows, dailySummary: daily.rows, eventBreakdown: breakdown.rows, topPlayed: topPlayed.rows, period: '90 days' }
     });
   } catch (err) {
     console.error('Super admin footprint error:', err);
@@ -743,250 +401,140 @@ router.get('/users/:id/footprint', authenticateSuperAdmin, async (req, res) => {
   }
 });
 
-// ── PUT /api/super-admin/users/:id/tier ──────────────────────────────────────
-router.put('/users/:id/tier', authenticateSuperAdmin, async (req, res) => {
+async function loadTarget(req, res) {
+  if (!isUuid(req.params.id)) { res.status(404).json({ success: false, error: 'User not found' }); return null; }
+  const r = await pool.query(
+    `SELECT u.id, u.email, u.full_name, u.subscription_tier, u.subscription_status, u.stripe_subscription_id,
+            COALESCE(u.is_admin, false) AS is_admin, COALESCE(u.is_super_admin, false) AS is_super_admin,
+            COALESCE(u.is_suspended, false) AS is_suspended, ${STRIPE_MANAGED} AS stripe_managed
+     FROM users u WHERE u.id = $1 AND u.deleted_at IS NULL`,
+    [req.params.id]
+  );
+  if (!r.rows.length) { res.status(404).json({ success: false, error: 'User not found' }); return null; }
+  return r.rows[0];
+}
+
+// ── Plan change (same rules as the admin Users page) ─────────────────────────
+router.put('/users/:id/tier', authenticateSuperAdmin, [
+  body('tier').isIn(TIERS),
+  body('reason').isString().trim().isLength({ min: 3, max: 1000 })
+], async (req, res) => {
   try {
-    const { id } = req.params;
-    const { tier, reason } = req.body;
-
-    const validTiers = ['LITE', 'ESSENTIAL', 'LEGACY_VAULT_PREMIUM'];
-    if (!validTiers.includes(tier)) {
-      return res.status(400).json({ success: false, error: 'Invalid tier' });
+    if (!validationResult(req).isEmpty()) return res.status(400).json({ success: false, error: 'Choose a plan and give a reason' });
+    const user = await loadTarget(req, res);
+    if (!user) return;
+    if (user.stripe_managed) {
+      return res.status(409).json({ success: false, code: 'STRIPE_MANAGED', error: 'This user pays through Stripe, so their plan follows their subscription. Change it in Stripe instead.' });
     }
-
-    await pool.query(
-      `UPDATE users SET subscription_tier = $1, updated_at = NOW() WHERE id = $2`,
-      [tier, id]
-    );
-
-    // Log the admin action
-    await pool.query(
-      `INSERT INTO analytics_events (user_id, event_type, event_data)
-       VALUES ($1, 'admin_tier_change', $2)`,
-      [id, JSON.stringify({
-        newTier: tier,
-        reason,
-        changedBy: req.user.id,
-        changedAt: new Date().toISOString()
-      })]
-    );
-
-    res.json({ success: true, message: `Tier updated to ${tier}` });
+    if (user.subscription_tier === req.body.tier) return res.status(400).json({ success: false, error: 'They\'re already on that plan' });
+    const limits = await applyPlan(user.id, req.body.tier);
+    logAdminAudit({
+      userId: req.user.id, action: 'SUPER_CHANGE_PLAN', targetId: user.id,
+      oldValue: { subscription_tier: user.subscription_tier }, newValue: { subscription_tier: req.body.tier, limits, reason: req.body.reason.trim() }, ipAddress: req.ip
+    });
+    res.json({ success: true, message: `Plan changed to ${req.body.tier}` });
   } catch (err) {
     console.error('Super admin tier change error:', err);
-    res.status(500).json({ success: false, error: 'Failed to update tier' });
+    res.status(500).json({ success: false, error: 'Failed to update plan' });
   }
 });
 
-// ── PUT /api/super-admin/users/:id/suspend ───────────────────────────────────
-router.put('/users/:id/suspend', authenticateSuperAdmin, async (req, res) => {
+// ── Suspend / reactivate (blocks app, admin console and phone line) ─────────
+router.put('/users/:id/suspend', authenticateSuperAdmin, [
+  body('suspend').isBoolean(),
+  body('reason').optional({ nullable: true }).isString().isLength({ max: 1000 })
+], async (req, res) => {
   try {
-    const { id } = req.params;
-    const { suspend, reason } = req.body;
+    if (!validationResult(req).isEmpty()) return res.status(400).json({ success: false, error: 'Invalid request' });
+    const user = await loadTarget(req, res);
+    if (!user) return;
+    const suspend = req.body.suspend === true || req.body.suspend === 'true';
+    const reason = req.body.reason?.trim() || null;
+    if (user.id === req.user.id) return res.status(400).json({ success: false, error: 'You can\'t suspend your own account' });
+    if (user.is_super_admin) return res.status(403).json({ success: false, error: 'Super admin accounts can\'t be suspended' });
+    if (suspend && !reason) return res.status(400).json({ success: false, error: 'Give a reason for suspending this account' });
+    if (suspend === user.is_suspended) return res.status(400).json({ success: false, error: suspend ? 'Already suspended' : 'Not suspended' });
 
-    await pool.query(
-      `UPDATE users SET is_suspended = $1, updated_at = NOW() WHERE id = $2`,
-      [suspend, id]
-    );
-
-    await pool.query(
-      `INSERT INTO analytics_events (user_id, event_type, event_data)
-       VALUES ($1, $2, $3)`,
-      [id,
-       suspend ? 'admin_account_suspended' : 'admin_account_reactivated',
-       JSON.stringify({ reason, actionBy: req.user.id })
-      ]
-    );
-
-    res.json({
-      success: true,
-      message: suspend ? 'Account suspended' : 'Account reactivated'
+    await setActive(user, !suspend, { adminId: req.user.id, reason });
+    pool.query(`INSERT INTO system_logs (user_id, level, service, message, metadata) VALUES ($1, $2, 'admin', $3, $4)`,
+      [req.user.id, suspend ? 'warning' : 'info', suspend ? 'Account suspended' : 'Account reactivated', JSON.stringify({ targetUserId: user.id, email: user.email, reason })]).catch(() => {});
+    logAdminAudit({
+      userId: req.user.id, action: suspend ? 'SUSPEND_USER' : 'REACTIVATE_USER', targetId: user.id,
+      oldValue: { is_suspended: user.is_suspended }, newValue: { is_suspended: suspend, reason }, ipAddress: req.ip
     });
+    res.json({ success: true, message: suspend ? 'Account suspended' : 'Account reactivated' });
   } catch (err) {
     console.error('Super admin suspend error:', err);
     res.status(500).json({ success: false, error: 'Failed to update account status' });
   }
 });
 
-// ── POST /api/super-admin/users/:id/resync ────────────────────────────────────
-// Re-sync a user's subscription data from DynamoDB to PostgreSQL
+// ── Re-sync a user's plan/Stripe IDs from the phone line (DynamoDB) ──────────
 router.post('/users/:id/resync', authenticateSuperAdmin, async (req, res) => {
   try {
-    const { id } = req.params;
+    const user = await loadTarget(req, res);
+    if (!user) return;
+    const full = (await pool.query('SELECT phone, stripe_customer_id, stripe_subscription_id FROM users WHERE id = $1', [user.id])).rows[0];
+    if (!full.phone) return res.status(400).json({ success: false, error: 'User has no phone number — cannot look up in IVR system' });
 
-    // 1. Get user from PostgreSQL to find their phone number
-    const userResult = await pool.query(
-      `SELECT id, phone, email, full_name, subscription_tier,
-              stripe_customer_id, stripe_subscription_id
-       FROM users WHERE id = $1`,
-      [id]
-    );
+    const digits = full.phone.replace(/[^\d]/g, '');
+    const normalizedPhone = digits.length === 10 ? `+1${digits}`
+      : (digits.length === 11 && digits.startsWith('1')) || (digits.startsWith('234') && (digits.length === 12 || digits.length === 13)) ? `+${digits}`
+      : (full.phone.startsWith('+') ? full.phone : `+${digits}`);
 
-    if (userResult.rows.length === 0) {
-      return res.status(404).json({ success: false, error: 'User not found' });
-    }
-
-    const user = userResult.rows[0];
-
-    if (!user.phone) {
-      return res.status(400).json({
-        success: false,
-        error: 'User has no phone number — cannot look up in IVR system'
-      });
-    }
-
-    // Normalize phone to E.164 for DynamoDB lookup
-    const normalizePhone = (phone) => {
-      const digits = phone.replace(/[^\d]/g, '');
-      if (digits.length === 10) return `+1${digits}`;
-      if (digits.length === 11 && digits.startsWith('1')) return `+${digits}`;
-      if (digits.length === 13 && digits.startsWith('234')) return `+${digits}`;
-      if (digits.length === 12 && digits.startsWith('234')) return `+${digits}`;
-      return phone.startsWith('+') ? phone : `+${digits}`;
-    };
-
-    const normalizedPhone = normalizePhone(user.phone);
-    console.log(`Re-sync: looking up DynamoDB for phone ${normalizedPhone}`);
-
-    // 2. Look up user in DynamoDB
-    const USERS_TABLE = process.env.DYNAMO_USERS_TABLE || 'Users';
-    let dynamoUser = null;
-
+    let dynamoUser;
     try {
-      const dynamoResult = await dynamodb.send(
-        new GetCommand({
-          TableName: USERS_TABLE,
-          Key: { userId: normalizedPhone }
-        })
-      );
-      dynamoUser = dynamoResult.Item;
+      dynamoUser = (await dynamodb.send(new GetCommand({ TableName: process.env.DYNAMO_USERS_TABLE || 'Users', Key: { userId: normalizedPhone } }))).Item;
     } catch (dynamoErr) {
-      const isTimeout = dynamoErr.name === 'TimeoutError' ||
-                        dynamoErr.message?.includes('timeout') ||
-                        dynamoErr.code === 'ETIMEDOUT';
-      console.error('DynamoDB lookup failed:', {
-        message: dynamoErr.message,
-        name: dynamoErr.name,
-        code: dynamoErr.code
-      });
-      return res.status(isTimeout ? 504 : 500).json({
-        success: false,
-        error: isTimeout
-          ? 'IVR system lookup timed out — try again in a moment'
-          : `DynamoDB lookup failed: ${dynamoErr.message}`
-      });
+      const isTimeout = dynamoErr.name === 'TimeoutError' || dynamoErr.message?.includes('timeout') || dynamoErr.code === 'ETIMEDOUT';
+      console.error('DynamoDB lookup failed:', dynamoErr.message);
+      return res.status(isTimeout ? 504 : 502).json({ success: false, error: isTimeout ? 'Phone line lookup timed out — try again in a moment' : 'Phone line lookup failed' });
     }
+    if (!dynamoUser) return res.status(404).json({ success: false, error: `Not found in the phone line system for ${normalizedPhone}` });
 
-    if (!dynamoUser) {
-      return res.status(404).json({
-        success: false,
-        error: `User not found in IVR system for phone ${normalizedPhone}`
-      });
-    }
+    const tierMap = { LITE: 'LITE', ESSENTIAL: 'ESSENTIAL', PREMIUM: 'LEGACY_VAULT_PREMIUM', LEGACY_VAULT_PREMIUM: 'LEGACY_VAULT_PREMIUM' };
+    const updates = { subscription_tier: tierMap[dynamoUser.subscription_tier] || user.subscription_tier || 'LITE' };
+    if (dynamoUser.stripeCustomerId) updates.stripe_customer_id = dynamoUser.stripeCustomerId;
+    if (dynamoUser.stripeSubscriptionId && dynamoUser.stripeSubscriptionId !== 'unsubscribed') updates.stripe_subscription_id = dynamoUser.stripeSubscriptionId;
+    if (dynamoUser.subscriptionStatus) updates.subscription_status = dynamoUser.subscriptionStatus;
+    if (dynamoUser.verified !== undefined) updates.subscription_status = dynamoUser.verified ? 'active' : 'inactive';
 
-    console.log(`Re-sync: DynamoDB user found:`, {
-      userId: dynamoUser.userId,
-      tier: dynamoUser.subscription_tier,
-      stripeCustomerId: dynamoUser.stripeCustomerId,
-      stripeSubscriptionId: dynamoUser.stripeSubscriptionId
-    });
-
-    // 3. Map DynamoDB tier to PostgreSQL tier
-    const tierMap = {
-      'LITE': 'LITE',
-      'ESSENTIAL': 'ESSENTIAL',
-      'PREMIUM': 'LEGACY_VAULT_PREMIUM',
-      'LEGACY_VAULT_PREMIUM': 'LEGACY_VAULT_PREMIUM'
-    };
-    const mappedTier = tierMap[dynamoUser.subscription_tier] ||
-                       user.subscription_tier || 'LITE';
-
-    // 4. Build update — only update fields that DynamoDB has values for
-    const updates = {
-      subscription_tier: mappedTier
-    };
-
-    if (dynamoUser.stripeCustomerId) {
-      updates.stripe_customer_id = dynamoUser.stripeCustomerId;
-    }
-    if (dynamoUser.stripeSubscriptionId &&
-        dynamoUser.stripeSubscriptionId !== 'unsubscribed') {
-      updates.stripe_subscription_id = dynamoUser.stripeSubscriptionId;
-    }
-    if (dynamoUser.subscriptionStatus) {
-      updates.subscription_status = dynamoUser.subscriptionStatus;
-    }
-    if (dynamoUser.verified !== undefined) {
-      updates.subscription_status = dynamoUser.verified ? 'active' : 'inactive';
-    }
-
-    // 5. Apply updates to PostgreSQL
-    const setParts = Object.keys(updates).map((key, i) => `${key} = $${i + 1}`);
-    const values = [...Object.values(updates), id];
-
+    const keys = Object.keys(updates);
     await pool.query(
-      `UPDATE users SET ${setParts.join(', ')}, updated_at = NOW() WHERE id = $${values.length}`,
-      values
+      `UPDATE users SET ${keys.map((k, i) => `${k} = $${i + 1}`).join(', ')}, updated_at = NOW() WHERE id = $${keys.length + 1}`,
+      [...Object.values(updates), user.id]
     );
-
-    // 6. Log the admin action
-    await pool.query(
-      `INSERT INTO analytics_events (user_id, event_type, event_data)
-       VALUES ($1, 'super_admin_resync', $2)`,
-      [id, JSON.stringify({
-        syncedFields: Object.keys(updates),
-        dynamoTier: dynamoUser.subscription_tier,
-        mappedTier,
-        actionBy: req.user.id,
-        syncedAt: new Date().toISOString()
-      })]
-    );
-
-    console.log(`Re-sync complete for user ${id}:`, updates);
-
-    res.json({
-      success: true,
-      message: 'User synced successfully from IVR system',
-      data: {
-        syncedFields: Object.keys(updates),
-        before: {
-          tier: user.subscription_tier,
-          stripeCustomerId: user.stripe_customer_id,
-          stripeSubscriptionId: user.stripe_subscription_id
-        },
-        after: updates
-      }
-    });
-
+    const before = { tier: user.subscription_tier, stripeCustomerId: full.stripe_customer_id, stripeSubscriptionId: full.stripe_subscription_id };
+    logAdminAudit({ userId: req.user.id, action: 'SUPER_RESYNC_USER', targetId: user.id, oldValue: before, newValue: updates, ipAddress: req.ip });
+    res.json({ success: true, message: 'User synced from the phone line system', data: { syncedFields: keys, before, after: updates } });
   } catch (err) {
-    console.error('Re-sync error:', {
-      message: err.message,
-      code: err.code,
-      userId: req.params.id
-    });
-    res.status(500).json({ success: false, error: 'Re-sync failed: ' + err.message });
+    console.error('Re-sync error:', { message: err.message, code: err.code, userId: req.params.id });
+    res.status(500).json({ success: false, error: 'Re-sync failed' });
   }
 });
 
-// ── GET /api/super-admin/sync/dead-letters ───────────────────────────────────
-// Dead sync items from both App→IVR (PostgreSQL) and IVR→App (reported via API)
+// ── Sync dead letters (App → phone line items that failed every attempt) ─────
+const EVENT_LABELS = {
+  'sync-user': 'Account update', 'sync-slot': 'Memory slot', 'sync-will': 'Voice will',
+  'delete-user': 'Account deletion', 'sync-credential': 'Login details',
+};
+
 router.get('/sync/dead-letters', authenticateSuperAdmin, async (req, res) => {
   try {
-    const deadLetters = await pool.query(
-      `SELECT id, event_type, payload, attempts,
-              last_attempt_at, error_message, created_at,
-              'app_to_ivr' as direction
-       FROM sync_outbox
-       WHERE status = 'dead'
-       ORDER BY created_at DESC
-       LIMIT 100`
+    const r = await pool.query(
+      `SELECT so.id, so.event_type, so.payload, so.attempts, so.last_attempt_at, so.error_message, so.created_at,
+              u.id AS user_id, u.full_name AS user_name, u.email AS user_email
+       FROM sync_outbox so
+       LEFT JOIN users u ON u.id::text = so.payload->>'userId' OR u.phone = so.payload->>'userId'
+       WHERE so.status = 'dead'
+       ORDER BY so.created_at DESC
+       LIMIT 200`
     );
-
     res.json({
       success: true,
       data: {
-        deadLetters: deadLetters.rows,
-        total: deadLetters.rows.length
+        deadLetters: r.rows.map(d => ({ ...d, label: EVENT_LABELS[d.event_type] || d.event_type, editable: d.event_type === 'sync-slot' })),
+        total: r.rows.length
       }
     });
   } catch (err) {
@@ -995,171 +543,116 @@ router.get('/sync/dead-letters', authenticateSuperAdmin, async (req, res) => {
   }
 });
 
-// ── POST /api/super-admin/sync/:id/retry ─────────────────────────────────────
-// Manually retry a dead sync item
 router.post('/sync/:id/retry', authenticateSuperAdmin, async (req, res) => {
   try {
-    const { id } = req.params;
-
-    await pool.query(
-      `UPDATE sync_outbox
-       SET status = 'pending', attempts = 0, error_message = NULL,
-           last_attempt_at = NULL
-       WHERE id = $1 AND status = 'dead'`,
-      [id]
+    const r = await pool.query(
+      `UPDATE sync_outbox SET status = 'pending', attempts = 0, error_message = NULL, last_attempt_at = NULL
+       WHERE id::text = $1 AND status = 'dead' RETURNING id, event_type`,
+      [req.params.id]
     );
-
-    res.json({ success: true, message: 'Sync item queued for retry' });
+    if (!r.rowCount) return res.status(404).json({ success: false, error: 'Not found, or no longer dead' });
+    logAdminAudit({ userId: req.user.id, action: 'SYNC_RETRY', targetId: String(req.params.id), newValue: { event: r.rows[0].event_type }, ipAddress: req.ip });
+    res.json({ success: true, message: 'Queued for retry' });
   } catch (err) {
-    console.error('Super admin retry sync error:', {
-      message: err.message,
-      code: err.code,
-      detail: err.detail
-    });
+    console.error('Super admin retry sync error:', err.message);
     res.status(500).json({ success: false, error: 'Failed to retry sync item' });
   }
 });
 
-// ── PUT /api/super-admin/sync/:id/edit-retry ─────────────────────────────────
-// Edit payload fields and retry a dead sync item
+// Edit is only offered for memory-slot items, whose payload shape is known
 router.put('/sync/:id/edit-retry', authenticateSuperAdmin, async (req, res) => {
   try {
-    const { id } = req.params;
     const { userId, slotNumber, contact, voiceMessage } = req.body;
-
-    // Validate required fields
     if (!userId || !slotNumber || !voiceMessage) {
-      return res.status(400).json({
-        success: false,
-        error: 'userId, slotNumber, and voiceMessage are required'
-      });
+      return res.status(400).json({ success: false, error: 'Phone number, slot number and recording are required' });
     }
+    const slotNum = parseInt(slotNumber, 10);
+    if (isNaN(slotNum) || slotNum < 1 || slotNum > 15) return res.status(400).json({ success: false, error: 'Slot number must be between 1 and 15' });
 
-    // Validate slotNumber is 1-15
-    const slotNum = parseInt(slotNumber);
-    if (isNaN(slotNum) || slotNum < 1 || slotNum > 15) {
-      return res.status(400).json({
-        success: false,
-        error: 'slotNumber must be between 1 and 15'
-      });
-    }
+    const current = (await pool.query('SELECT * FROM sync_outbox WHERE id::text = $1', [req.params.id])).rows[0];
+    if (!current) return res.status(404).json({ success: false, error: 'Sync item not found' });
+    if (current.event_type !== 'sync-slot') return res.status(400).json({ success: false, error: 'Only memory-slot items can be edited. Use Retry or Dismiss.' });
+    if (current.status !== 'dead') return res.status(409).json({ success: false, error: 'This item is no longer dead' });
 
-    // Get current item to preserve eventType and other fields
-    const currentItem = await pool.query(
-      'SELECT * FROM sync_outbox WHERE id = $1',
-      [id]
-    );
-
-    if (currentItem.rows.length === 0) {
-      return res.status(404).json({ success: false, error: 'Sync item not found' });
-    }
-
-    // Build updated payload preserving existing fields
-    const existingPayload = currentItem.rows[0].payload || {};
+    const before = current.payload || {};
     const updatedPayload = {
-      ...existingPayload,
-      userId,
-      slotNumber: slotNum.toString(),
-      contact: contact || '',
-      voiceMessage,
-      action: existingPayload.action || 'create',
-      source: existingPayload.source || 'app',
-      _editedBySuperAdmin: true,
-      _editedAt: new Date().toISOString(),
-      _editedBy: req.user.id
+      ...before, userId, slotNumber: String(slotNum), contact: contact || '', voiceMessage,
+      action: before.action || 'create', source: before.source || 'app',
+      _editedBySuperAdmin: true, _editedAt: new Date().toISOString(), _editedBy: req.user.id
     };
-
-    // Update payload and reset for retry
     await pool.query(
-      `UPDATE sync_outbox
-       SET payload = $1,
-           status = 'pending',
-           attempts = 0,
-           error_message = NULL,
-           last_attempt_at = NULL
-       WHERE id = $2`,
-      [JSON.stringify(updatedPayload), id]
+      `UPDATE sync_outbox SET payload = $1, status = 'pending', attempts = 0, error_message = NULL, last_attempt_at = NULL WHERE id = $2`,
+      [JSON.stringify(updatedPayload), current.id]
     );
-
-    // Log the admin action
-    await pool.query(
-      `INSERT INTO analytics_events (user_id, event_type, event_data)
-       VALUES ($1, 'super_admin_edit_retry_sync', $2)`,
-      [req.user.id, JSON.stringify({ syncId: id, changes: { userId, slotNumber: slotNum, contact, voiceMessage } })]
-    );
-
-    res.json({
-      success: true,
-      message: 'Sync item updated and queued for retry',
-      data: { updatedPayload }
-    });
-
+    logAdminAudit({ userId: req.user.id, action: 'SYNC_EDIT_RETRY', targetId: String(current.id), oldValue: before, newValue: updatedPayload, ipAddress: req.ip });
+    res.json({ success: true, message: 'Updated and queued for retry', data: { updatedPayload } });
   } catch (err) {
-    console.error('Super admin edit retry error:', {
-      message: err.message,
-      code: err.code,
-      detail: err.detail
-    });
+    console.error('Super admin edit retry error:', err.message);
     res.status(500).json({ success: false, error: 'Failed to update sync item' });
   }
 });
 
-// ── GET /api/super-admin/overview ────────────────────────────────────────────
-// System-wide overview stats
+router.post('/sync/:id/dismiss', authenticateSuperAdmin, [
+  body('reason').isString().trim().isLength({ min: 3, max: 1000 })
+], async (req, res) => {
+  try {
+    if (!validationResult(req).isEmpty()) return res.status(400).json({ success: false, error: 'Give a reason for dismissing it' });
+    const r = await pool.query(
+      `UPDATE sync_outbox SET status = 'dismissed', resolved_note = $2, resolved_at = NOW(), resolved_by = $3
+       WHERE id::text = $1 AND status = 'dead' RETURNING id, event_type`,
+      [req.params.id, req.body.reason.trim(), req.user.id]
+    );
+    if (!r.rowCount) return res.status(404).json({ success: false, error: 'Not found, or no longer dead' });
+    logAdminAudit({ userId: req.user.id, action: 'SYNC_DISMISS', targetId: String(req.params.id), newValue: { event: r.rows[0].event_type, reason: req.body.reason.trim() }, ipAddress: req.ip });
+    res.json({ success: true, message: 'Dismissed' });
+  } catch (err) {
+    console.error('Super admin dismiss sync error:', err.message);
+    res.status(500).json({ success: false, error: 'Failed to dismiss sync item' });
+  }
+});
+
+// ── Overview (KPI cards) + activity ──────────────────────────────────────────
 router.get('/overview', authenticateSuperAdmin, async (req, res) => {
   try {
-    const [
-      userStats,
-      contentStats,
-      syncStats,
-      recentActivity
-    ] = await Promise.all([
+    const [userStats, contentStats, syncStats, adminActions, userActivity] = await Promise.all([
       pool.query(`
-        SELECT
-          COUNT(*) as total_users,
-          COUNT(CASE WHEN subscription_tier = 'LITE' THEN 1 END) as lite_users,
-          COUNT(CASE WHEN subscription_tier = 'ESSENTIAL' THEN 1 END) as essential_users,
-          COUNT(CASE WHEN subscription_tier = 'LEGACY_VAULT_PREMIUM' THEN 1 END) as premium_users,
-          COUNT(CASE WHEN is_suspended = true THEN 1 END) as suspended_users,
-          COUNT(CASE WHEN created_at >= NOW() - INTERVAL '7 days' THEN 1 END) as new_this_week,
-          COUNT(CASE WHEN last_login >= NOW() - INTERVAL '24 hours' THEN 1 END) as active_today
-        FROM users WHERE is_admin = false OR is_admin IS NULL
-      `),
+        SELECT COUNT(*)::int AS total_users,
+               COUNT(*) FILTER (WHERE COALESCE(subscription_tier, 'LITE') = 'LITE')::int AS lite_users,
+               COUNT(*) FILTER (WHERE subscription_tier = 'ESSENTIAL')::int AS essential_users,
+               COUNT(*) FILTER (WHERE subscription_tier IN ('LEGACY_VAULT_PREMIUM', 'PREMIUM'))::int AS premium_users,
+               COUNT(*) FILTER (WHERE COALESCE(is_suspended, false))::int AS suspended_users,
+               COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '7 days')::int AS new_this_week,
+               COUNT(*) FILTER (WHERE COALESCE(last_active_at, last_login) >= NOW() - INTERVAL '24 hours')::int AS active_today
+        FROM users WHERE deleted_at IS NULL AND COALESCE(is_admin, false) = false`),
+      // Separate subqueries — joining notes and messages multiplied every number
       pool.query(`
-        SELECT
-          COUNT(DISTINCT vn.id) as total_voice_notes,
-          COALESCE(SUM(vn.file_size_bytes), 0) as total_storage_bytes,
-          COUNT(DISTINCT sm.id) as total_scheduled,
-          COUNT(DISTINCT CASE WHEN sm.delivery_status = 'delivered' THEN sm.id END) as total_delivered,
-          COUNT(DISTINCT CASE WHEN sm.delivery_status = 'failed' THEN sm.id END) as total_failed
-        FROM voice_notes vn
-        FULL OUTER JOIN scheduled_messages sm ON true
-        WHERE vn.deleted_at IS NULL OR vn.id IS NULL
-      `),
-      pool.query(`
-        SELECT
-          COUNT(CASE WHEN status = 'dead' THEN 1 END) as dead_count,
-          COUNT(CASE WHEN status = 'pending' THEN 1 END) as pending_count,
-          COUNT(CASE WHEN status = 'sent' THEN 1 END) as sent_count
-        FROM sync_outbox
-      `),
-      pool.query(`
-        SELECT ae.event_type, ae.created_at,
-               u.full_name, u.email
-        FROM analytics_events ae
-        JOIN users u ON ae.user_id = u.id
-        ORDER BY ae.created_at DESC
-        LIMIT 20
-      `)
+        SELECT (SELECT COUNT(*)::int FROM voice_notes WHERE deleted_at IS NULL) AS total_voice_notes,
+               (SELECT COALESCE(SUM(file_size_bytes), 0)::bigint FROM voice_notes WHERE deleted_at IS NULL) AS total_storage_bytes,
+               (SELECT COUNT(*)::int FROM scheduled_messages) AS total_scheduled,
+               (SELECT COUNT(*)::int FROM scheduled_messages WHERE delivery_status = 'delivered') AS total_delivered,
+               (SELECT COUNT(*)::int FROM scheduled_messages WHERE delivery_status = 'failed') AS total_failed`),
+      pool.query(`SELECT COUNT(*) FILTER (WHERE status = 'dead')::int AS dead_count,
+                         COUNT(*) FILTER (WHERE status IN ('pending', 'failed'))::int AS pending_count,
+                         COUNT(*) FILTER (WHERE status = 'sent')::int AS sent_count
+                  FROM sync_outbox`),
+      pool.query(`SELECT a.id, a.action, a.target_id, a.new_value, a.created_at, u.full_name AS admin_name, u.email AS admin_email,
+                         t.full_name AS target_name, t.email AS target_email
+                  FROM admin_audit_log a
+                  LEFT JOIN users u ON u.id = a.admin_user_id
+                  LEFT JOIN users t ON t.id::text = a.target_id
+                  ORDER BY a.created_at DESC LIMIT 30`),
+      pool.query(`SELECT ae.event_type, ae.created_at, u.id AS user_id, u.full_name, u.email
+                  FROM analytics_events ae JOIN users u ON ae.user_id = u.id
+                  ORDER BY ae.created_at DESC LIMIT 30`),
     ]);
-
     res.json({
       success: true,
       data: {
         users: userStats.rows[0],
-        content: contentStats.rows[0],
+        content: { ...contentStats.rows[0], total_storage_bytes: Number(contentStats.rows[0].total_storage_bytes) },
         sync: syncStats.rows[0],
-        recentActivity: recentActivity.rows
+        adminActions: adminActions.rows,
+        recentActivity: userActivity.rows
       }
     });
   } catch (err) {
@@ -1168,71 +661,45 @@ router.get('/overview', authenticateSuperAdmin, async (req, res) => {
   }
 });
 
-// ── GET /api/super-admin/revenue ─────────────────────────────────────────────
+// ── Revenue (Stripe, like the dashboard) ─────────────────────────────────────
 router.get('/revenue', authenticateSuperAdmin, async (req, res) => {
   try {
-    const [tierStats, billingHistory, recentTransactions] = await Promise.all([
-
-      // Users per tier with estimated MRR
+    const { getRevenueStats } = require('../utils/revenueStats');
+    const [revenue, paying, totals, recent] = await Promise.all([
+      getRevenueStats(),
       pool.query(`
-        SELECT
-          subscription_tier,
-          COUNT(*) as user_count,
-          COUNT(CASE WHEN is_suspended = false OR is_suspended IS NULL THEN 1 END) as active_count,
-          COUNT(CASE WHEN created_at >= NOW() - INTERVAL '30 days' THEN 1 END) as new_this_month
-        FROM users
-        WHERE is_admin = false OR is_admin IS NULL
-        GROUP BY subscription_tier
-        ORDER BY user_count DESC
-      `),
-
-      // Billing totals
+        SELECT COALESCE(u.subscription_tier, 'LITE') AS tier,
+               COUNT(*) FILTER (WHERE u.deleted_at IS NULL AND COALESCE(u.is_admin, false) = false)::int AS users,
+               COUNT(*) FILTER (WHERE u.deleted_at IS NULL AND ${STRIPE_MANAGED})::int AS paying
+        FROM users u GROUP BY 1`),
       pool.query(`
-        SELECT
-          COUNT(*) as total_transactions,
-          COALESCE(SUM(CASE WHEN status = 'succeeded' THEN amount_cents ELSE 0 END), 0) as total_revenue_cents,
-          COALESCE(SUM(CASE WHEN status = 'succeeded' AND created_at >= NOW() - INTERVAL '30 days' THEN amount_cents ELSE 0 END), 0) as revenue_last_30_days_cents,
-          COUNT(CASE WHEN status = 'failed' THEN 1 END) as failed_transactions
-        FROM billing_history
-      `),
-
-      // Recent transactions
+        SELECT COALESCE(SUM(amount_cents) FILTER (WHERE status IN ('paid', 'succeeded')), 0)::bigint AS total_cents,
+               COUNT(*) FILTER (WHERE status IN ('paid', 'succeeded'))::int AS paid_count,
+               COUNT(*) FILTER (WHERE status = 'failed' AND created_at >= NOW() - INTERVAL '30 days')::int AS failed_30d
+        FROM billing_history`),
       pool.query(`
-        SELECT
-          bh.id, bh.amount_cents, bh.currency, bh.status,
-          bh.description, bh.tier_before, bh.tier_after,
-          bh.created_at,
-          u.full_name, u.email
-        FROM billing_history bh
-        JOIN users u ON bh.user_id = u.id
-        ORDER BY bh.created_at DESC
-        LIMIT 20
-      `)
+        SELECT bh.id, bh.amount_cents, bh.currency, bh.status, bh.description, bh.created_at, u.id AS user_id, u.full_name, u.email
+        FROM billing_history bh JOIN users u ON bh.user_id = u.id
+        WHERE bh.status IN ('paid', 'succeeded', 'failed')
+        ORDER BY bh.created_at DESC LIMIT 20`),
     ]);
-
-    // Tier pricing for MRR estimate (adjust to your actual prices)
-    const TIER_PRICE_USD = {
-      'LITE': 0,
-      'ESSENTIAL': 6.99,
-      'LEGACY_VAULT_PREMIUM': 12.99
-    };
-
-    const tierBreakdown = tierStats.rows.map(row => ({
-      ...row,
-      estimatedMonthlyRevenue: (parseInt(row.active_count) * (TIER_PRICE_USD[row.subscription_tier] || 0)).toFixed(2)
-    }));
-
-    const estimatedMRR = tierBreakdown.reduce((sum, tier) =>
-      sum + parseFloat(tier.estimatedMonthlyRevenue), 0
-    ).toFixed(2);
-
+    const price = { LITE: TIER_LIMITS.LITE.price, ESSENTIAL: TIER_LIMITS.ESSENTIAL.price, LEGACY_VAULT_PREMIUM: TIER_LIMITS.LEGACY_VAULT_PREMIUM.price, PREMIUM: TIER_LIMITS.LEGACY_VAULT_PREMIUM.price };
+    const byTier = paying.rows.map(t => ({ ...t, estimatedMrr: Math.round(t.paying * (price[t.tier] || 0) * 100) / 100 }));
+    const mrr = Math.round(byTier.reduce((s, t) => s + t.estimatedMrr, 0) * 100) / 100;
     res.json({
       success: true,
       data: {
-        tierBreakdown,
-        estimatedMRR,
-        billing: billingHistory.rows[0],
-        recentTransactions: recentTransactions.rows
+        source: revenue.source,
+        thisMonth: revenue.current_month_revenue,
+        lastMonth: revenue.last_month_revenue,
+        monthly: revenue.monthly,
+        estimatedMrr: mrr,
+        estimatedArr: Math.round(mrr * 12 * 100) / 100,
+        payingUsers: byTier.reduce((s, t) => s + t.paying, 0),
+        byTier,
+        recordedTotal: Number(totals.rows[0].total_cents) / 100,
+        failedPayments30d: totals.rows[0].failed_30d,
+        recentTransactions: recent.rows,
       }
     });
   } catch (err) {
@@ -1241,247 +708,81 @@ router.get('/revenue', authenticateSuperAdmin, async (req, res) => {
   }
 });
 
-// ── GET /api/super-admin/sync-health ─────────────────────────────────────────
+// ── Sync monitor ─────────────────────────────────────────────────────────────
 router.get('/sync-health', authenticateSuperAdmin, async (req, res) => {
   try {
-    const sevenDaysAgo = new Date();
-    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
-
-    // App → IVR outbox stats
-    const outboxStats = await pool.query(`
-      SELECT status, COUNT(*) as count, AVG(attempts) as avg_attempts
-      FROM sync_outbox
-      GROUP BY status
-    `);
-
-    const recentFailures = await pool.query(`
-      SELECT id, event_type, attempts, error_message,
-             last_attempt_at, created_at
-      FROM sync_outbox
-      WHERE status IN ('failed', 'dead')
-      ORDER BY last_attempt_at DESC NULLS LAST
-      LIMIT 10
-    `);
-
-    const recentSuccess = await pool.query(`
-      SELECT
-        MAX(CASE WHEN status = 'sent' THEN sent_at END) as last_app_to_ivr_success,
-        MAX(CASE WHEN status = 'dead' THEN last_attempt_at END) as last_dead_at
-      FROM sync_outbox
-    `);
-
-    // IVR → App received log — handle missing table gracefully
-    let receivedBreakdown = [];
-    let lastIvrReceived = null;
-
-    try {
-      const receivedLog = await pool.query(`
-        SELECT
-          event_type,
-          COUNT(*) as total,
-          COUNT(CASE WHEN created_at >= $1 THEN 1 END) as last_7_days
-        FROM sync_received_log
-        GROUP BY event_type
-        ORDER BY total DESC
-      `, [sevenDaysAgo]);
-      receivedBreakdown = receivedLog.rows;
-
-      const lastReceived = await pool.query(`
-        SELECT created_at FROM sync_received_log
-        ORDER BY created_at DESC LIMIT 1
-      `);
-      lastIvrReceived = lastReceived.rows[0]?.created_at || null;
-    } catch (logErr) {
-      console.warn('sync_received_log query failed (table may not exist):', logErr.message);
+    const ts = await receivedTs();
+    const [byStatus, byEvent, failures, last, received, lastReceived] = await Promise.all([
+      pool.query(`SELECT status, COUNT(*)::int AS count FROM sync_outbox GROUP BY status`),
+      pool.query(`SELECT event_type, status, COUNT(*)::int AS count FROM sync_outbox GROUP BY event_type, status`),
+      pool.query(`SELECT id, event_type, status, attempts, error_message, last_attempt_at, created_at FROM sync_outbox
+                  WHERE status IN ('failed', 'dead') ORDER BY last_attempt_at DESC NULLS LAST LIMIT 10`),
+      pool.query(`SELECT MAX(sent_at) FILTER (WHERE status = 'sent') AS last_success,
+                         COUNT(*) FILTER (WHERE status = 'sent' AND sent_at >= NOW() - INTERVAL '7 days')::int AS sent_7d
+                  FROM sync_outbox`),
+      ts ? pool.query(`SELECT event_type, COUNT(*)::int AS total, COUNT(*) FILTER (WHERE ${ts} >= NOW() - INTERVAL '7 days')::int AS last_7_days
+                  FROM sync_received_log GROUP BY event_type ORDER BY total DESC`) : { rows: [] },
+      ts ? pool.query(`SELECT MAX(${ts}) AS at FROM sync_received_log`) : { rows: [{}] },
+    ]);
+    const stats = Object.fromEntries(byStatus.rows.map(r => [r.status, r.count]));
+    const events = {};
+    for (const r of byEvent.rows) {
+      events[r.event_type] = events[r.event_type] || { label: EVENT_LABELS[r.event_type] || r.event_type, sent: 0, pending: 0, dead: 0, dismissed: 0 };
+      const key = r.status === 'failed' ? 'pending' : r.status;
+      events[r.event_type][key] = (events[r.event_type][key] || 0) + r.count;
     }
-
-    // Calculate success rate
-    const outboxMap = {};
-    outboxStats.rows.forEach(row => { outboxMap[row.status] = parseInt(row.count); });
-    const totalSyncs = Object.values(outboxMap).reduce((a, b) => a + b, 0);
-    const successfulSyncs = outboxMap['sent'] || 0;
-    const successRate = totalSyncs > 0 ? ((successfulSyncs / totalSyncs) * 100).toFixed(1) : '0.0';
-
+    const delivered = stats.sent || 0;
+    const finished = delivered + (stats.dead || 0);
     res.json({
       success: true,
       data: {
         appToIvr: {
-          stats: outboxMap,
-          totalSyncs,
-          successRate: parseFloat(successRate),
-          recentFailures: recentFailures.rows,
-          lastSuccess: recentSuccess.rows[0]?.last_app_to_ivr_success || null,
-          lastDeadAt: recentSuccess.rows[0]?.last_dead_at || null
+          sent: delivered, pending: (stats.pending || 0) + (stats.failed || 0), dead: stats.dead || 0, dismissed: stats.dismissed || 0,
+          successRate: finished ? Math.round((delivered / finished) * 1000) / 10 : null,
+          sent7d: last.rows[0].sent_7d, lastSuccess: last.rows[0].last_success, byEvent: events, recentFailures: failures.rows
         },
         ivrToApp: {
-          breakdown: receivedBreakdown,
-          lastReceived: lastIvrReceived
+          breakdown: received.rows.map(r => ({ ...r, label: r.event_type.replace(/_/g, ' ') })),
+          lastReceived: lastReceived.rows[0]?.at || null
         }
       }
     });
   } catch (err) {
-    console.error('Sync health endpoint error:', { message: err.message, code: err.code, detail: err.detail });
+    console.error('Sync health endpoint error:', { message: err.message, code: err.code });
     res.status(500).json({ success: false, error: 'Failed to fetch sync health' });
   }
 });
 
-// ── GET /api/super-admin/system-health ───────────────────────────────────────
+// ── System health: live service checks + scheduler queue + sync backlog ──────
 router.get('/system-health', authenticateSuperAdmin, async (req, res) => {
   try {
-    const startTime = Date.now();
-
-    // 1. Database health — ping and get stats
-    const dbStart = Date.now();
-    const [dbPing, dbStats, storageStats, schedulerStats] = await Promise.all([
-      pool.query('SELECT NOW() as time, version() as version'),
+    const { getSystemHealth } = require('../utils/systemHealth');
+    const [health, scheduler, sync, db] = await Promise.all([
+      getSystemHealth({ force: req.query.refresh === '1' }),
       pool.query(`
-        SELECT
-          COUNT(*) as total_users,
-          COUNT(CASE WHEN last_login >= NOW() - INTERVAL '24 hours' THEN 1 END) as active_24h,
-          COUNT(CASE WHEN last_login >= NOW() - INTERVAL '7 days' THEN 1 END) as active_7d
-        FROM users
-      `),
-      pool.query(`
-        SELECT
-          s3_bucket,
-          COUNT(*) as file_count,
-          COALESCE(SUM(file_size_bytes), 0) as total_bytes
-        FROM voice_notes
-        WHERE deleted_at IS NULL
-        GROUP BY s3_bucket
-        ORDER BY total_bytes DESC
-      `),
-      pool.query(`
-        SELECT
-          COUNT(*) as total_scheduled,
-          COUNT(CASE WHEN delivery_status = 'scheduled' AND scheduled_for > NOW() THEN 1 END) as upcoming,
-          COUNT(CASE WHEN delivery_status = 'delivered' AND delivered_at >= NOW() - INTERVAL '24 hours' THEN 1 END) as delivered_today,
-          COUNT(CASE WHEN delivery_status = 'failed' THEN 1 END) as total_failed
-        FROM scheduled_messages
-      `)
+        SELECT COUNT(*) FILTER (WHERE delivery_status = 'scheduled' AND COALESCE(metadata->>'source', 'app') <> 'ivr')::int AS waiting,
+               COUNT(*) FILTER (WHERE delivery_status = 'scheduled' AND scheduled_for <= NOW() AND COALESCE(metadata->>'source', 'app') <> 'ivr')::int AS overdue,
+               COUNT(*) FILTER (WHERE delivery_status = 'delivered' AND delivered_at >= NOW() - INTERVAL '24 hours')::int AS delivered_24h,
+               COUNT(*) FILTER (WHERE delivery_status = 'failed')::int AS failed
+        FROM scheduled_messages`),
+      pool.query(`SELECT COUNT(*) FILTER (WHERE status IN ('pending', 'failed'))::int AS pending, COUNT(*) FILTER (WHERE status = 'dead')::int AS dead FROM sync_outbox`),
+      pool.query(`SELECT version() AS version, pg_database_size(current_database())::bigint AS size_bytes`),
     ]);
-    const dbResponseTime = Date.now() - dbStart;
-
-    // 2. S3 storage summary
-    const totalStorageBytes = storageStats.rows.reduce((sum, row) =>
-      sum + parseInt(row.total_bytes || 0), 0
-    );
-
-    // 3. Sync outbox health
-    const syncStats = await pool.query(`
-      SELECT status, COUNT(*) as count
-      FROM sync_outbox
-      GROUP BY status
-    `);
-    const syncMap = {};
-    syncStats.rows.forEach(r => { syncMap[r.status] = parseInt(r.count); });
-
     res.json({
       success: true,
       data: {
-        timestamp: new Date().toISOString(),
-        responseTime: Date.now() - startTime,
-        database: {
-          status: 'healthy',
-          responseTimeMs: dbResponseTime,
-          version: dbPing.rows[0] ? dbPing.rows[0].version.split(' ')[0] + ' ' + dbPing.rows[0].version.split(' ')[1] : 'unknown',
-          serverTime: dbPing.rows[0]?.time,
-          users: dbStats.rows[0]
-        },
-        storage: {
-          buckets: storageStats.rows.map(row => ({
-            bucket: row.s3_bucket,
-            files: parseInt(row.file_count),
-            bytes: parseInt(row.total_bytes),
-            gb: (parseInt(row.total_bytes) / (1024 * 1024 * 1024)).toFixed(3)
-          })),
-          totalBytes: totalStorageBytes,
-          totalGb: (totalStorageBytes / (1024 * 1024 * 1024)).toFixed(3)
-        },
-        scheduler: schedulerStats.rows[0],
-        sync: {
-          outbox: syncMap,
-          deadCount: syncMap['dead'] || 0,
-          pendingCount: syncMap['pending'] || 0,
-          sentCount: syncMap['sent'] || 0
-        }
+        services: health.services,
+        overall: health.overall,
+        checkedAt: health.checkedAt,
+        scheduler: scheduler.rows[0],
+        sync: sync.rows[0],
+        database: { version: db.rows[0].version.split(' ').slice(0, 2).join(' '), sizeBytes: Number(db.rows[0].size_bytes) },
+        uptimeSeconds: Math.round(process.uptime()),
       }
     });
   } catch (err) {
     console.error('System health endpoint error:', { message: err.message, code: err.code });
     res.status(500).json({ success: false, error: 'Failed to fetch system health' });
-  }
-});
-
-// Hard delete — permanently wipe a user and all their data
-router.delete('/users/:id', authenticateSuperAdmin, async (req, res) => {
-  const { id } = req.params;
-  const { confirm } = req.body;
-
-  if (confirm !== 'DELETE_USER') {
-    return res.status(400).json({ success: false, error: 'Missing confirmation. Send { confirm: "DELETE_USER" } in the request body.' });
-  }
-
-  try {
-    // 1. Fetch target user
-    const userResult = await pool.query(
-      'SELECT id, email, full_name, is_super_admin FROM users WHERE id = $1',
-      [id]
-    );
-    if (userResult.rows.length === 0) {
-      return res.status(404).json({ success: false, error: 'User not found' });
-    }
-    const target = userResult.rows[0];
-
-    // 2. Block deletion of super admins
-    if (target.is_super_admin) {
-      return res.status(403).json({ success: false, error: 'Cannot delete a super admin account' });
-    }
-
-    // 3. Audit log BEFORE deletion
-    await pool.query(
-      `INSERT INTO admin_audit_log (admin_user_id, action, target_id, new_value)
-       VALUES ($1, 'hard_delete_user', $2, $3)`,
-      [req.user.id, id, JSON.stringify({ email: target.email, full_name: target.full_name, deleted_by: req.user.email })]
-    );
-
-    // 4. Collect all S3 files to delete
-    const [notesResult, willsResult] = await Promise.all([
-      pool.query('SELECT s3_key, s3_bucket FROM voice_notes WHERE user_id = $1 AND s3_key IS NOT NULL', [id]),
-      pool.query('SELECT s3_key, s3_bucket FROM voice_wills WHERE user_id = $1 AND s3_key IS NOT NULL', [id])
-    ]);
-    const s3Files = [...notesResult.rows, ...willsResult.rows];
-
-    // 5. Delete S3 objects (fire-and-forget — don't let S3 errors block user deletion)
-    if (s3Files.length > 0) {
-      Promise.allSettled(
-        s3Files.map(f => deleteFromS3(f.s3_key, f.s3_bucket))
-      ).catch(err => console.warn('S3 cleanup warning:', err.message));
-    }
-
-    // 6. NULL out non-CASCADE foreign key references
-    await pool.query('UPDATE system_logs SET user_id = NULL WHERE user_id = $1', [id]);
-    await pool.query('UPDATE lifecycle_rules SET created_by = NULL WHERE created_by = $1', [id]);
-    await pool.query('UPDATE rule_executions SET executed_by = NULL WHERE executed_by = $1', [id]);
-    await pool.query('UPDATE storage_config SET updated_by = NULL WHERE updated_by = $1', [id]);
-    await pool.query('UPDATE storage_reports SET uploaded_by = NULL WHERE uploaded_by = $1', [id]);
-    await pool.query(
-      `UPDATE knowledge_base_articles
-       SET published_by = CASE WHEN published_by = $1 THEN NULL ELSE published_by END,
-           created_by   = CASE WHEN created_by   = $1 THEN NULL ELSE created_by   END,
-           updated_by   = CASE WHEN updated_by   = $1 THEN NULL ELSE updated_by   END
-       WHERE published_by = $1 OR created_by = $1 OR updated_by = $1`,
-      [id]
-    );
-
-    // 7. Hard delete — CASCADE handles dependent tables automatically
-    await pool.query('DELETE FROM users WHERE id = $1', [id]);
-
-    res.json({ success: true, message: `User ${target.email} permanently deleted` });
-
-  } catch (err) {
-    console.error('Hard delete user error:', err);
-    res.status(500).json({ success: false, error: 'Failed to delete user' });
   }
 });
 

@@ -22,6 +22,33 @@ const recordActivity = (userId) => {
   pool.query('UPDATE users SET last_active_at = CURRENT_TIMESTAMP WHERE id = $1', [userId]).catch(() => {});
 };
 
+// Loads the signed-in user. Includes is_suspended (migration 016); if that column doesn't exist yet,
+// falls back to the query without it so deploying before the migration can't lock everyone out.
+let suspensionColumn = true;
+const loadUserForAuth = async (userId) => {
+  const base = `id, email, phone, full_name, subscription_tier, subscription_status, profile_image_url, is_admin, last_logout_at`;
+  if (suspensionColumn) {
+    try {
+      return await pool.query(`SELECT ${base}, COALESCE(is_suspended, false) AS is_suspended FROM users WHERE id = $1 AND deleted_at IS NULL`, [userId]);
+    } catch (err) {
+      if (err.code !== '42703') throw err;
+      suspensionColumn = false;
+      console.warn('users.is_suspended missing — run migration 016 to enable account suspension');
+    }
+  }
+  return pool.query(`SELECT ${base} FROM users WHERE id = $1 AND deleted_at IS NULL`, [userId]);
+};
+
+// True when an account is suspended (for sign-in routes). Missing column = not suspended.
+const isAccountSuspended = async (userId) => {
+  try {
+    return !!(await pool.query('SELECT COALESCE(is_suspended, false) AS s FROM users WHERE id = $1', [userId])).rows[0]?.s;
+  } catch (err) {
+    if (err.code === '42703') return false;
+    throw err;
+  }
+};
+
 // Authentication middleware
 const authenticate = async (req, res, next) => {
   try {
@@ -57,10 +84,7 @@ const authenticate = async (req, res, next) => {
     }
 
     // Check if user exists and is active
-    const userQuery = await pool.query(
-        `SELECT id, email, phone, full_name, subscription_tier, subscription_status, profile_image_url, is_admin, last_logout_at FROM users WHERE id = $1 AND deleted_at IS NULL`,
-        [decoded.userId]
-      );
+    const userQuery = await loadUserForAuth(decoded.userId);
 
     if (userQuery.rows.length === 0) {
       throw new Error('User not found');
@@ -75,6 +99,16 @@ const authenticate = async (req, res, next) => {
       if (tokenIssuedAt < new Date(user.last_logout_at).getTime()) {
         return res.status(401).json({ success: false, error: 'Session expired. Please log in again.' });
       }
+    }
+
+    // Suspended by an admin (Users page "Deactivate" or super admin "Suspend") — blocked everywhere.
+    // Impersonation sessions are already refused for suspended accounts when they start.
+    if (user.is_suspended) {
+      return res.status(403).json({
+        success: false,
+        code: 'ACCOUNT_SUSPENDED',
+        error: 'This account has been suspended. Please contact SureTalk support.'
+      });
     }
 
     // Check subscription status
@@ -259,6 +293,7 @@ const recordAnalyticsEvent = async (req, eventType, data = {}) => {
 };
 
 module.exports = {
+  isAccountSuspended,
   authenticate,
   authenticateAdmin,
   validateTier,

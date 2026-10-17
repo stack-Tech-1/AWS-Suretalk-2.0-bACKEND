@@ -68,8 +68,9 @@ function buildUserFilters(query) {
     // older rows may store 'PREMIUM'
     where[where.length - 1] = `u.subscription_tier IN ($${params.length}, 'PREMIUM')`;
   }
-  if (query.status === 'active') where.push(`u.subscription_status IN ('active', 'trialing', 'past_due')`);
-  if (query.status === 'inactive') where.push(`COALESCE(u.subscription_status, 'inactive') NOT IN ('active', 'trialing', 'past_due')`);
+  if (query.status === 'active') where.push(`u.subscription_status IN ('active', 'trialing', 'past_due') AND COALESCE(u.is_suspended, false) = false`);
+  if (query.status === 'inactive') where.push(`(COALESCE(u.subscription_status, 'inactive') NOT IN ('active', 'trialing', 'past_due') OR COALESCE(u.is_suspended, false) = true)`);
+  if (query.status === 'suspended') where.push(`COALESCE(u.is_suspended, false) = true`);
   if (query.status === 'paying') where.push(STRIPE_MANAGED);
 
   return { whereSql: `WHERE ${where.join(' AND ')}`, params };
@@ -86,7 +87,7 @@ router.get('/users/stats', authenticateAdmin, async (req, res) => {
         COUNT(*) FILTER (WHERE ${STRIPE_MANAGED} AND u.subscription_tier = 'ESSENTIAL')::int AS paying_essential,
         COUNT(*) FILTER (WHERE ${STRIPE_MANAGED} AND u.subscription_tier IN ('LEGACY_VAULT_PREMIUM', 'PREMIUM'))::int AS paying_premium,
         COUNT(*) FILTER (WHERE COALESCE(u.last_active_at, u.last_login) >= NOW() - INTERVAL '24 hours')::int AS active_today,
-        COUNT(*) FILTER (WHERE COALESCE(u.subscription_status, 'inactive') NOT IN ('active', 'trialing', 'past_due'))::int AS inactive_users
+        COUNT(*) FILTER (WHERE COALESCE(u.subscription_status, 'inactive') NOT IN ('active', 'trialing', 'past_due') OR COALESCE(u.is_suspended, false))::int AS inactive_users
       FROM users u
       WHERE u.deleted_at IS NULL AND ${CUSTOMER_FILTER}
     `);
@@ -116,7 +117,7 @@ router.get('/users', authenticateAdmin, async (req, res) => {
     const result = await pool.query(
       `SELECT u.id, u.email, u.phone, u.full_name, u.subscription_tier, u.subscription_status,
               u.created_at, u.last_login, COALESCE(u.last_active_at, u.last_login) AS last_active,
-              u.is_admin, u.admin_status, ${STRIPE_MANAGED} AS stripe_managed,
+              u.is_admin, u.admin_status, ${STRIPE_MANAGED} AS stripe_managed, COALESCE(u.is_suspended, false) AS is_suspended,
               (SELECT COUNT(*)::int FROM voice_notes vn WHERE vn.user_id = u.id AND vn.deleted_at IS NULL) AS note_count,
               (SELECT COUNT(*)::int FROM contacts c WHERE c.user_id = u.id) AS contact_count,
               COUNT(*) OVER()::int AS total_count
@@ -236,9 +237,9 @@ router.post('/users/bulk', authenticateAdmin, [
         if (user.stripe_managed) { skipped.push({ id: user.id, email: user.email, reason: 'Plan managed by Stripe' }); continue; }
         await applyPlan(user.id, tier);
       } else if (action === 'deactivate') {
-        await setActive(user, false);
+        await setActive(user, false, { adminId: req.user.id });
       } else if (action === 'reactivate') {
-        await setActive(user, true);
+        await setActive(user, true, { adminId: req.user.id });
       } else if (action === 'delete') {
         await softDeleteUser(user, { notifyUser: false });
       }
@@ -336,7 +337,8 @@ const USER_DETAIL_COLUMNS = `
   u.storage_limit_gb, u.contacts_limit, u.voice_notes_limit, u.created_at, u.updated_at,
   u.last_login, COALESCE(u.last_active_at, u.last_login) AS last_active, u.email_verified,
   u.is_admin, u.admin_status, COALESCE(u.two_factor_enabled, false) AS two_factor_enabled,
-  u.source, u.stripe_customer_id IS NOT NULL AS has_stripe_customer, ${STRIPE_MANAGED} AS stripe_managed`;
+  u.source, u.stripe_customer_id IS NOT NULL AS has_stripe_customer, ${STRIPE_MANAGED} AS stripe_managed,
+  COALESCE(u.is_suspended, false) AS is_suspended, u.suspended_at, u.suspended_reason`;
 
 router.get('/users/:id', authenticateAdmin, async (req, res) => {
   try {
@@ -427,10 +429,22 @@ async function applyPlan(userId, tier, customLimits = null) {
   return limits;
 }
 
-async function setActive(user, active) {
-  const status = active ? 'active' : 'suspended';
-  await pool.query('UPDATE users SET subscription_status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2', [status, user.id]);
-  syncToIvr({ userId: user.id, tier: ivrTierName(user.subscription_tier), subscriptionStatus: status }, 'sync-user');
+// Suspension uses users.is_suspended (migration 016), which every request and sign-in checks and Stripe
+// never changes. Accounts deactivated before 016 had subscription_status = 'suspended'; that's cleared too.
+async function setActive(user, active, { adminId = null, reason = null } = {}) {
+  const updated = (await pool.query(
+    `UPDATE users
+     SET is_suspended = $1,
+         suspended_at = CASE WHEN $1 THEN NOW() ELSE NULL END,
+         suspended_reason = CASE WHEN $1 THEN $3 ELSE NULL END,
+         suspended_by = CASE WHEN $1 THEN $4::uuid ELSE NULL END,
+         subscription_status = CASE WHEN subscription_status = 'suspended' THEN 'active' ELSE subscription_status END,
+         updated_at = CURRENT_TIMESTAMP
+     WHERE id = $2
+     RETURNING subscription_status`,
+    [!active, user.id, reason, adminId]
+  )).rows[0];
+  syncToIvr({ userId: user.id, tier: ivrTierName(user.subscription_tier), subscriptionStatus: active ? (updated?.subscription_status || 'active') : 'suspended' }, 'sync-user');
 }
 
 // Same steps as a user deleting their own account (routes/settings.js DELETE /account)
@@ -464,6 +478,7 @@ async function loadTarget(req, res) {
   if (!isUuid(id)) { res.status(404).json({ success: false, error: 'User not found' }); return null; }
   const result = await pool.query(
     `SELECT u.id, u.email, u.full_name, u.is_admin, u.subscription_tier, u.subscription_status,
+            COALESCE(u.is_suspended, false) AS is_suspended,
             u.storage_limit_gb, u.contacts_limit, u.voice_notes_limit, u.stripe_subscription_id,
             ${STRIPE_MANAGED} AS stripe_managed
      FROM users u WHERE u.id = $1 AND u.deleted_at IS NULL`,
@@ -537,13 +552,13 @@ for (const [path, active] of [['deactivate', false], ['reactivate', true]]) {
     try {
       const user = await loadTarget(req, res);
       if (!user || !protectAccount(req, res, user)) return;
-      await setActive(user, active);
+      await setActive(user, active, { adminId: req.user.id, reason: req.body?.reason?.trim() || null });
       logSystem(req.user.id, active ? 'info' : 'warning', active ? 'User reactivated by admin' : 'User deactivated by admin', { targetUserId: user.id, email: user.email });
       logAdminAudit({
         userId: req.user.id, action: active ? 'REACTIVATE_USER' : 'DEACTIVATE_USER', targetId: user.id,
-        oldValue: { subscription_status: user.subscription_status }, newValue: { subscription_status: active ? 'active' : 'suspended' }, ipAddress: req.ip
+        oldValue: { is_suspended: !!user.is_suspended }, newValue: { is_suspended: !active, reason: req.body?.reason || null }, ipAddress: req.ip
       });
-      res.json({ success: true, data: { subscription_status: active ? 'active' : 'suspended' } });
+      res.json({ success: true, data: { is_suspended: !active } });
     } catch (error) {
       console.error(`User ${path} error:`, error);
       res.status(500).json({ success: false, error: `Failed to ${path} user` });
@@ -595,3 +610,5 @@ router.delete('/users/:id', authenticateAdmin, async (req, res) => {
 });
 
 module.exports = router;
+// Shared with routes/superAdmin.js so both consoles change plans and suspend accounts the same way
+Object.assign(module.exports, { applyPlan, setActive, STRIPE_MANAGED, TIER_LIMITS, TIERS });

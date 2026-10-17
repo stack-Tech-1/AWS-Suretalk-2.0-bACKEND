@@ -5,7 +5,7 @@ const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const { body, validationResult } = require('express-validator');
 const { pool } = require('../config/database');
-const { authenticate } = require('../middleware/auth');
+const { authenticate, isAccountSuspended } = require('../middleware/auth');
 const tokenService = require('../utils/tokens');
 const emailService = require('../utils/emailService');
 const twilio = require('twilio');
@@ -273,6 +273,11 @@ router.post('/login', validateLogin, async (req, res) => {
       'UPDATE users SET failed_login_attempts = 0, account_locked_until = NULL WHERE id = $1 AND (failed_login_attempts > 0 OR account_locked_until IS NOT NULL)',
       [user.id]
     ).catch(err => console.error('failed-login counter reset failed:', err));
+
+    // Suspended by an admin — tell them clearly instead of failing on the next request
+    if (await isAccountSuspended(user.id)) {
+      return res.status(403).json({ success: false, code: 'ACCOUNT_SUSPENDED', error: 'This account has been suspended. Please contact SureTalk support.' });
+    }
 
     // IMPORTANT: Check if user is admin - admins bypass email verification
     if (user.is_admin && user.admin_status !== 'approved') {
