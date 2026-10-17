@@ -236,6 +236,7 @@ app.use('/api/voice-notes', require('./routes/voiceNotes'));
 app.use('/api/contacts', require('./routes/contacts'));
 app.use('/api/vault', require('./routes/vault'));
 app.use('/api/scheduled', require('./routes/scheduled'));
+app.use('/api/admin', require('./routes/adminUsers'));
 app.use('/api/admin', require('./routes/admin'));
 app.use('/api/settings', settingsRoutes);
 app.use('/api/devices', devicesRoutes);
