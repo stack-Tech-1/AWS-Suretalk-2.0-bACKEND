@@ -9,7 +9,6 @@ const { authenticate, isAccountSuspended } = require('../middleware/auth');
 const tokenService = require('../utils/tokens');
 const emailService = require('../utils/emailService');
 const twilio = require('twilio');
-const { syncToIvr } = require('../utils/syncIvr');
 const { normalizeTier, TIERS } = require('../utils/tierMapping');
 const axios = require('axios');
 const { requireTurnstile } = require('../middleware/turnstile');
@@ -1156,8 +1155,8 @@ router.post('/claim-account', validateClaimAccount, async (req, res) => {
     );
     const user = updatedUser.rows[0];
 
-    // 7. Fire-and-forget sync to IVR DynamoDB
-    syncToIvr({ userId: user.id, email, fullName, phone, source: 'app' }, 'sync-user');
+    // 7. Nothing to send to the phone line: the account already exists there (it was created by a
+    //    call) and the phone line doesn't store name, email or password.
 
     // 8. Generate JWT (same pattern as login)
     const token = jwt.sign(

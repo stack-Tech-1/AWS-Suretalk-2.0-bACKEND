@@ -5,7 +5,7 @@ const { body, validationResult } = require('express-validator');
 const { authenticate } = require('../middleware/auth');
 const { pool } = require('../config/database');
 const emailService = require('../utils/emailService');
-const { syncToIvr } = require('../utils/syncIvr');
+const { syncAccountToIvr } = require('../utils/syncIvr');
 
 const stripe = process.env.STRIPE_SECRET_KEY
   ? require('stripe')(process.env.STRIPE_SECRET_KEY)
@@ -544,15 +544,16 @@ router.delete('/account', authenticate, [
     }
 
     // 2. Soft-delete the user (keep the row for legal compliance — never hard-delete)
-    await pool.query(
+    const deleted = (await pool.query(
       `UPDATE users
        SET deleted_at             = CURRENT_TIMESTAMP,
            subscription_status    = 'cancelled',
            stripe_subscription_id = NULL,
            updated_at             = CURRENT_TIMESTAMP
-       WHERE id = $1`,
+       WHERE id = $1
+       RETURNING phone`,
       [userId]
-    );
+    )).rows[0];
 
     // 3. Log the deletion
     await pool.query(
@@ -562,7 +563,8 @@ router.delete('/account', authenticate, [
     );
 
     // 4. Notify IVR system to deactivate the phone account
-    syncToIvr({ userId, subscriptionStatus: 'cancelled' }, 'delete-user');
+    // (soft delete there too: recordings kept, phone sign-in switched off)
+    syncAccountToIvr(deleted?.phone, { action: 'delete' });
 
     // 5. Send goodbye email
     emailService.sendAccountDeletedEmail(user.email, user.full_name)

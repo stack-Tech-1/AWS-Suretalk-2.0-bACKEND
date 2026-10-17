@@ -9,7 +9,7 @@ const jwt = require('jsonwebtoken');
 const { body, validationResult } = require('express-validator');
 const { authenticateAdmin } = require('../middleware/auth');
 const { pool } = require('../config/database');
-const { syncToIvr } = require('../utils/syncIvr');
+const { syncAccountToIvr } = require('../utils/syncIvr');
 const { ivrTierName } = require('../utils/tierMapping');
 const emailService = require('../utils/emailService');
 
@@ -296,7 +296,8 @@ router.post('/users', authenticateAdmin, [
       [email, phone || null, fullName, passwordHash, subscriptionTier, limits.storageGb, limits.contacts, limits.voiceNotes]
     )).rows[0];
 
-    if (phone) syncToIvr({ userId: created.id, email, fullName, phone, source: 'app' }, 'sync-user');
+    // No phone-line sync here: a phone-line account needs a 4-digit PIN, which the person sets
+    // themselves (Settings → Phone line) or by registering on a call.
 
     // "Set your password" link — same mechanism as Forgot password, valid for 7 days
     const token = jwt.sign({ userId: created.id, purpose: 'password_reset' }, process.env.JWT_SECRET, { expiresIn: '7d' });
@@ -422,10 +423,10 @@ async function applyPlan(userId, tier, customLimits = null) {
   const updated = (await pool.query(
     `UPDATE users SET subscription_tier = $1, storage_limit_gb = $2, contacts_limit = $3, voice_notes_limit = $4,
                       updated_at = CURRENT_TIMESTAMP
-     WHERE id = $5 RETURNING subscription_status`,
+     WHERE id = $5 RETURNING phone`,
     [tier, limits.storageGb, limits.contacts, limits.voiceNotes, userId]
   )).rows[0];
-  syncToIvr({ userId, tier: ivrTierName(tier), subscriptionStatus: updated?.subscription_status || 'active' }, 'sync-user');
+  syncAccountToIvr(updated?.phone, { subscription_tier: ivrTierName(tier), action: 'update_tier' });
   return limits;
 }
 
@@ -441,10 +442,11 @@ async function setActive(user, active, { adminId = null, reason = null } = {}) {
          subscription_status = CASE WHEN subscription_status = 'suspended' THEN 'active' ELSE subscription_status END,
          updated_at = CURRENT_TIMESTAMP
      WHERE id = $2
-     RETURNING subscription_status`,
+     RETURNING phone`,
     [!active, user.id, reason, adminId]
   )).rows[0];
-  syncToIvr({ userId: user.id, tier: ivrTierName(user.subscription_tier), subscriptionStatus: active ? (updated?.subscription_status || 'active') : 'suspended' }, 'sync-user');
+  // verified=false switches phone sign-in off; true switches it back on
+  syncAccountToIvr(updated?.phone, { verified: active, action: active ? 'reactivate' : 'suspend' });
 }
 
 // Same steps as a user deleting their own account (routes/settings.js DELETE /account)
@@ -459,13 +461,13 @@ async function softDeleteUser(user, { notifyUser }) {
       stripeCancelled = false;
     }
   }
-  await pool.query(
+  const deleted = (await pool.query(
     `UPDATE users SET deleted_at = CURRENT_TIMESTAMP, subscription_status = 'cancelled',
                       stripe_subscription_id = NULL, updated_at = CURRENT_TIMESTAMP
-     WHERE id = $1`,
+     WHERE id = $1 RETURNING phone`,
     [user.id]
-  );
-  syncToIvr({ userId: user.id, subscriptionStatus: 'cancelled' }, 'delete-user');
+  )).rows[0];
+  syncAccountToIvr(deleted?.phone, { action: 'delete' });
   if (notifyUser) {
     emailService.sendAccountDeletedEmail(user.email, user.full_name)
       .catch(err => console.error(`Failed to send account deletion email: ${err.message}`));

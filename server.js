@@ -258,6 +258,15 @@ app.use('/api/super-admin', require('./routes/superAdmin'));
 
 // ==================== Sync Routes - Handle incoming payloads from IVR Lambdas ====================
 
+// The same phone number can be stored with or without +1 / formatting; compare digits only.
+// '+15551234567' and '5551234567' match each other (US); other numbers must match exactly.
+const phoneDigitVariants = (phone) => {
+  const d = String(phone || '').replace(/[^0-9]/g, '');
+  if (d.length === 10) return [d, `1${d}`];
+  if (d.length === 11 && d.startsWith('1')) return [d, d.slice(1)];
+  return [d];
+};
+
 // Auth middleware for sync routes (use shared token, not user auth)
 const syncAuth = (req, res, next) => {
   const auth = req.headers.authorization;
@@ -289,11 +298,54 @@ app.post('/api/sync/user', syncAuth, async (req, res) => {
       [action || 'unknown', JSON.stringify(req.body)]
     );
 
+    // PIN or phone-number change made on a call (UpdateuserloginsNew sends no action, just fieldsUpdated)
+    if (!action && Array.isArray(req.body.fieldsUpdated)) {
+      const { oldUserId } = req.body;
+      if (req.body.fieldsUpdated.includes('userId') && oldUserId && oldUserId !== userId) {
+        const current = await pool.query(
+          `SELECT id FROM users WHERE regexp_replace(phone, '[^0-9]', '', 'g') = ANY($1) AND deleted_at IS NULL`,
+          [phoneDigitVariants(oldUserId)]
+        );
+        const taken = await pool.query(
+          `SELECT id FROM users WHERE regexp_replace(phone, '[^0-9]', '', 'g') = ANY($1)`,
+          [phoneDigitVariants(userId)]
+        );
+        if (current.rows.length && taken.rows.length && taken.rows[0].id !== current.rows[0].id) {
+          console.warn(`Phone change from IVR skipped: ${userId} already belongs to another app account`);
+          return res.status(409).json({ success: false, error: 'New number already used by another account' });
+        }
+        if (current.rows.length) {
+          await pool.query(`UPDATE users SET phone = $1, updated_at = NOW() WHERE id = $2`, [userId, current.rows[0].id]);
+        }
+      }
+      // PIN-only change: the app doesn't store phone PINs, nothing to update
+      return res.status(200).json({ success: true });
+    }
+
     if (action === 'unsubscribe') {
-      await pool.query(
-        `UPDATE users SET subscription_status = $1, updated_at = NOW() WHERE phone = $2`,
-        ['inactive', userId]
+      // Unsubscribing on a call = move to the free Lite plan on both sides. The account stays usable
+      // (status 'active'), any paid Stripe subscription is cancelled now so the plans can't drift apart.
+      const r = await pool.query(
+        `SELECT id, stripe_subscription_id FROM users
+         WHERE regexp_replace(phone, '[^0-9]', '', 'g') = ANY($1) AND deleted_at IS NULL`,
+        [phoneDigitVariants(userId)]
       );
+      for (const u of r.rows) {
+        if (u.stripe_subscription_id && process.env.STRIPE_SECRET_KEY) {
+          try {
+            await require('stripe')(process.env.STRIPE_SECRET_KEY).subscriptions.cancel(u.stripe_subscription_id);
+          } catch (stripeErr) {
+            console.error(`Unsubscribe from IVR: Stripe cancel failed for ${u.id}: ${stripeErr.message}`);
+          }
+        }
+        await pool.query(
+          `UPDATE users
+           SET subscription_tier = 'LITE', subscription_status = 'active', stripe_subscription_id = NULL,
+               storage_limit_gb = 1, contacts_limit = 3, voice_notes_limit = 3, updated_at = NOW()
+           WHERE id = $1`,
+          [u.id]
+        );
+      }
     } else if (action === 'create' || action === 'update') {
       // Check if user already exists and is claimed (has password_hash set)
       const existing = await pool.query(

@@ -63,4 +63,15 @@ const syncToIvr = async (payload, endpointPath, client) => {
   }
 };
 
-module.exports = { syncToIvr };
+/**
+ * Account changes for the phone line's sync-user function. It finds the account by PHONE NUMBER
+ * (never the app's user id) and only reads: subscription_tier ('LITE' | 'ESSENTIAL' | 'PREMIUM' —
+ * use ivrTierName), verified (false = phone sign-in off), and action 'delete' or
+ * 'change_phone' (+ newUserId). Users without a phone number have no phone-line account.
+ */
+const syncAccountToIvr = (phone, fields) => {
+  if (!phone) return;
+  return syncToIvr({ userId: phone, source: 'app', ...fields }, 'sync-user');
+};
+
+module.exports = { syncToIvr, syncAccountToIvr };

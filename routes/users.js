@@ -4,7 +4,7 @@ const router = express.Router();
 const { body, validationResult } = require('express-validator');
 const { authenticate, authenticateAdmin } = require('../middleware/auth');
 const { pool } = require('../config/database');
-const { syncToIvr } = require('../utils/syncIvr'); // Import sync helper
+const { syncToIvr, syncAccountToIvr } = require('../utils/syncIvr'); // Import sync helper
 const { ivrTierName, normalizeTier } = require('../utils/tierMapping');
 
 // Get user profile
@@ -127,20 +127,15 @@ router.put('/profile', authenticate, [
       UPDATE users 
       SET ${updates.join(', ')}, updated_at = CURRENT_TIMESTAMP
       WHERE id = $${paramCount}
-      RETURNING id, email, phone, full_name, profile_image_url, subscription_tier, verified, updated_at
+      RETURNING id, email, phone, full_name, profile_image_url, subscription_tier, updated_at
     `;
 
     const result = await pool.query(query, values);
     const updatedUser = result.rows[0];
 
-    // If phone was updated, sync the change to IVR (userId changed)
+    // Phone changed: move their phone-line account (PIN, recordings, plan) to the new number
     if (phone && phone !== req.user.phone) {
-      syncToIvr({
-        userId: req.user.phone,               // old phone
-        newUserId: updatedUser.phone,          // new phone
-        action: 'update_credentials',
-        source: 'app'
-      }, 'sync-credential');
+      syncAccountToIvr(req.user.phone, { action: 'change_phone', newUserId: updatedUser.phone });
     }
 
     res.json({
@@ -1376,17 +1371,8 @@ router.delete('/account', authenticate, async (req, res) => {
       [req.user.id]
     );
 
-    if (user?.phone) {
-      try {
-        syncToIvr({
-          userId: user.phone,
-          action: 'unsubscribe',
-          source: 'app'
-        }, 'sync-user');
-      } catch (syncErr) {
-        console.error('IVR sync on delete failed:', syncErr.message);
-      }
-    }
+    // Soft delete on the phone line too: recordings kept, phone sign-in switched off
+    syncAccountToIvr(user?.phone, { action: 'delete' });
 
     await pool.query(
       `INSERT INTO analytics_events (user_id, event_type, event_data)
@@ -1710,6 +1696,92 @@ router.get('/profile-image-url', authenticate, async (req, res) => {
   } catch (err) {
     console.error('Profile image URL error:', err.message);
     res.status(500).json({ success: false, error: 'Failed to generate image URL' });
+  }
+});
+
+// ── Phone line access (Settings → Phone line) ───────────────────────────────
+// A phone-line account is created by the phone line's saveUserDataNew function with a 4-digit PIN,
+// the same one used when someone registers on a call. The phone line asks callers for a 10-digit
+// ID, so only US numbers (+1) can have one. Calls need IVR_API_URL and IVR_REQUEST_KEY.
+const phoneLineId = (phone) => {
+  const d = String(phone || '').replace(/[^0-9]/g, '');
+  if (d.length === 11 && d.startsWith('1')) return d.slice(1);
+  if (d.length === 10) return d;
+  return null;
+};
+const phoneLineConfigured = () => !!(process.env.IVR_API_URL && process.env.IVR_REQUEST_KEY);
+const WEAK_PINS = new Set(['1234', '4321', '0123', '1111', '0000']);
+const pinAttempts = new Map(); // userId -> timestamps, max 5 tries an hour
+
+async function phoneLineAccountExists(id) {
+  const axios = require('axios');
+  const r = await axios.get(`${process.env.IVR_API_URL}/getUserIVRState`, {
+    params: { userId: id, key: process.env.IVR_REQUEST_KEY },
+    timeout: 8000,
+    validateStatus: () => true
+  });
+  if (r.status === 200) return true;
+  if (r.status === 404) return false;
+  throw new Error(`Phone line status check returned ${r.status}`);
+}
+
+router.get('/phone-line', authenticate, async (req, res) => {
+  try {
+    const id = phoneLineId(req.user.phone);
+    if (!req.user.phone) return res.json({ success: true, data: { phone: null, supported: false, reason: 'no_phone', hasAccount: false } });
+    if (!id) return res.json({ success: true, data: { phone: req.user.phone, supported: false, reason: 'not_us', hasAccount: false } });
+    if (!phoneLineConfigured()) return res.status(503).json({ success: false, error: 'Phone line is not available right now' });
+    const hasAccount = await phoneLineAccountExists(id);
+    res.json({ success: true, data: { phone: req.user.phone, supported: true, hasAccount } });
+  } catch (err) {
+    console.error('Phone line status error:', err.message);
+    res.status(502).json({ success: false, error: 'Could not reach the phone line. Try again in a moment.' });
+  }
+});
+
+router.post('/phone-line/pin', authenticate, [
+  body('pin').isString().matches(/^\d{4}$/).withMessage('Your PIN must be exactly 4 digits')
+], async (req, res) => {
+  try {
+    if (req.isImpersonating) return res.status(403).json({ success: false, error: 'Not available while viewing as this user' });
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ success: false, error: errors.array()[0].msg });
+    const { pin } = req.body;
+    if (WEAK_PINS.has(pin)) return res.status(400).json({ success: false, code: 'WEAK_PIN', error: 'Choose a PIN that is harder to guess' });
+
+    const id = phoneLineId(req.user.phone);
+    if (!id) return res.status(400).json({ success: false, code: 'NOT_US', error: 'The phone line currently supports US (+1) numbers only' });
+    if (!phoneLineConfigured()) return res.status(503).json({ success: false, error: 'Phone line is not available right now' });
+
+    const now = Date.now();
+    const recent = (pinAttempts.get(req.user.id) || []).filter(t => now - t < 3600 * 1000);
+    if (recent.length >= 5) return res.status(429).json({ success: false, error: 'Too many attempts. Try again in an hour.' });
+    pinAttempts.set(req.user.id, [...recent, now]);
+
+    const axios = require('axios');
+    const r = await axios.post(`${process.env.IVR_API_URL}/saveUserDataNew`, {
+      key: process.env.IVR_REQUEST_KEY,
+      userId: id,
+      userPin: pin,
+      subscription_tier: ivrTierName(req.user.subscription_tier)
+    }, { timeout: 10000, validateStatus: () => true });
+
+    if (r.status === 201) {
+      pool.query(
+        `INSERT INTO system_logs (user_id, level, service, message, metadata) VALUES ($1, 'info', 'account', 'Phone line account created', $2)`,
+        [req.user.id, JSON.stringify({ via: 'app settings' })]
+      ).catch(() => {});
+      return res.status(201).json({ success: true, message: 'Your phone line account is ready' });
+    }
+    // 200 = an account already exists for this number; we can't prove it's theirs, so the PIN isn't changed
+    if (r.status === 200) {
+      return res.status(409).json({ success: false, code: 'ALREADY_EXISTS', error: 'This number already has a phone line account. Call in and use your existing PIN.' });
+    }
+    console.error(`saveUserDataNew returned ${r.status}: ${JSON.stringify(r.data).slice(0, 200)}`);
+    res.status(502).json({ success: false, error: 'The phone line could not create your account. Try again in a moment.' });
+  } catch (err) {
+    console.error('Phone line PIN error:', err.message);
+    res.status(502).json({ success: false, error: 'Could not reach the phone line. Try again in a moment.' });
   }
 });
 

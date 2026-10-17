@@ -5,7 +5,7 @@ const router   = express.Router();
 const Stripe   = require('stripe');
 const https    = require('https');
 const { pool } = require('../config/database');
-const { syncToIvr }   = require('../utils/syncIvr');
+const { syncAccountToIvr } = require('../utils/syncIvr');
 const { ivrTierName } = require('../utils/tierMapping');
 const emailService    = require('../utils/emailService');
 const logger          = require('../utils/logger');
@@ -40,17 +40,21 @@ async function setUserLimits(userId, tier) {
   );
 }
 
-// Returns { id, email, full_name } for the user linked to a Stripe subscription object
+// Subscription statuses that keep the paid plan. Anything else (canceled, unpaid, incomplete,
+// incomplete_expired, paused) means the person is on the free Lite plan, with their account still active.
+const PAID_STATUSES = ['active', 'trialing', 'past_due'];
+
+// Returns { id, email, full_name, phone } for the user linked to a Stripe subscription object
 async function getUserFromSubscription(subscription) {
   if (subscription.metadata?.userId) {
     const r = await pool.query(
-      'SELECT id, email, full_name FROM users WHERE id = $1 AND deleted_at IS NULL',
+      'SELECT id, email, full_name, phone FROM users WHERE id = $1 AND deleted_at IS NULL',
       [subscription.metadata.userId]
     );
     return r.rows[0] || null;
   }
   const r = await pool.query(
-    'SELECT id, email, full_name FROM users WHERE stripe_customer_id = $1 AND deleted_at IS NULL',
+    'SELECT id, email, full_name, phone FROM users WHERE stripe_customer_id = $1 AND deleted_at IS NULL',
     [subscription.customer]
   );
   return r.rows[0] || null;
@@ -123,7 +127,10 @@ async function handleEvent(event) {
       if (!user) { logger.warn(`No user found for subscription ${obj.id}`); break; }
 
       const priceId = obj.items.data[0]?.price.id;
-      const tier    = getTierFromPriceId(priceId);
+      const paid    = PAID_STATUSES.includes(obj.status);
+      const tier    = paid ? getTierFromPriceId(priceId) : 'LITE';
+      // Not paying any more → Lite, but the account stays usable (auth only lets active/trialing/past_due in)
+      const status  = paid ? obj.status : 'active';
 
       await pool.query(
         `UPDATE users
@@ -132,14 +139,12 @@ async function handleEvent(event) {
              stripe_subscription_id = $3,
              updated_at             = NOW()
          WHERE id = $4`,
-        [tier, obj.status, obj.id, user.id]
+        [tier, status, obj.id, user.id]
       );
       await setUserLimits(user.id, tier);
 
-      syncToIvr(
-        { userId: user.id, tier: ivrTierName(tier), subscriptionStatus: obj.status },
-        'sync-user'
-      );
+      // Plan only — Stripe never changes phone sign-in (that's suspension, set by admins)
+      syncAccountToIvr(user.phone, { subscription_tier: ivrTierName(tier), action: 'stripe_update' });
 
       logger.info(`Subscription ${event.type}: user ${user.id} → tier ${tier}, status ${obj.status}`);
       break;
@@ -148,7 +153,7 @@ async function handleEvent(event) {
     // ── Subscription cancelled (user cancelled or Stripe gave up after failed payments)
     case 'customer.subscription.deleted': {
       const r = await pool.query(
-        'SELECT id, email, full_name, subscription_tier FROM users WHERE stripe_subscription_id = $1 AND deleted_at IS NULL',
+        'SELECT id, email, full_name, phone, subscription_tier FROM users WHERE stripe_subscription_id = $1 AND deleted_at IS NULL',
         [obj.id]
       );
       const user = r.rows[0];
@@ -157,9 +162,11 @@ async function handleEvent(event) {
       const previousTier = user.subscription_tier;
 
       // Downgrade to LITE — keep all data, reset limits and tier
+      // Status stays 'active' so they can still sign in ('inactive' was refused by middleware/auth.js
+      // and locked people out of the app when their plan ended)
       await pool.query(
         `UPDATE users
-         SET subscription_status    = 'inactive',
+         SET subscription_status    = 'active',
              subscription_tier      = 'LITE',
              stripe_subscription_id = NULL,
              updated_at             = NOW()
@@ -168,7 +175,7 @@ async function handleEvent(event) {
       );
       await setUserLimits(user.id, 'LITE');
 
-      syncToIvr({ userId: user.id, subscriptionStatus: 'inactive', tier: 'lite' }, 'sync-user');
+      syncAccountToIvr(user.phone, { subscription_tier: 'LITE', action: 'stripe_cancelled' });
 
       // Was this a voluntary cancellation or payment failure suspension?
       // Stripe sets cancel_at_period_end=true for voluntary, then fires deleted when period ends.

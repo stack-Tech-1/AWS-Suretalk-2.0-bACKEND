@@ -496,8 +496,11 @@ router.post('/users/:id/resync', authenticateSuperAdmin, async (req, res) => {
     const updates = { subscription_tier: tierMap[dynamoUser.subscription_tier] || user.subscription_tier || 'LITE' };
     if (dynamoUser.stripeCustomerId) updates.stripe_customer_id = dynamoUser.stripeCustomerId;
     if (dynamoUser.stripeSubscriptionId && dynamoUser.stripeSubscriptionId !== 'unsubscribed') updates.stripe_subscription_id = dynamoUser.stripeSubscriptionId;
-    if (dynamoUser.subscriptionStatus) updates.subscription_status = dynamoUser.subscriptionStatus;
-    if (dynamoUser.verified !== undefined) updates.subscription_status = dynamoUser.verified ? 'active' : 'inactive';
+    // The phone line's "verified" only controls phone sign-in, so it isn't copied. A lapsed Stripe
+    // status becomes 'active' (on Lite) — any other value would lock them out of the app.
+    if (dynamoUser.subscriptionStatus) {
+      updates.subscription_status = ['active', 'trialing', 'past_due'].includes(dynamoUser.subscriptionStatus) ? dynamoUser.subscriptionStatus : 'active';
+    }
 
     const keys = Object.keys(updates);
     await pool.query(
