@@ -429,6 +429,70 @@ router.get('/admin-profile', authenticateAdmin, async (req, res) => {
   }
 });
 
+// Counts the unused backup codes stored for a user (stored as a JSON array of hashes)
+const countBackupCodes = (stored) => {
+  let codes = stored || [];
+  if (typeof codes === 'string') {
+    try { codes = JSON.parse(codes); } catch { codes = []; }
+  }
+  return Array.isArray(codes) ? codes.length : 0;
+};
+
+// The signed-in admin's 2FA status (setup / turning off use the shared /auth/2fa routes)
+router.get('/admin/2fa/status', authenticateAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT two_factor_enabled, two_factor_backup_codes FROM users WHERE id = $1',
+      [req.user.id]
+    );
+    const row = result.rows[0] || {};
+    res.json({
+      success: true,
+      data: {
+        enabled: !!row.two_factor_enabled,
+        backupCodesRemaining: row.two_factor_enabled ? countBackupCodes(row.two_factor_backup_codes) : 0
+      }
+    });
+  } catch (error) {
+    console.error('Admin 2FA status error:', error);
+    res.status(500).json({ success: false, error: 'Failed to load 2FA status' });
+  }
+});
+
+// Replace the signed-in admin's backup codes (needs a current authenticator code)
+router.post('/admin/2fa/backup-codes', authenticateAdmin, [
+  body('token').matches(/^\d{6}$/)
+], async (req, res) => {
+  try {
+    if (!validationResult(req).isEmpty()) {
+      return res.status(400).json({ success: false, error: 'Enter the 6-digit code from your authenticator app' });
+    }
+    const result = await pool.query(
+      'SELECT two_factor_enabled, two_factor_secret FROM users WHERE id = $1',
+      [req.user.id]
+    );
+    const row = result.rows[0];
+    if (!row?.two_factor_enabled || !row.two_factor_secret) {
+      return res.status(400).json({ success: false, error: '2FA is not turned on' });
+    }
+
+    const speakeasy = require('speakeasy');
+    const valid = speakeasy.totp.verify({ secret: row.two_factor_secret, encoding: 'base32', token: req.body.token, window: 1 });
+    if (!valid) return res.status(400).json({ success: false, error: 'Invalid code' });
+
+    const backupCodes = Array.from({ length: 10 }, () => crypto.randomBytes(4).toString('hex').toUpperCase());
+    await pool.query(
+      'UPDATE users SET two_factor_backup_codes = $1 WHERE id = $2',
+      [JSON.stringify(backupCodes.map(c => crypto.createHash('sha256').update(c).digest('hex'))), req.user.id]
+    );
+
+    res.json({ success: true, data: { backupCodes } });
+  } catch (error) {
+    console.error('Admin backup codes error:', error);
+    res.status(500).json({ success: false, error: 'Failed to create new backup codes' });
+  }
+});
+
 // Admin logout with session cleanup
 router.post('/admin/logout', async (req, res) => {
   try {

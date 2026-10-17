@@ -223,6 +223,19 @@ async function handleEvent(event) {
         nextBillingDate
       }).catch(e => logger.error('Failed to send payment success email:', e));
 
+      // Keep a local payment record (once per invoice — Stripe can resend events) and log it for admins
+      await pool.query(
+        `INSERT INTO billing_history (user_id, stripe_invoice_id, amount_cents, currency, description, status)
+         SELECT $1, $2::VARCHAR, $3, $4, $5, 'paid'
+         WHERE NOT EXISTS (SELECT 1 FROM billing_history WHERE stripe_invoice_id = $2::VARCHAR AND status = 'paid')`,
+        [user.id, obj.id, obj.amount_paid, (obj.currency || 'usd').toUpperCase(), `${tier} subscription payment`]
+      ).catch(e => logger.error('Failed to record billing history:', e));
+      await pool.query(
+        `INSERT INTO system_logs (user_id, level, service, message, metadata)
+         VALUES ($1, 'info', 'billing', 'Payment received', $2)`,
+        [user.id, JSON.stringify({ invoiceId: obj.id, amount: obj.amount_paid, currency: obj.currency, tier })]
+      ).catch(() => {});
+
       logger.info(`Invoice paid: user ${user.id}, amount ${obj.amount_paid} ${obj.currency}`);
       break;
     }

@@ -9,6 +9,18 @@ const { normalizeTier } = require('../utils/tierMapping');
 const PER_USER_LIMIT = Number(process.env.PER_USER_RATE_LIMIT) || 1000;
 const _perUserLimits = new Map();
 
+// Records users.last_active_at (migration 011) at most once per 5 minutes per user,
+// for the admin dashboard's "Active now". Never blocks or fails the request.
+const ACTIVITY_WRITE_MS = 5 * 60 * 1000;
+const _lastActivityWrite = new Map();
+const recordActivity = (userId) => {
+  const now = Date.now();
+  if (now - (_lastActivityWrite.get(userId) || 0) < ACTIVITY_WRITE_MS) return;
+  _lastActivityWrite.set(userId, now);
+  if (_lastActivityWrite.size > 50000) _lastActivityWrite.clear();
+  pool.query('UPDATE users SET last_active_at = CURRENT_TIMESTAMP WHERE id = $1', [userId]).catch(() => {});
+};
+
 // Authentication middleware
 const authenticate = async (req, res, next) => {
   try {
@@ -85,6 +97,8 @@ const authenticate = async (req, res, next) => {
       return res.status(429).json({ success: false, error: 'Rate limit exceeded. Please try again later.' });
     }
     _entry.count++;
+
+    if (!req.isImpersonating) recordActivity(user.id);
 
     next();
   } catch (error) {

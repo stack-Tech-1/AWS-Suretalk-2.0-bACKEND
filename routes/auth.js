@@ -140,6 +140,13 @@ router.post('/register', requireTurnstile, validateRegister, async (req, res) =>
 */
     const createdUser = newUser.rows[0];
 
+    pool.query(
+      `INSERT INTO system_logs (user_id, level, service, message, metadata, ip_address, user_agent)
+       VALUES ($1, 'info', 'auth', 'New account created', $2, $3, $4)`,
+      [createdUser.id, JSON.stringify({ email: createdUser.email, tier: createdUser.subscription_tier }),
+        req.ip || req.connection?.remoteAddress, req.get('user-agent') || '']
+    ).catch(err => console.error('system_log write failed:', err));
+
     // Generate email verification token
     const verificationToken = tokenService.generateEmailVerificationToken(
       createdUser.id,
@@ -1171,8 +1178,13 @@ router.post('/2fa/setup', authenticate, async (req, res) => {
     const speakeasy = require('speakeasy');
     const qrcode = require('qrcode');
 
-    const userResult = await pool.query('SELECT email FROM users WHERE id = $1', [req.user.id]);
+    const userResult = await pool.query('SELECT email, two_factor_enabled FROM users WHERE id = $1', [req.user.id]);
     const email = userResult.rows[0]?.email;
+
+    // Starting setup replaces the secret, which would break a working authenticator — turn 2FA off first
+    if (userResult.rows[0]?.two_factor_enabled) {
+      return res.status(400).json({ success: false, error: '2FA is already turned on. Turn it off first to set it up again.' });
+    }
 
     const secret = speakeasy.generateSecret({
       name: `SureTalk (${email})`,
@@ -1221,6 +1233,12 @@ router.post('/2fa/setup-verify', authenticate, async (req, res) => {
       [JSON.stringify(hashedCodes), req.user.id]
     );
 
+    pool.query(
+      `INSERT INTO system_logs (user_id, level, service, message, metadata, ip_address, user_agent)
+       VALUES ($1, 'info', 'security', '2FA turned on', '{}', $2, $3)`,
+      [req.user.id, req.ip || req.connection?.remoteAddress, req.get('user-agent') || '']
+    ).catch(err => console.error('system_log write failed:', err));
+
     res.json({ success: true, data: { backupCodes } });
   } catch (error) {
     console.error('2FA setup-verify error:', error);
@@ -1249,6 +1267,12 @@ router.post('/2fa/disable', authenticate, async (req, res) => {
        two_factor_backup_codes = '[]' WHERE id = $1`,
       [req.user.id]
     );
+
+    pool.query(
+      `INSERT INTO system_logs (user_id, level, service, message, metadata, ip_address, user_agent)
+       VALUES ($1, 'warning', 'security', '2FA turned off', '{}', $2, $3)`,
+      [req.user.id, req.ip || req.connection?.remoteAddress, req.get('user-agent') || '']
+    ).catch(err => console.error('system_log write failed:', err));
 
     res.json({ success: true, message: '2FA has been disabled' });
   } catch (error) {

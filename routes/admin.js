@@ -1225,138 +1225,119 @@ router.get('/dashboard/stats', authenticateAdmin, async (req, res) => {
 
 
 // Get comprehensive admin dashboard data
+// Counts cover customers only — admin accounts and admin-access applicants are left out.
+const CUSTOMERS_CTE = `
+  customers AS (
+    SELECT * FROM users
+    WHERE deleted_at IS NULL
+      AND COALESCE(is_admin, false) = false
+      AND COALESCE(admin_status, 'none') NOT IN ('pending', 'rejected')
+  )`;
+
+const userStatsSql = (activityColumn) => `
+  WITH ${CUSTOMERS_CTE}
+  SELECT
+    COUNT(*)::int AS total_users,
+    COUNT(*) FILTER (WHERE COALESCE(subscription_tier, 'LITE') = 'LITE')::int AS lite_users,
+    COUNT(*) FILTER (WHERE subscription_tier = 'ESSENTIAL')::int AS essential_users,
+    COUNT(*) FILTER (WHERE subscription_tier IN ('LEGACY_VAULT_PREMIUM', 'PREMIUM'))::int AS premium_users,
+    COUNT(*) FILTER (WHERE subscription_status IN ('active', 'trialing'))::int AS active_users,
+    COUNT(*) FILTER (WHERE ${activityColumn} >= NOW() - INTERVAL '15 minutes')::int AS active_now,
+    COUNT(*) FILTER (WHERE ${activityColumn} >= NOW() - INTERVAL '24 hours')::int AS active_today,
+    COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '7 days')::int AS new_users_7d,
+    COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '30 days')::int AS new_users_30d,
+    COUNT(*) FILTER (WHERE subscription_tier IN ('LEGACY_VAULT_PREMIUM', 'PREMIUM')
+                       AND created_at < NOW() - INTERVAL '30 days')::int AS premium_users_30d_ago
+  FROM customers`;
+
+// Runs an optional dashboard query; one broken table shouldn't blank the whole dashboard
+const safeQuery = async (sql, params, fallback) => {
+  try {
+    return (await pool.query(sql, params)).rows;
+  } catch (error) {
+    console.error('Dashboard query failed:', error.message);
+    return fallback;
+  }
+};
+
 router.get('/dashboard/overview', authenticateAdmin, async (req, res) => {
   try {
-    // Get user statistics
-    const userStats = await pool.query(`
-      SELECT 
-        COUNT(*) as total_users,
-        COUNT(CASE WHEN subscription_tier = 'LITE' THEN 1 END) as lite_users,
-        COUNT(CASE WHEN subscription_tier = 'ESSENTIAL' THEN 1 END) as essential_users,
-        COUNT(CASE WHEN subscription_tier = 'LEGACY_VAULT_PREMIUM' THEN 1 END) as premium_users,
-        COUNT(CASE WHEN subscription_status = 'active' THEN 1 END) as active_users,
-        COUNT(CASE WHEN last_login >= CURRENT_DATE - INTERVAL '1 hour' THEN 1 END) as active_now,
-        COUNT(CASE WHEN created_at >= CURRENT_DATE - INTERVAL '7 days' THEN 1 END) as new_users_7d,
-        COUNT(CASE WHEN last_login >= CURRENT_DATE - INTERVAL '1 day' THEN 1 END) as active_today
-      FROM users
-      WHERE deleted_at IS NULL
-    `);
+    const { getRevenueStats, monthBuckets } = require('../utils/revenueStats');
+    const { getSystemHealth } = require('../utils/systemHealth');
+    const chartStart = monthBuckets()[0].start;
 
-    // Get revenue statistics (current month)
-    const revenueStats = await pool.query(`
-      SELECT 
-        COALESCE(SUM(amount_cents) / 100, 0) as current_month_revenue,
-        COUNT(*) as transaction_count
-      FROM billing_history
-      WHERE status = 'paid'
-        AND created_at >= DATE_TRUNC('month', CURRENT_DATE)
-    `);
+    // last_active_at comes from migration 011; fall back to last_login until it's applied
+    let userStats;
+    try {
+      userStats = (await pool.query(userStatsSql('last_active_at'))).rows[0];
+      userStats.activity_source = 'last_active_at';
+    } catch (error) {
+      if (error.code !== '42703') throw error;
+      userStats = (await pool.query(userStatsSql('last_login'))).rows[0];
+      userStats.activity_source = 'last_login';
+    }
 
-    // Get monthly revenue for chart (last 6 months)
-    const monthlyRevenue = await pool.query(`
-      SELECT 
-        TO_CHAR(DATE_TRUNC('month', created_at), 'Mon') as month,
-        EXTRACT(MONTH FROM created_at) as month_num,
-        COUNT(*) as transactions,
-        COALESCE(SUM(amount_cents) / 100, 0) as revenue,
-        COUNT(DISTINCT user_id) as active_users
-      FROM billing_history
-      WHERE status = 'paid'
-        AND created_at >= CURRENT_DATE - INTERVAL '6 months'
-      GROUP BY DATE_TRUNC('month', created_at), EXTRACT(MONTH FROM created_at)
-      ORDER BY month_num
-    `);
+    const [revenue, signups, recentActivity, platform, health] = await Promise.all([
+      getRevenueStats(),
+      safeQuery(
+        `WITH ${CUSTOMERS_CTE}
+         SELECT TO_CHAR(DATE_TRUNC('month', created_at), 'YYYY-MM') AS key, COUNT(*)::int AS count
+         FROM customers WHERE created_at >= $1 GROUP BY 1`,
+        [chartStart], []
+      ),
+      safeQuery(
+        `SELECT sl.id, sl.message AS action, sl.service, sl.created_at AS time,
+                CASE WHEN sl.level IN ('warn', 'warning') THEN 'warning' ELSE sl.level END AS status,
+                u.full_name AS user_name, u.email AS user_email
+         FROM system_logs sl
+         LEFT JOIN users u ON sl.user_id = u.id
+         WHERE sl.created_at >= NOW() - INTERVAL '7 days'
+           AND sl.level IN ('info', 'warn', 'warning', 'error')
+         ORDER BY sl.created_at DESC
+         LIMIT 10`,
+        [], []
+      ),
+      safeQuery(
+        `SELECT
+           (SELECT COALESCE(SUM(file_size_bytes), 0)::bigint FROM voice_notes WHERE deleted_at IS NULL) AS storage_bytes,
+           (SELECT COUNT(*)::int FROM voice_notes WHERE deleted_at IS NULL) AS voice_notes,
+           (SELECT COUNT(*)::int FROM scheduled_messages WHERE delivery_status = 'scheduled') AS scheduled_pending,
+           (SELECT COUNT(*)::int FROM scheduled_messages
+             WHERE delivery_status <> 'delivered' AND error_message IS NOT NULL
+               AND updated_at >= NOW() - INTERVAL '24 hours') AS delivery_problems_24h,
+           (SELECT COUNT(*)::int FROM system_logs
+             WHERE message IN ('Failed login attempt', 'Failed 2FA attempt')
+               AND created_at >= NOW() - INTERVAL '24 hours')
+           + (SELECT COUNT(*)::int FROM login_attempts
+             WHERE success = false AND is_admin_attempt = true
+               AND created_at >= NOW() - INTERVAL '24 hours') AS failed_logins_24h`,
+        [], [{}]
+      ),
+      getSystemHealth({ force: req.query.refresh === '1' })
+    ]);
 
-    // Get recent activity (last 24 hours)
-    const recentActivity = await pool.query(`
-      SELECT 
-        u.full_name as user_name,
-        CASE 
-          WHEN sl.service = 'voice-notes' THEN 'Created voice note'
-          WHEN sl.service = 'vault' THEN 'Created voice will'
-          WHEN sl.service = 'billing' THEN 'Upgraded subscription'
-          WHEN sl.service = 'scheduled' THEN 'Scheduled message'
-          ELSE sl.message
-        END as action,
-        sl.created_at as time,
-        sl.level as status
-      FROM system_logs sl
-      LEFT JOIN users u ON sl.user_id = u.id
-      WHERE sl.created_at >= CURRENT_DATE - INTERVAL '24 hours'
-        AND sl.level IN ('info', 'error', 'warn')
-      ORDER BY sl.created_at DESC
-      LIMIT 10
-    `);
-
-    // Get system health metrics
-    const systemHealth = await pool.query(`
-      WITH service_stats AS (
-        SELECT 
-          service,
-          COUNT(*) as request_count,
-          AVG(
-            CASE 
-              WHEN metadata->>'responseTime' IS NOT NULL 
-              THEN (metadata->>'responseTime')::NUMERIC 
-              ELSE 50 
-            END
-          ) as avg_latency_ms
-        FROM system_logs
-        WHERE created_at >= CURRENT_DATE - INTERVAL '1 hour'
-          AND level = 'info'
-        GROUP BY service
-      )
-      SELECT 
-        service,
-        request_count,
-        ROUND(avg_latency_ms, 0) as avg_latency_ms,
-        CASE 
-          WHEN avg_latency_ms < 50 THEN 'bg-green-500'
-          WHEN avg_latency_ms < 100 THEN 'bg-yellow-500'
-          ELSE 'bg-red-500'
-        END as status_color,
-        CASE 
-          WHEN request_count > 0 THEN 100
-          ELSE 0
-        END as health_percentage
-      FROM service_stats
-      ORDER BY request_count DESC
-      LIMIT 5
-    `);
-
-    // Get API request rate (last minute)
-    const apiRequests = await pool.query(`
-      SELECT 
-        COUNT(*) as requests_last_minute,
-        EXTRACT(SECOND FROM NOW()) as current_second
-      FROM system_logs
-      WHERE created_at >= CURRENT_TIMESTAMP - INTERVAL '1 minute'
-        AND level = 'info'
-    `);
-
-    // Get storage health
-    const storageHealth = await pool.query(`
-      SELECT 
-        COUNT(*) as total_files,
-        COALESCE(SUM(file_size_bytes), 0) as total_bytes,
-        COUNT(CASE WHEN created_at >= CURRENT_DATE - INTERVAL '1 hour' THEN 1 END) as recent_files
-      FROM voice_notes
-      WHERE deleted_at IS NULL
-    `);
+    const signupsByMonth = Object.fromEntries(signups.map(r => [r.key, r.count]));
+    const monthly = revenue.monthly.map(m => ({ ...m, new_users: signupsByMonth[m.key] || 0 }));
 
     res.json({
       success: true,
       data: {
-        // User stats
-        userStats: userStats.rows[0],
-        revenue: revenueStats.rows[0],
-        monthlyRevenue: monthlyRevenue.rows,
-        recentActivity: recentActivity.rows,
-        systemHealth: systemHealth.rows,
-        apiMetrics: apiRequests.rows[0],
-        storageMetrics: storageHealth.rows[0],
-        lastUpdated: new Date().toISOString(),
-        systemStatus: 'operational' // You can add logic to determine this
+        userStats,
+        revenue: {
+          source: revenue.source,
+          current_month_revenue: revenue.current_month_revenue,
+          transaction_count: revenue.transaction_count,
+          last_month_revenue: revenue.last_month_revenue,
+          last_month_to_date_revenue: revenue.last_month_to_date_revenue,
+          other_currencies: revenue.other_currencies
+        },
+        monthlyRevenue: monthly,
+        recentActivity,
+        systemHealth: health.services,
+        healthCheckedAt: health.checkedAt,
+        systemStatus: health.overall,
+        platform: platform[0] || {},
+        lastUpdated: new Date().toISOString()
       }
     });
 
@@ -1369,6 +1350,90 @@ router.get('/dashboard/overview', authenticateAdmin, async (req, res) => {
   }
 });
 
+
+// Audit log — every admin action recorded by logAdminAudit, newest first
+router.get('/audit-log', authenticateAdmin, async (req, res) => {
+  try {
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 25, 1), 100);
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+    const params = [];
+    const where = [];
+    if (req.query.action) {
+      params.push(req.query.action);
+      where.push(`a.action = $${params.length}`);
+    }
+    if (req.query.search) {
+      params.push(`%${req.query.search}%`);
+      where.push(`(u.email ILIKE $${params.length} OR u.full_name ILIKE $${params.length} OR a.target_id ILIKE $${params.length})`);
+    }
+    const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+
+    const [rows, total, actions] = await Promise.all([
+      pool.query(
+        `SELECT a.id, a.action, a.target_id, a.old_value, a.new_value, a.ip_address::text AS ip_address, a.created_at,
+                u.full_name AS admin_name, u.email AS admin_email
+         FROM admin_audit_log a
+         LEFT JOIN users u ON u.id = a.admin_user_id
+         ${whereSql}
+         ORDER BY a.created_at DESC
+         LIMIT ${limit} OFFSET ${(page - 1) * limit}`,
+        params
+      ),
+      pool.query(`SELECT COUNT(*)::int AS count FROM admin_audit_log a LEFT JOIN users u ON u.id = a.admin_user_id ${whereSql}`, params),
+      pool.query('SELECT DISTINCT action FROM admin_audit_log ORDER BY action')
+    ]);
+
+    res.json({
+      success: true,
+      data: {
+        entries: rows.rows,
+        actions: actions.rows.map(r => r.action),
+        pagination: { page, limit, total: total.rows[0].count, pages: Math.max(1, Math.ceil(total.rows[0].count / limit)) }
+      }
+    });
+  } catch (error) {
+    console.error('Get audit log error:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch audit log' });
+  }
+});
+
+// Admin console sign-in attempts (successful and failed), newest first
+router.get('/admin-login-attempts', authenticateAdmin, async (req, res) => {
+  try {
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 25, 1), 100);
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+    const params = [];
+    let whereSql = 'WHERE is_admin_attempt = true';
+    if (req.query.result === 'failed') whereSql += ' AND success = false';
+    if (req.query.result === 'success') whereSql += ' AND success = true';
+    if (req.query.search) {
+      params.push(`%${req.query.search}%`);
+      whereSql += ` AND (email ILIKE $1 OR ip_address::text ILIKE $1)`;
+    }
+
+    const [rows, total] = await Promise.all([
+      pool.query(
+        `SELECT id, email, ip_address::text AS ip_address, user_agent, success, failure_reason, created_at
+         FROM login_attempts ${whereSql}
+         ORDER BY created_at DESC
+         LIMIT ${limit} OFFSET ${(page - 1) * limit}`,
+        params
+      ),
+      pool.query(`SELECT COUNT(*)::int AS count FROM login_attempts ${whereSql}`, params)
+    ]);
+
+    res.json({
+      success: true,
+      data: {
+        attempts: rows.rows,
+        pagination: { page, limit, total: total.rows[0].count, pages: Math.max(1, Math.ceil(total.rows[0].count / limit)) }
+      }
+    });
+  } catch (error) {
+    console.error('Get admin login attempts error:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch sign-in attempts' });
+  }
+});
 
 // Request admin access
 router.post('/register-request', authenticate, [
