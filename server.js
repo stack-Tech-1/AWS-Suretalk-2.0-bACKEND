@@ -239,6 +239,8 @@ app.use('/api/scheduled', require('./routes/scheduled'));
 app.use('/api/admin', require('./routes/adminUsers'));
 app.use('/api/admin', require('./routes/adminWills'));
 app.use('/api/admin', require('./routes/adminScheduled'));
+app.use('/api/admin', require('./routes/adminLogs'));
+app.use('/api/admin', require('./routes/adminStorage'));
 app.use('/api/admin', require('./routes/admin'));
 app.use('/api/settings', settingsRoutes);
 app.use('/api/devices', devicesRoutes);
