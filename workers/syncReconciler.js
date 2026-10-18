@@ -9,9 +9,9 @@
 // Reported for a person to look at:
 //   - phone sign-in off for an active app customer (may be on purpose, e.g. old unsubscribes)
 //   - an account created by phone whose phone-line account is missing
-//   - voice notes / wills in the app but not on the phone line (keypad slot / will slot) — a Super admin
-//     can copy them with "Copy to the phone line" (POST /api/super-admin/sync/reconcile/:id/copy-content)
-//   - keypad or will slots on the phone line that the app doesn't have
+//   - recordings (voice notes / wills), matched by the recording itself: ones the app lost the slot of,
+//     extra copies on the phone line, ones missing on either side. A Super admin fixes them with
+//     "Fix recordings" (POST /api/super-admin/sync/reconcile/:id/copy-content), which re-reads both sides first.
 // Runs once a night after RUN_HOUR_UTC (a database lock stops two backend copies running it), and on
 // demand from Super admin → Sync monitor. More than MAX_AUTO_FIXES differences = nothing is changed
 // automatically, in case something upstream is wrong.
@@ -70,43 +70,123 @@ async function loadPhoneLineAccounts() {
 
 const countText = (n, word) => (n ? `${n} ${word}${n > 1 ? 's' : ''}` : '');
 
-// For each linked, active customer: app items missing from the phone line, and phone-line slots the app
-// doesn't have. Notes are matched by keypad slot, wills by will slot. Notes without a keypad slot (made
-// before the person had a phone-line account) count as missing; they get a slot when copied.
-async function compareContent(pairs) {
-  if (!pairs.length) return [];
-  const ids = pairs.map(p => p.u.id);
+// The recording a slot or an app item points at, without the link's signature: the last part of the
+// path ("…/stream-s3-recording/voice-notes/<id>/1773918077125-0f90.mp3?exp=…" -> "1773918077125-0f90.mp3");
+// Twilio recording ids ("RE…") stay as they are. Same key on both sides = same recording.
+const recordingKey = (v) => { const s = String(v || '').split('?')[0].replace(/\/+$/, ''); return s ? s.split('/').pop() : ''; };
+
+/**
+ * One side (keypad slots or will slots) for one customer. Recordings are matched by the recording itself
+ * first, so an app note whose slot link was lost is recognised instead of copied again.
+ *   relink:     app items already on the phone line in another slot -> the app adopts that slot
+ *   duplicates: phone slots repeating a recording that's already in another slot (extra copies)
+ *   missing:    app items whose recording isn't on the phone line (get a free slot when copied)
+ *   inAppMissing: phone slots the app has no recording for
+ */
+function planSide(phoneList, slotField, appItems, appSlotOf, maxSlots) {
+  const phone = (phoneList || []).map(s => ({ slot: Number(s[slotField]), key: recordingKey(s.voiceMessage), created: String(s.createdAt || '') })).filter(s => s.slot);
+  // Same recording in several slots: the OLDEST slot is the original and stays (ties: lowest number)
+  const slotsByKey = new Map();
+  for (const p of [...phone].sort((a, b) => (a.created && b.created ? a.created.localeCompare(b.created) : 0) || a.slot - b.slot)) {
+    if (p.key) (slotsByKey.get(p.key) || slotsByKey.set(p.key, []).get(p.key)).push(p.slot);
+  }
+
+  const keep = new Map(); // recording key -> the slot that stays
+  const linkedSlots = new Set();
+  const relink = [], missing = [];
+  for (const a of appItems) {
+    const slots = a.key ? slotsByKey.get(a.key) : null;
+    if (slots && slots.length) {
+      const target = keep.get(a.key) || slots[0];
+      keep.set(a.key, target);
+      linkedSlots.add(target);
+      if (a.appSlot !== target) relink.push({ id: a.id, title: a.title, from: a.appSlot || null, to: target });
+    } else if (a.appSlot && phone.some(p => p.slot === a.appSlot && !p.key)) {
+      linkedSlots.add(a.appSlot); // old slot without a recording address: trust the slot number
+    } else {
+      missing.push(a);
+    }
+  }
+  for (const [key, slots] of slotsByKey) if (!keep.has(key)) keep.set(key, slots[0]);
+  const duplicates = phone.filter(p => p.key && keep.get(p.key) !== p.slot).map(p => ({ slot: p.slot, sameAs: keep.get(p.key) }));
+  const linkedKeys = new Set(appItems.filter(a => a.key && slotsByKey.has(a.key)).map(a => a.key));
+  const inAppMissing = phone.filter(p => !duplicates.some(d => d.slot === p.slot) && !linkedSlots.has(p.slot) && !(p.key && linkedKeys.has(p.key))).map(p => p.slot).sort((a, b) => a - b);
+
+  // Slots a copied item may use: free on the phone line (duplicates count as taken until they're removed)
+  const taken = new Set(phone.map(p => p.slot));
+  const free = []; for (let s = 1; s <= maxSlots; s++) if (!taken.has(s)) free.push(s);
+  return {
+    relink,
+    duplicates: duplicates.sort((a, b) => a.slot - b.slot),
+    missing: missing.slice(0, free.length).map((a, i) => ({ id: a.id, title: a.title, slot: free[i] })),
+    noRoom: Math.max(0, missing.length - free.length),
+    inAppMissing,
+  };
+}
+
+async function loadAppContent(ids) {
   const [notes, wills] = await Promise.all([
     pool.query(
-      `SELECT id, user_id, title, ivr_slot_number, slot_number FROM voice_notes
-       WHERE user_id = ANY($1) AND deleted_at IS NULL AND COALESCE(is_will, false) = false`, [ids]).then(r => r.rows),
+      `SELECT id, user_id, title, ivr_slot_number, slot_number, s3_key, twilio_recording_sid FROM voice_notes
+       WHERE user_id = ANY($1) AND deleted_at IS NULL AND COALESCE(is_will, false) = false ORDER BY created_at`, [ids]).then(r => r.rows),
     pool.query(
-      `SELECT id, user_id, title, will_slot_number FROM voice_wills
-       WHERE user_id = ANY($1) AND deleted_at IS NULL AND admin_removed_at IS NULL`, [ids]).then(r => r.rows),
+      `SELECT id, user_id, title, will_slot_number, s3_key, twilio_recording_sid FROM voice_wills
+       WHERE user_id = ANY($1) AND deleted_at IS NULL AND admin_removed_at IS NULL ORDER BY created_at`, [ids]).then(r => r.rows),
   ]);
   const group = (rows) => rows.reduce((m, r) => (m.get(r.user_id) || m.set(r.user_id, []).get(r.user_id)).push(r) && m, new Map());
-  const notesBy = group(notes), willsBy = group(wills);
+  return { notesBy: group(notes), willsBy: group(wills) };
+}
+
+// For each linked, active customer: what matches, what to relink, extra copies, and what's missing where
+async function compareContent(pairs) {
+  if (!pairs.length) return [];
+  const { notesBy, willsBy } = await loadAppContent(pairs.map(p => p.u.id));
   return pairs.map(({ u, acct }) => {
     const plan = limitsFor(u.subscription_tier);
-    const phoneSlots = new Set((acct.slots || []).map(s => Number(s.slotNumber)));
-    const phoneWills = new Set((acct.voiceWillSlots || []).map(w => Number(w.willSlotNumber)));
-    const myNotes = notesBy.get(u.id) || [], myWills = willsBy.get(u.id) || [];
-    const appSlots = new Set(myNotes.map(n => n.ivr_slot_number || n.slot_number).filter(Boolean));
-    const appWillSlots = new Set(myWills.map(w => w.will_slot_number).filter(Boolean));
-    const item = (x, slot) => ({ id: x.id, slot: slot || null, title: x.title || null });
+    const notes = (notesBy.get(u.id) || []).map(n => ({ id: n.id, title: n.title, appSlot: n.ivr_slot_number || n.slot_number || null, key: recordingKey(n.twilio_recording_sid || n.s3_key) }));
+    const wills = (willsBy.get(u.id) || []).map(w => ({ id: w.id, title: w.title, appSlot: w.will_slot_number || null, key: recordingKey(w.twilio_recording_sid || w.s3_key) }));
     return {
-      u,
-      missingOnPhone: {
-        notes: myNotes.filter(n => !n.ivr_slot_number ? true : n.ivr_slot_number <= plan.slots && !phoneSlots.has(n.ivr_slot_number))
-          .slice(0, plan.slots).map(n => item(n, n.ivr_slot_number)),
-        wills: plan.wills ? myWills.filter(w => !w.will_slot_number || !phoneWills.has(w.will_slot_number)).map(w => item(w, w.will_slot_number)) : [],
-      },
-      missingInApp: {
-        notes: [...phoneSlots].filter(s => !appSlots.has(s)).sort((a, b) => a - b),
-        wills: [...phoneWills].filter(s => !appWillSlots.has(s)).sort((a, b) => a - b),
-      },
+      u, acct,
+      notes: planSide(acct.slots, 'slotNumber', notes, null, plan.slots),
+      wills: plan.wills ? planSide(acct.voiceWillSlots, 'willSlotNumber', wills, null, plan.wills) : planSide([], 'willSlotNumber', [], null, 0),
     };
   });
+}
+
+/**
+ * The "Fix recordings" button: re-reads both sides NOW (never an old report) for these customers and
+ *   1. relinks app items that are already on the phone line,
+ *   2. removes extra copies from the phone line (a slot repeating another slot's recording),
+ *   3. copies what's missing into slots that are free on the phone line.
+ * Nothing in the app is deleted. Returns what was done per customer.
+ */
+async function fixContent(userIds) {
+  const phoneLineContent = require('../utils/phoneLineContent');
+  const users = (await pool.query(
+    `SELECT id, full_name, email, phone, subscription_tier FROM users WHERE id = ANY($1) AND deleted_at IS NULL AND phone IS NOT NULL`,
+    [userIds]
+  )).rows;
+  const byKey = new Map((await loadPhoneLineAccounts()).map(a => [phoneKey(a.userId), a]));
+  const pairs = users.map(u => ({ u, acct: byKey.get(phoneKey(u.phone)) })).filter(p => p.acct);
+  const plans = await compareContent(pairs);
+  const results = [];
+  for (const p of plans) {
+    const r = { userId: p.u.id, name: p.u.full_name || p.u.email, relinked: 0, duplicatesRemoved: 0, notes: 0, wills: 0 };
+    for (const x of p.notes.relink) { await pool.query('UPDATE voice_notes SET ivr_slot_number = $1 WHERE id = $2', [x.to, x.id]); r.relinked++; }
+    for (const x of p.wills.relink) { await pool.query('UPDATE voice_wills SET will_slot_number = $1 WHERE id = $2', [x.to, x.id]); r.relinked++; }
+    for (const d of p.notes.duplicates) { await phoneLineContent.removeNote(p.u.phone, d.slot); r.duplicatesRemoved++; }
+    for (const d of p.wills.duplicates) { await phoneLineContent.removeWill(p.u.phone, d.slot); r.duplicatesRemoved++; }
+    for (const m of p.notes.missing) {
+      const note = (await pool.query('UPDATE voice_notes SET ivr_slot_number = $1 WHERE id = $2 RETURNING *', [m.slot, m.id])).rows[0];
+      await phoneLineContent.sendNote(p.u.phone, note); r.notes++;
+    }
+    for (const m of p.wills.missing) {
+      const will = (await pool.query('UPDATE voice_wills SET will_slot_number = $1 WHERE id = $2 RETURNING *', [m.slot, m.id])).rows[0];
+      await phoneLineContent.sendWill(p.u.phone, will); r.wills++;
+    }
+    results.push(r);
+  }
+  return results;
 }
 
 async function failedSyncCounts() {
@@ -194,23 +274,42 @@ async function runReconcile({ trigger = 'manual', runBy = null, applyFixes = tru
     // Recordings and wills: what each side has, by keypad slot / will slot. Never changed automatically:
     // a Super admin reviews the list and presses "Copy to the phone line".
     const content = await compareContent(contentToCompare);
+    const both = (n, w, nw, ww) => [countText(n, nw), countText(w, ww)].filter(Boolean).join(' and ');
+    const slotList = (word, slots) => `${word} slot${slots.length > 1 ? 's' : ''} ${slots.join(', ')}`;
     for (const c of content) {
-      const u = c.u;
-      if (c.missingOnPhone.notes.length || c.missingOnPhone.wills.length) {
+      const u = c.u, N = c.notes, W = c.wills;
+      if (N.relink.length || W.relink.length) {
         issues.push({
-          ...who(u), type: 'CONTENT_MISSING_ON_PHONE_LINE', fixable: true,
-          label: `${countText(c.missingOnPhone.notes.length, 'voice note')}${c.missingOnPhone.notes.length && c.missingOnPhone.wills.length ? ' and ' : ''}${countText(c.missingOnPhone.wills.length, 'voice will')} in the app but not on their phone line`,
-          items: c.missingOnPhone,
+          ...who(u), type: 'CONTENT_RELINK', fixable: true,
+          label: `${both(N.relink.length, W.relink.length, 'voice note', 'voice will')} already on the phone line, but the app lost which slot: the app will be relinked (nothing is copied)`,
+          items: { notes: N.relink, wills: W.relink },
         });
       }
-      if (c.missingInApp.notes.length || c.missingInApp.wills.length) {
+      if (N.duplicates.length || W.duplicates.length) {
+        issues.push({
+          ...who(u), type: 'PHONE_DUPLICATE_SLOTS', fixable: true,
+          label: `Extra copies on the phone line: ${[
+            ...N.duplicates.map(d => `keypad ${d.slot} repeats keypad ${d.sameAs}`),
+            ...W.duplicates.map(d => `will slot ${d.slot} repeats will slot ${d.sameAs}`),
+          ].join('; ')}. The extra copies will be removed.`,
+          items: { notes: N.duplicates, wills: W.duplicates },
+        });
+      }
+      if (N.missing.length || W.missing.length) {
+        issues.push({
+          ...who(u), type: 'CONTENT_MISSING_ON_PHONE_LINE', fixable: true,
+          label: `${both(N.missing.length, W.missing.length, 'voice note', 'voice will')} in the app but not on their phone line${N.noRoom || W.noRoom ? ` (${N.noRoom + W.noRoom} more won't fit: no free slots)` : ''}`,
+          items: { notes: N.missing, wills: W.missing },
+        });
+      }
+      if (N.inAppMissing.length || W.inAppMissing.length) {
         issues.push({
           ...who(u), type: 'CONTENT_MISSING_IN_APP',
           label: `On the phone line but not in the app: ${[
-            c.missingInApp.notes.length ? `keypad slot${c.missingInApp.notes.length > 1 ? 's' : ''} ${c.missingInApp.notes.join(', ')}` : '',
-            c.missingInApp.wills.length ? `will slot${c.missingInApp.wills.length > 1 ? 's' : ''} ${c.missingInApp.wills.join(', ')}` : '',
+            N.inAppMissing.length ? slotList('keypad', N.inAppMissing) : '',
+            W.inAppMissing.length ? slotList('will', W.inAppMissing) : '',
           ].filter(Boolean).join('; ')}`,
-          items: c.missingInApp,
+          items: { notes: N.inAppMissing, wills: W.inAppMissing },
         });
       }
     }
@@ -278,4 +377,4 @@ const startReconciler = () => {
   setInterval(nightlyTick, CHECK_EVERY_MS);
 };
 
-module.exports = { runReconcile, startReconciler, nightlyTick, phoneKey, MAX_AUTO_FIXES };
+module.exports = { runReconcile, startReconciler, nightlyTick, phoneKey, MAX_AUTO_FIXES, fixContent, recordingKey, planSide };

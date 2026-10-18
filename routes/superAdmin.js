@@ -691,8 +691,10 @@ router.post('/sync/reconcile/run', authenticateSuperAdmin, async (req, res) => {
   }
 });
 
-// Copy the recordings / wills a report found in the app but not on the phone line. Only what that report
-// listed is sent (a Super admin has reviewed it); optional userIds narrows it to some customers.
+// "Fix recordings" for the customers a report flagged (relink / remove extra copies / copy missing).
+// Both sides are re-read when the button is pressed, so it never acts on stale information.
+// Optional userIds narrows it to some customers.
+const CONTENT_FIX_TYPES = ['CONTENT_RELINK', 'PHONE_DUPLICATE_SLOTS', 'CONTENT_MISSING_ON_PHONE_LINE'];
 router.post('/sync/reconcile/:id/copy-content', authenticateSuperAdmin, [
   body('userIds').optional().isArray({ max: 500 }),
 ], async (req, res) => {
@@ -701,21 +703,17 @@ router.post('/sync/reconcile/:id/copy-content', authenticateSuperAdmin, [
     const report = (await pool.query('SELECT id, issues FROM sync_reconcile_reports WHERE id = $1', [req.params.id])).rows[0];
     if (!report) return res.status(404).json({ success: false, error: 'Report not found' });
     const wanted = Array.isArray(req.body.userIds) ? new Set(req.body.userIds) : null;
-    const todo = (report.issues || []).filter(i => i.type === 'CONTENT_MISSING_ON_PHONE_LINE' && i.userId && (!wanted || wanted.has(i.userId)));
-    if (!todo.length) return res.status(400).json({ success: false, error: 'Nothing to copy in this report' });
+    const userIds = [...new Set((report.issues || [])
+      .filter(i => CONTENT_FIX_TYPES.includes(i.type) && i.userId && (!wanted || wanted.has(i.userId)))
+      .map(i => i.userId))];
+    if (!userIds.length) return res.status(400).json({ success: false, error: 'Nothing to fix in this report' });
 
-    const { pushAllToPhoneLine } = require('../utils/phoneLineContent');
-    const results = [];
-    for (const i of todo) {
-      const only = { notes: (i.items?.notes || []).map(x => x.id), wills: (i.items?.wills || []).map(x => x.id) };
-      try {
-        const sent = await pushAllToPhoneLine(i.userId, { only });
-        results.push({ userId: i.userId, name: i.name, ...sent });
-      } catch (err) {
-        results.push({ userId: i.userId, name: i.name, error: err.message });
-      }
-    }
-    const totals = results.reduce((t, r) => ({ notes: t.notes + (r.notes || 0), wills: t.wills + (r.wills || 0), failed: t.failed + (r.error ? 1 : 0) }), { notes: 0, wills: 0, failed: 0 });
+    const { fixContent } = require('../workers/syncReconciler');
+    const results = await fixContent(userIds);
+    const totals = results.reduce((t, r) => ({
+      relinked: t.relinked + r.relinked, duplicatesRemoved: t.duplicatesRemoved + r.duplicatesRemoved,
+      notes: t.notes + r.notes, wills: t.wills + r.wills,
+    }), { relinked: 0, duplicatesRemoved: 0, notes: 0, wills: 0 });
     logAdminAudit({ userId: req.user.id, action: 'SYNC_CONTENT_COPY', targetId: report.id, newValue: { customers: results.length, ...totals }, ipAddress: req.ip });
     res.json({ success: true, data: { customers: results.length, ...totals, results } });
   } catch (err) {
