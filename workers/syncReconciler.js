@@ -112,15 +112,19 @@ function planSide(phoneList, slotField, appItems, appSlotOf, maxSlots) {
   const linkedKeys = new Set(appItems.filter(a => a.key && slotsByKey.has(a.key)).map(a => a.key));
   const inAppMissing = phone.filter(p => !duplicates.some(d => d.slot === p.slot) && !linkedSlots.has(p.slot) && !(p.key && linkedKeys.has(p.key))).map(p => p.slot).sort((a, b) => a - b);
 
-  // Slots a copied item may use: free on the phone line (duplicates count as taken until they're removed)
+  // Slots a copied item may use: free on the phone line (duplicates count as taken until they're removed).
+  // The phone line's limit counts recordings, not slot numbers, so a slot number used twice uses two.
   const taken = new Set(phone.map(p => p.slot));
-  const free = []; for (let s = 1; s <= maxSlots; s++) if (!taken.has(s)) free.push(s);
+  const room = Math.max(0, maxSlots - phone.length);
+  const free = []; for (let s = 1; s <= maxSlots && free.length < room; s++) if (!taken.has(s)) free.push(s);
+  const counts = phone.reduce((m, p) => m.set(p.slot, (m.get(p.slot) || 0) + 1), new Map());
   return {
     relink,
     duplicates: duplicates.sort((a, b) => a.slot - b.slot),
     missing: missing.slice(0, free.length).map((a, i) => ({ id: a.id, title: a.title, slot: free[i] })),
     noRoom: Math.max(0, missing.length - free.length),
     inAppMissing,
+    repeatedSlots: [...counts].filter(([, n]) => n > 1).map(([s]) => s).sort((a, b) => a - b),
   };
 }
 
@@ -300,6 +304,15 @@ async function runReconcile({ trigger = 'manual', runBy = null, applyFixes = tru
           ...who(u), type: 'CONTENT_MISSING_ON_PHONE_LINE', fixable: true,
           label: `${both(N.missing.length, W.missing.length, 'voice note', 'voice will')} in the app but not on their phone line${N.noRoom || W.noRoom ? ` (${N.noRoom + W.noRoom} more won't fit: no free slots)` : ''}`,
           items: { notes: N.missing, wills: W.missing },
+        });
+      }
+      if (N.repeatedSlots.length || W.repeatedSlots.length) {
+        issues.push({
+          ...who(u), type: 'PHONE_SLOT_NUMBER_REPEATED',
+          label: `On the phone line, ${[
+            ...N.repeatedSlots.map(s => `keypad ${s}`), ...W.repeatedSlots.map(s => `will slot ${s}`),
+          ].join(', ')} holds more than one recording. Decide which to keep before copying anything to this customer.`,
+          items: { notes: N.repeatedSlots, wills: W.repeatedSlots },
         });
       }
       if (N.inAppMissing.length || W.inAppMissing.length) {
