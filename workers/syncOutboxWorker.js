@@ -2,6 +2,7 @@ const axios = require('axios');
 const { pool } = require('../config/database');
 const logger = require('../utils/logger');
 const emailService = require('../utils/emailService');
+const { isNothingToUpdate, markSkipped } = require('../utils/syncIvr');
 
 const MAX_ATTEMPTS = 5;
 const POLL_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
@@ -58,6 +59,11 @@ const processOutbox = async () => {
       logger.info(`sync_outbox: sent ${row.event_type} (id=${row.id})`);
 
     } catch (err) {
+      // Nothing to update on the phone line (e.g. no phone-line account): skip, don't retry or alert
+      if (isNothingToUpdate(err)) {
+        await markSkipped(row.id, err);
+        continue;
+      }
       const newAttempts = (row.attempts || 0) + 1;
       const newStatus = newAttempts >= MAX_ATTEMPTS ? 'dead' : 'failed';
 

@@ -901,6 +901,11 @@ if (process.env.NODE_ENV === 'production' || process.env.ENABLE_SCHEDULER === 't
   const { startSyncOutboxWorker } = require('./workers/syncOutboxWorker');
   startSyncOutboxWorker();
   logger.info('Sync outbox worker started');
+
+  // Nightly app ↔ phone-line comparison (runs once a night on one backend copy)
+  const { startReconciler } = require('./workers/syncReconciler');
+  startReconciler();
+  logger.info('Sync reconciler started');
 }
 
 // Start server

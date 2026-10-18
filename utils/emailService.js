@@ -441,6 +441,49 @@ class EmailService {
   }
 
   // ══════════════════════════════════════════════════════════════════════════
+  // 15. INTERNAL: NIGHTLY APP ↔ PHONE LINE COMPARISON (to ADMIN_EMAIL)
+  // ══════════════════════════════════════════════════════════════════════════
+  async sendReconcileReport(toEmail, { summary, fixes = [], issues = [] }) {
+    const reviewUrl = `${this.siteUrl}/adminDashboard/super`;
+    const line = (x) => `${x.label}${x.email || x.name ? ` — ${x.name || ''}${x.email ? ` (${x.email})` : ''}` : ''}`;
+    const html = t.render({
+      category: 'Admin', accent: issues.length ? 'urgent' : 'brand', title: 'Nightly app and phone line check',
+      subtitle: `${summary.fixes} fixed automatically · ${summary.needsAttention} need a look`,
+      preheader: `${summary.fixes} differences fixed, ${summary.needsAttention} need attention.`,
+      reason: "You're receiving this because this address is set as SureTalk's admin alert address.",
+      body: [
+        t.details([
+          ['Customers checked', String(summary.appCustomers)],
+          ['Phone-line accounts', String(summary.phoneLineAccounts)],
+          ['Fixed automatically', summary.fixesApplied || !summary.fixes ? String(summary.fixes) : `${summary.fixes} (not applied: over the safety limit)`],
+          ['Need a look', String(summary.needsAttention)],
+          ['Failed syncs (app → phone line)', String(summary.appFailedSyncs)],
+          ['Failed syncs (phone line → app)', summary.phoneLineFailedSyncs == null ? 'Could not read' : String(summary.phoneLineFailedSyncs)],
+        ]),
+        fixes.length ? t.p(t.b(summary.fixesApplied ? 'Fixed automatically' : 'Differences found (not changed)')) : '',
+        fixes.length ? t.list(fixes.slice(0, 20).map(line)) : '',
+        issues.length ? t.p(t.b('Need a look')) : '',
+        issues.length ? t.list(issues.slice(0, 20).map(line)) : '',
+        (fixes.length > 20 || issues.length > 20) ? t.p('The full list is on the Super admin page.', { muted: true, small: true }) : '',
+        t.button('Open the Sync monitor', reviewUrl, { tone: issues.length ? 'urgent' : 'primary' }),
+      ].filter(Boolean)
+    });
+    return this._send({
+      to: toEmail,
+      subject: `[SureTalk] Nightly check: ${summary.fixes} fixed, ${summary.needsAttention} need a look`,
+      html,
+      text: [
+        'SureTalk nightly app and phone line check', '',
+        `Fixed automatically: ${summary.fixes}${summary.fixesApplied || !summary.fixes ? '' : ' (not applied: over the safety limit)'}`,
+        ...fixes.slice(0, 20).map(f => `  - ${line(f)}`),
+        `Need a look: ${summary.needsAttention}`,
+        ...issues.slice(0, 20).map(i => `  - ${line(i)}`), '',
+        `Details: ${reviewUrl}`
+      ].join('\n')
+    });
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
   // 14. INTERNAL: A SYNC TO THE PHONE LINE FAILED FOR GOOD (to ADMIN_EMAIL)
   // ══════════════════════════════════════════════════════════════════════════
   async sendSyncFailureAlert(toEmail, { recordId, eventType, error, payload }) {

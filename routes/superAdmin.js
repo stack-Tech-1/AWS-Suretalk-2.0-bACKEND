@@ -10,6 +10,8 @@ const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
 const { DynamoDBDocumentClient, GetCommand } = require('@aws-sdk/lib-dynamodb');
 const { NodeHttpHandler } = require('@smithy/node-http-handler');
 const { applyPlan, setActive, STRIPE_MANAGED, TIER_LIMITS, TIERS } = require('./adminUsers');
+const phoneLineQueue = require('../utils/phoneLineQueue');
+const { phoneKey } = require('../workers/syncReconciler');
 
 const dynamoClient = new DynamoDBClient({
   region: process.env.AWS_REGION || 'eu-central-1',
@@ -533,11 +535,28 @@ router.get('/sync/dead-letters', authenticateSuperAdmin, async (req, res) => {
        ORDER BY so.created_at DESC
        LIMIT 200`
     );
+    // The phone line's own failures (changes made on a call that never reached the app)
+    let phoneLine = { items: [], error: null };
+    try {
+      const items = await phoneLineQueue.listDead();
+      const phones = [...new Set(items.map(i => phoneKey(i.phone)).filter(Boolean))];
+      const owners = phones.length ? (await pool.query(
+        `SELECT id, full_name, email, phone FROM users WHERE deleted_at IS NULL AND phone IS NOT NULL`
+      )).rows.filter(u => phones.includes(phoneKey(u.phone))) : [];
+      phoneLine.items = items.map(i => {
+        const owner = owners.find(u => phoneKey(u.phone) === phoneKey(i.phone));
+        return { ...i, user_id: owner?.id || null, user_name: owner?.full_name || null, user_email: owner?.email || null };
+      });
+    } catch (err) {
+      console.error('Phone-line queue read failed:', err.message);
+      phoneLine.error = 'Could not read the phone line\'s failed items right now.';
+    }
     res.json({
       success: true,
       data: {
         deadLetters: r.rows.map(d => ({ ...d, label: EVENT_LABELS[d.event_type] || d.event_type, editable: d.event_type === 'sync-slot' })),
-        total: r.rows.length
+        total: r.rows.length,
+        phoneLine
       }
     });
   } catch (err) {
@@ -614,6 +633,60 @@ router.post('/sync/:id/dismiss', authenticateSuperAdmin, [
   }
 });
 
+// ── Phone line → app failures: retry / dismiss (needs dynamodb:UpdateItem on SyncOutbox) ──
+const phoneLineAction = (fn, auditAction) => async (req, res) => {
+  try {
+    const reason = req.body?.reason?.trim();
+    if (auditAction === 'PHONE_SYNC_DISMISS' && (!reason || reason.length < 3)) {
+      return res.status(400).json({ success: false, error: 'Give a reason for dismissing it' });
+    }
+    await fn(req.params.id, reason, req.user.id);
+    logAdminAudit({ userId: req.user.id, action: auditAction, targetId: String(req.params.id), newValue: reason ? { reason } : null, ipAddress: req.ip });
+    res.json({ success: true, message: auditAction === 'PHONE_SYNC_RETRY' ? 'Queued: the phone line will send it again within about 2 minutes' : 'Dismissed' });
+  } catch (err) {
+    if (err.name === 'ConditionalCheckFailedException') return res.status(404).json({ success: false, error: 'Not found, or no longer failed' });
+    if (phoneLineQueue.isAccessDenied(err)) {
+      return res.status(403).json({ success: false, code: 'NEEDS_PERMISSION', error: 'The backend is not yet allowed to change the phone line\'s queue. Run the phase 5 permission script, then try again.' });
+    }
+    console.error('Phone-line queue action failed:', err.message);
+    res.status(500).json({ success: false, error: 'Failed to update the phone line\'s queue' });
+  }
+};
+router.post('/sync/phone-line/:id/retry', authenticateSuperAdmin,
+  phoneLineAction((id, _reason, adminId) => phoneLineQueue.retry(id, adminId), 'PHONE_SYNC_RETRY'));
+router.post('/sync/phone-line/:id/dismiss', authenticateSuperAdmin,
+  phoneLineAction((id, reason, adminId) => phoneLineQueue.dismiss(id, reason, adminId), 'PHONE_SYNC_DISMISS'));
+
+// ── Nightly app ↔ phone line comparison ──────────────────────────────────────
+router.get('/sync/reconcile', authenticateSuperAdmin, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT rr.id, rr.trigger, rr.started_at, rr.finished_at, rr.summary, rr.fixes, rr.issues, rr.error, u.full_name AS run_by_name
+       FROM sync_reconcile_reports rr LEFT JOIN users u ON u.id = rr.run_by
+       ORDER BY rr.started_at DESC LIMIT 10`
+    );
+    const [latest, ...history] = r.rows;
+    res.json({ success: true, data: { latest: latest || null, history: history.map(({ fixes, issues, ...h }) => h) } });
+  } catch (err) {
+    if (err.code === '42P01') return res.json({ success: true, data: { latest: null, history: [], needsMigration: true } });
+    console.error('Reconcile report read failed:', err.message);
+    res.status(500).json({ success: false, error: 'Failed to load the nightly check' });
+  }
+});
+
+router.post('/sync/reconcile/run', authenticateSuperAdmin, async (req, res) => {
+  try {
+    const { runReconcile } = require('../workers/syncReconciler');
+    const report = await runReconcile({ trigger: 'manual', runBy: req.user.id });
+    logAdminAudit({ userId: req.user.id, action: 'SYNC_RECONCILE_RUN', newValue: report.summary, ipAddress: req.ip });
+    res.json({ success: true, data: report });
+  } catch (err) {
+    if (err.code === '42P01') return res.status(409).json({ success: false, error: 'Run database update 018 first.' });
+    console.error('Manual reconcile failed:', err.message);
+    res.status(500).json({ success: false, error: 'The check could not finish. Try again in a moment.' });
+  }
+});
+
 // ── Overview (KPI cards) + activity ──────────────────────────────────────────
 router.get('/overview', authenticateSuperAdmin, async (req, res) => {
   try {
@@ -648,12 +721,14 @@ router.get('/overview', authenticateSuperAdmin, async (req, res) => {
                   FROM analytics_events ae JOIN users u ON ae.user_id = u.id
                   ORDER BY ae.created_at DESC LIMIT 30`),
     ]);
+    let phoneLineDead = null;
+    try { phoneLineDead = (await phoneLineQueue.counts()).byStatus.dead || 0; } catch { /* shown as unknown */ }
     res.json({
       success: true,
       data: {
         users: userStats.rows[0],
         content: { ...contentStats.rows[0], total_storage_bytes: Number(contentStats.rows[0].total_storage_bytes) },
-        sync: syncStats.rows[0],
+        sync: { ...syncStats.rows[0], phone_line_dead: phoneLineDead },
         adminActions: adminActions.rows,
         recentActivity: userActivity.rows
       }
@@ -736,17 +811,28 @@ router.get('/sync-health', authenticateSuperAdmin, async (req, res) => {
     }
     const delivered = stats.sent || 0;
     const finished = delivered + (stats.dead || 0);
+    // The phone line's own queue (phone line → app); read-only, so a failure here doesn't break the page
+    let queue = null;
+    try {
+      const c = await phoneLineQueue.counts();
+      queue = { sent: c.byStatus.sent || 0, pending: (c.byStatus.pending || 0) + (c.byStatus.failed || 0), dead: c.byStatus.dead || 0, dismissed: c.byStatus.dismissed || 0, byEvent: c.byEvent };
+    } catch (err) {
+      console.warn('Phone-line queue counts failed:', err.message);
+    }
     res.json({
       success: true,
       data: {
         appToIvr: {
           sent: delivered, pending: (stats.pending || 0) + (stats.failed || 0), dead: stats.dead || 0, dismissed: stats.dismissed || 0,
+          // Nothing to update on the phone line (e.g. a website-only customer); not a failure
+          skipped: stats.skipped || 0,
           successRate: finished ? Math.round((delivered / finished) * 1000) / 10 : null,
           sent7d: last.rows[0].sent_7d, lastSuccess: last.rows[0].last_success, byEvent: events, recentFailures: failures.rows
         },
         ivrToApp: {
           breakdown: received.rows.map(r => ({ ...r, label: r.event_type.replace(/_/g, ' ') })),
-          lastReceived: lastReceived.rows[0]?.at || null
+          lastReceived: lastReceived.rows[0]?.at || null,
+          queue
         }
       }
     });

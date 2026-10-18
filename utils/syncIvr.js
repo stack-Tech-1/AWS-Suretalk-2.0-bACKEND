@@ -58,9 +58,30 @@ const syncToIvr = async (payload, endpointPath, client) => {
     );
     logger.info(`Synced to IVR: ${endpointPath} (outbox id=${outboxId})`);
   } catch (err) {
+    if (isNothingToUpdate(err)) {
+      await markSkipped(outboxId, err);
+      return;
+    }
     // Leave as 'pending' — outbox worker will retry
     logger.warn(`Sync to IVR failed (will retry via outbox): ${err.message}`);
   }
+};
+
+/**
+ * The phone line answered 404 "User not found" / "Slot not found": there is nothing there to update
+ * (e.g. a website-only customer who has no phone-line account). Retrying can't help, so the item is
+ * marked 'skipped' instead of failing 5 times and raising an alert.
+ */
+const isNothingToUpdate = (err) =>
+  err?.response?.status === 404 && /not found/i.test(String(err.response?.data?.error || err.response?.data || ''));
+
+const markSkipped = async (outboxId, err) => {
+  const reason = String(err?.response?.data?.error || 'Not found on the phone line');
+  await pool.query(
+    `UPDATE sync_outbox SET status = 'skipped', error_message = $2, last_attempt_at = NOW() WHERE id = $1`,
+    [outboxId, `${reason} (nothing to update on the phone line)`]
+  ).catch(e => logger.error(`sync_outbox skip update failed: ${e.message}`));
+  logger.info(`Sync skipped (${reason}), outbox id=${outboxId}`);
 };
 
 /**
@@ -74,4 +95,4 @@ const syncAccountToIvr = (phone, fields) => {
   return syncToIvr({ userId: phone, source: 'app', ...fields }, 'sync-user');
 };
 
-module.exports = { syncToIvr, syncAccountToIvr };
+module.exports = { syncToIvr, syncAccountToIvr, isNothingToUpdate, markSkipped };
