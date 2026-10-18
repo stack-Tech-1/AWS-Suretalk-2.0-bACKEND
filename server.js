@@ -267,6 +267,19 @@ const phoneDigitVariants = (phone) => {
   return [d];
 };
 
+// The live app account for a phone-line number, however the number was stored
+const findUserIdByPhone = async (phone) => {
+  if (!phone) return null;
+  const exact = await pool.query('SELECT id FROM users WHERE phone = $1 AND deleted_at IS NULL LIMIT 1', [phone]);
+  if (exact.rows.length) return exact.rows[0].id;
+  const r = await pool.query(
+    `SELECT id FROM users WHERE regexp_replace(phone, '[^0-9]', '', 'g') = ANY($1) AND deleted_at IS NULL
+     ORDER BY created_at LIMIT 1`,
+    [phoneDigitVariants(phone)]
+  );
+  return r.rows[0]?.id || null;
+};
+
 // Auth middleware for sync routes (use shared token, not user auth)
 const syncAuth = (req, res, next) => {
   const auth = req.headers.authorization;
@@ -441,33 +454,38 @@ app.post('/api/sync/slot', syncAuth, async (req, res) => {
       [action || 'unknown', JSON.stringify(req.body)]
     );
 
-    // 1. Find internal user_id from phone
-    const userResult = await pool.query(
-      'SELECT id FROM users WHERE phone = $1',
-      [userId]
-    );
-
-    if (userResult.rows.length === 0) {
+    // 1. Find internal user_id from phone (stored with or without +1)
+    const dbUserId = await findUserIdByPhone(userId);
+    if (!dbUserId) {
       return res.status(404).json({ success: false, error: 'User not found' });
     }
-
-    const dbUserId = userResult.rows[0].id;
+    const slotNum = parseInt(slotNumber, 10) || null;
+    const isWill = type === 'will' || type === 'voiceWill';
 
     if (action === 'delete') {
-      // Delete by user_id + voiceMessage (s3_key)
-      const deleteResult = await pool.query(
-        `DELETE FROM voice_notes
-         WHERE user_id = $1 AND s3_key = $2
-         RETURNING id`,
-        [dbUserId, voiceMessage]
-      );
-
-      if (deleteResult.rowCount === 0) {
-        console.warn(`No voice note found to delete for user ${userId}, s3_key ${voiceMessage}`);
+      if (isWill) {
+        await pool.query(
+          `UPDATE voice_wills SET deleted_at = NOW() WHERE user_id = $1 AND will_slot_number = $2 AND deleted_at IS NULL`,
+          [dbUserId, slotNum]
+        );
+      } else {
+        // Soft delete (kept for records, like every other delete). Match the recording itself, or the
+        // keypad slot — notes made in the app have a different recording address on the phone line.
+        const deleteResult = await pool.query(
+          `UPDATE voice_notes SET deleted_at = NOW()
+           WHERE user_id = $1 AND deleted_at IS NULL
+             AND (($2::text IS NOT NULL AND s3_key = $2)
+               OR ($3::int IS NOT NULL AND (ivr_slot_number = $3 OR (ivr_slot_number IS NULL AND slot_number = $3))))
+           RETURNING id`,
+          [dbUserId, voiceMessage || null, slotNum]
+        );
+        if (deleteResult.rowCount === 0) {
+          console.warn(`No voice note found to delete for user ${userId}, slot ${slotNum}`);
+        }
       }
     } else if (action === 'create' || action === 'update') {
       // If IVR explicitly marks this slot as a will, route to voice_wills
-      if (type === 'will') {
+      if (isWill) {
         const isTwilioSid = voiceMessage &&
           typeof voiceMessage === 'string' &&
           voiceMessage.startsWith('RE') &&
@@ -480,20 +498,20 @@ app.post('/api/sync/slot', syncAuth, async (req, res) => {
 
         const existingWill = await pool.query(
           `SELECT id FROM voice_wills WHERE user_id = $1 AND will_slot_number = $2 AND deleted_at IS NULL`,
-          [dbUserId, slotNumber]
+          [dbUserId, slotNum]
         );
 
         if (existingWill.rows.length === 0) {
           await pool.query(
             `INSERT INTO voice_wills (user_id, will_slot_number, s3_key, twilio_recording_sid, source, created_at)
              VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING`,
-            [dbUserId, slotNumber, s3KeyValue, twilioRecordingSid, source, createdAt || new Date()]
+            [dbUserId, slotNum, s3KeyValue, twilioRecordingSid, source, createdAt || new Date()]
           );
         } else {
           await pool.query(
-            `UPDATE voice_wills SET s3_key = $1, twilio_recording_sid = $2, updated_at = NOW()
+            `UPDATE voice_wills SET s3_key = $1, twilio_recording_sid = $2
              WHERE user_id = $3 AND will_slot_number = $4 AND deleted_at IS NULL`,
-            [s3KeyValue, twilioRecordingSid, dbUserId, slotNumber]
+            [s3KeyValue, twilioRecordingSid, dbUserId, slotNum]
           );
         }
       } else {
@@ -506,22 +524,32 @@ app.post('/api/sync/slot', syncAuth, async (req, res) => {
         if (existingNote.rows.length > 0) {
           console.log(`Duplicate sync-slot ignored: user ${userId}, s3_key ${voiceMessage}`);
         } else {
+          // A deleted note (kept for records) may still hold this slot number: free it so the new
+          // recording gets its own row instead of overwriting the old one
+          if (slotNum) {
+            await pool.query(
+              `UPDATE voice_notes SET slot_number = NULL, ivr_slot_number = NULL
+               WHERE user_id = $1 AND deleted_at IS NOT NULL AND (slot_number = $2 OR ivr_slot_number = $2)`,
+              [dbUserId, slotNum]
+            );
+          }
           await pool.query(
             `INSERT INTO voice_notes (
                user_id, slot_number, title, description,
                s3_key, s3_bucket, recording_url,
-               file_size_bytes, duration_seconds, created_at, source
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+               file_size_bytes, duration_seconds, created_at, source, ivr_slot_number
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $2)
              ON CONFLICT (user_id, slot_number) DO UPDATE SET
                title         = EXCLUDED.title,
                description   = EXCLUDED.description,
                s3_key        = EXCLUDED.s3_key,
                recording_url = EXCLUDED.recording_url,
                source        = EXCLUDED.source,
+               ivr_slot_number = EXCLUDED.ivr_slot_number,
                updated_at    = NOW()`,
             [
               dbUserId,
-              slotNumber,
+              slotNum,
               `Voice Note ${slotNumber || '(imported)'}`,
               null,
               voiceMessage,
@@ -536,14 +564,36 @@ app.post('/api/sync/slot', syncAuth, async (req, res) => {
         }
       }
     } else if (action === 'updateContact') {
-      if (type === 'voiceWill' || type === 'will') {
+      if (isWill) {
         await pool.query(
-          `UPDATE voice_wills SET contact_phone = $1, updated_at = NOW()
+          `UPDATE voice_wills SET contact_phone = $1
            WHERE user_id = $2 AND will_slot_number = $3 AND deleted_at IS NULL`,
-          [contact || null, dbUserId, slotNumber]
+          [contact || null, dbUserId, slotNum]
         );
+      } else {
+        // Voice-note slot: point the note at the contact with this number (added to contacts if new)
+        const note = (await pool.query(
+          `SELECT id FROM voice_notes
+           WHERE user_id = $1 AND deleted_at IS NULL AND (ivr_slot_number = $2 OR (ivr_slot_number IS NULL AND slot_number = $2))
+           ORDER BY created_at DESC LIMIT 1`,
+          [dbUserId, slotNum]
+        )).rows[0];
+        if (!note) {
+          return res.status(404).json({ success: false, error: 'Voice note not found for this slot' });
+        }
+        let contactId = null;
+        if (contact) {
+          const found = await pool.query(
+            `SELECT id FROM contacts WHERE user_id = $1 AND regexp_replace(phone, '[^0-9]', '', 'g') = ANY($2) LIMIT 1`,
+            [dbUserId, phoneDigitVariants(contact)]
+          );
+          contactId = found.rows[0]?.id || (await pool.query(
+            `INSERT INTO contacts (user_id, name, phone) VALUES ($1, $2, $2) RETURNING id`,
+            [dbUserId, contact]
+          )).rows[0].id;
+        }
+        await pool.query('UPDATE voice_notes SET contact_id = $1 WHERE id = $2', [contactId, note.id]);
       }
-      // Regular voice note slots have no contact_phone — just acknowledge
     } else {
       return res.status(400).json({ success: false, error: 'Invalid action' });
     }
@@ -581,11 +631,9 @@ app.post('/api/sync/schedule', syncAuth, async (req, res) => {
       [JSON.stringify(req.body)]
     );
 
-    // Find the internal user by phone number
-    const userResult = await pool.query(
-      'SELECT id FROM users WHERE phone = $1',
-      [ivrUserId]
-    );
+    // Find the internal user by phone number (stored with or without +1)
+    const foundId = await findUserIdByPhone(ivrUserId);
+    const userResult = { rows: foundId ? [{ id: foundId }] : [] };
 
     if (userResult.rows.length === 0) {
       console.warn(`Sync schedule: user not found for phone ${ivrUserId}`);
@@ -673,17 +721,11 @@ app.post('/api/sync/will', syncAuth, async (req, res) => {
   }
 
   try {
-    // 1. Find the user by phone number
-    const userResult = await pool.query(
-      'SELECT id FROM users WHERE phone = $1',
-      [userId]
-    );
-
-    if (userResult.rows.length === 0) {
+    // 1. Find the user by phone number (stored with or without +1)
+    const dbUserId = await findUserIdByPhone(userId);
+    if (!dbUserId) {
       return res.status(404).json({ success: false, error: 'User not found' });
     }
-
-    const dbUserId = userResult.rows[0].id;
 
     pool.query(
       `INSERT INTO sync_received_log (source, event_type, payload) VALUES ('ivr', $1, $2)`,
@@ -731,8 +773,7 @@ app.post('/api/sync/will', syncAuth, async (req, res) => {
            SET s3_key = $1,
                twilio_recording_sid = $2,
                twilio_sync_status = $3,
-               contact_phone = $4,
-               updated_at = NOW()
+               contact_phone = $4
            WHERE user_id = $5 AND will_slot_number = $6 AND deleted_at IS NULL`,
           [s3KeyValue, twilioRecordingSid, twilioSyncStatus, contact, dbUserId, willSlotNumber]
         );
@@ -752,8 +793,8 @@ app.post('/api/sync/will', syncAuth, async (req, res) => {
     } else if (action === 'delete') {
       await pool.query(
         `UPDATE voice_wills 
-         SET deleted_at = NOW() 
-         WHERE user_id = $1 AND will_slot_number = $2`,
+         SET deleted_at = NOW()
+         WHERE user_id = $1 AND will_slot_number = $2 AND deleted_at IS NULL`,
         [dbUserId, willSlotNumber]
       );
 

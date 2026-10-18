@@ -68,18 +68,21 @@ const syncToIvr = async (payload, endpointPath, client) => {
 };
 
 /**
- * The phone line answered 404 "User not found" / "Slot not found": there is nothing there to update
- * (e.g. a website-only customer who has no phone-line account). Retrying can't help, so the item is
- * marked 'skipped' instead of failing 5 times and raising an alert.
+ * Answers where retrying can't help, so the item is marked 'skipped' instead of failing 5 times and
+ * raising an alert:
+ *   404 "User not found" / "Slot not found": nothing there to update (e.g. a website-only customer)
+ *   409 "Slot 3 already exists": what we were adding is already on the phone line
  */
+const errorText = (err) => String(err?.response?.data?.error || err?.response?.data || '');
+const isAlreadyThere = (err) => err?.response?.status === 409 && /already (exists|configured)/i.test(errorText(err));
 const isNothingToUpdate = (err) =>
-  err?.response?.status === 404 && /not found/i.test(String(err.response?.data?.error || err.response?.data || ''));
+  (err?.response?.status === 404 && /not found/i.test(errorText(err))) || isAlreadyThere(err);
 
 const markSkipped = async (outboxId, err) => {
   const reason = String(err?.response?.data?.error || 'Not found on the phone line');
   await pool.query(
     `UPDATE sync_outbox SET status = 'skipped', error_message = $2, last_attempt_at = NOW() WHERE id = $1`,
-    [outboxId, `${reason} (nothing to update on the phone line)`]
+    [outboxId, `${reason} (${isAlreadyThere(err) ? 'already on the phone line' : 'nothing to update on the phone line'})`]
   ).catch(e => logger.error(`sync_outbox skip update failed: ${e.message}`));
   logger.info(`Sync skipped (${reason}), outbox id=${outboxId}`);
 };

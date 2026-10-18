@@ -11,8 +11,8 @@ const {
   BUCKETS,
   isOwnS3Key
 } = require('../utils/s3Storage');
-const { syncToIvr } = require('../utils/syncIvr');
 const { willLimitError } = require('../utils/planLimits');
+const phoneLineContent = require('../utils/phoneLineContent');
 const { resolveIvrPlaybackUrl } = require('../utils/resolveAudioUrl');
 const { signedProxyRecordingPath } = require('../utils/audioSigning');
 const Twilio = require('twilio');
@@ -250,15 +250,15 @@ router.post('/wills', authenticate, validateTier('LEGACY_VAULT_PREMIUM'), [
     const will = result.rows[0];
     const ivrPlaybackUrl = resolveIvrPlaybackUrl(will);
 
-    // --- Fire-and-forget sync to IVR ---
-    syncToIvr({
-      userId: req.user.phone,
-      willSlotNumber: will.will_slot_number?.toString() || will.id.toString(),
-      contact: will.contact_phone || will.title || 'Unknown',
-      voiceMessage: ivrPlaybackUrl,
-      action: 'create',
-      source: 'app'
-    }, 'sync-will');
+    // Give it a will slot (1–9, what callers press on the keypad) and copy it to the phone line.
+    // The phone-line slot calls the first beneficiary; the app keeps all of them for the release.
+    const willSlot = await phoneLineContent.freeWillSlot(req.user.id);
+    if (willSlot) {
+      await pool.query('UPDATE voice_wills SET will_slot_number = $1 WHERE id = $2', [willSlot, will.id]);
+      will.will_slot_number = willSlot;
+      phoneLineContent.sendWill(req.user.phone, will)
+        .catch(err => console.warn('Will sync to phone line failed (queued for retry):', err.message));
+    }
 
     res.status(201).json({
       success: true,
@@ -596,13 +596,8 @@ router.delete('/wills/:id', authenticate, async (req, res) => {
     // Soft delete in database
     await pool.query('UPDATE voice_wills SET deleted_at = NOW() WHERE id = $1', [will.id]);
 
-    // Fire-and-forget: sync delete to IVR
-    syncToIvr({
-      userId: req.user.phone,
-      willSlotNumber: will.will_slot_number?.toString() || will.id.toString(),
-      action: 'delete',
-      source: 'app'
-    }, 'sync-will');
+    // Fire-and-forget: remove it from the phone line's will slot
+    phoneLineContent.removeWill(req.user.phone, will.will_slot_number);
 
     // Fire-and-forget: delete from Twilio if IVR recording
     if (will.source === 'ivr' && twilioClient) {

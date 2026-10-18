@@ -1669,6 +1669,13 @@ router.post('/phone-line/pin', authenticate, [
         `INSERT INTO system_logs (user_id, level, service, message, metadata) VALUES ($1, 'info', 'account', 'Phone line account created', $2)`,
         [req.user.id, JSON.stringify({ via: 'app settings' })]
       ).catch(() => {});
+      // Their new keypad starts empty: copy the voice notes (and Premium wills) they already made in the app
+      require('../utils/phoneLineContent').pushAllToPhoneLine(req.user.id)
+        .then(sent => (sent.notes || sent.wills) && pool.query(
+          `INSERT INTO system_logs (user_id, level, service, message, metadata) VALUES ($1, 'info', 'account', 'Recordings copied to the new phone line account', $2)`,
+          [req.user.id, JSON.stringify(sent)]
+        ))
+        .catch(err => console.error('Copying recordings to the new phone line account failed:', err.message));
       return res.status(201).json({ success: true, message: 'Your phone line account is ready' });
     }
     // 200 = an account already exists for this number; we can't prove it's theirs, so the PIN isn't changed

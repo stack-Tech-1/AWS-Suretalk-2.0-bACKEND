@@ -9,7 +9,9 @@
 // Reported for a person to look at:
 //   - phone sign-in off for an active app customer (may be on purpose, e.g. old unsubscribes)
 //   - an account created by phone whose phone-line account is missing
-// Content (recordings, wills, contacts) is not compared yet: that sync is still being built.
+//   - voice notes / wills in the app but not on the phone line (keypad slot / will slot) — a Super admin
+//     can copy them with "Copy to the phone line" (POST /api/super-admin/sync/reconcile/:id/copy-content)
+//   - keypad or will slots on the phone line that the app doesn't have
 // Runs once a night after RUN_HOUR_UTC (a database lock stops two backend copies running it), and on
 // demand from Super admin → Sync monitor. More than MAX_AUTO_FIXES differences = nothing is changed
 // automatically, in case something upstream is wrong.
@@ -19,6 +21,7 @@ const { pool } = require('../config/database');
 const logger = require('../utils/logger');
 const { syncAccountToIvr } = require('../utils/syncIvr');
 const { ivrTierName } = require('../utils/tierMapping');
+const { limitsFor } = require('../utils/planLimits');
 
 const RUN_HOUR_UTC = 3;
 const CHECK_EVERY_MS = 15 * 60 * 1000;
@@ -54,8 +57,8 @@ async function loadPhoneLineAccounts() {
   do {
     const r = await dynamo().send(new ScanCommand({
       TableName: process.env.DYNAMO_USERS_TABLE || 'Users',
-      ProjectionExpression: 'userId, subscription_tier, verified, #st, migratedTo, stripeSubscriptionId, subscriptionStatus',
-      ExpressionAttributeNames: { '#st': 'status' },
+      ProjectionExpression: 'userId, subscription_tier, verified, #st, migratedTo, stripeSubscriptionId, subscriptionStatus, #sl, voiceWillSlots',
+      ExpressionAttributeNames: { '#st': 'status', '#sl': 'slots' },
       ExclusiveStartKey,
     }));
     items.push(...(r.Items || []));
@@ -63,6 +66,47 @@ async function loadPhoneLineAccounts() {
   } while (ExclusiveStartKey);
   // Backups left by the number-format conversion are not live accounts
   return items.filter(i => !i.migratedTo);
+}
+
+const countText = (n, word) => (n ? `${n} ${word}${n > 1 ? 's' : ''}` : '');
+
+// For each linked, active customer: app items missing from the phone line, and phone-line slots the app
+// doesn't have. Notes are matched by keypad slot, wills by will slot. Notes without a keypad slot (made
+// before the person had a phone-line account) count as missing; they get a slot when copied.
+async function compareContent(pairs) {
+  if (!pairs.length) return [];
+  const ids = pairs.map(p => p.u.id);
+  const [notes, wills] = await Promise.all([
+    pool.query(
+      `SELECT id, user_id, title, ivr_slot_number, slot_number FROM voice_notes
+       WHERE user_id = ANY($1) AND deleted_at IS NULL AND COALESCE(is_will, false) = false`, [ids]).then(r => r.rows),
+    pool.query(
+      `SELECT id, user_id, title, will_slot_number FROM voice_wills
+       WHERE user_id = ANY($1) AND deleted_at IS NULL AND admin_removed_at IS NULL`, [ids]).then(r => r.rows),
+  ]);
+  const group = (rows) => rows.reduce((m, r) => (m.get(r.user_id) || m.set(r.user_id, []).get(r.user_id)).push(r) && m, new Map());
+  const notesBy = group(notes), willsBy = group(wills);
+  return pairs.map(({ u, acct }) => {
+    const plan = limitsFor(u.subscription_tier);
+    const phoneSlots = new Set((acct.slots || []).map(s => Number(s.slotNumber)));
+    const phoneWills = new Set((acct.voiceWillSlots || []).map(w => Number(w.willSlotNumber)));
+    const myNotes = notesBy.get(u.id) || [], myWills = willsBy.get(u.id) || [];
+    const appSlots = new Set(myNotes.map(n => n.ivr_slot_number || n.slot_number).filter(Boolean));
+    const appWillSlots = new Set(myWills.map(w => w.will_slot_number).filter(Boolean));
+    const item = (x, slot) => ({ id: x.id, slot: slot || null, title: x.title || null });
+    return {
+      u,
+      missingOnPhone: {
+        notes: myNotes.filter(n => !n.ivr_slot_number ? true : n.ivr_slot_number <= plan.slots && !phoneSlots.has(n.ivr_slot_number))
+          .slice(0, plan.slots).map(n => item(n, n.ivr_slot_number)),
+        wills: plan.wills ? myWills.filter(w => !w.will_slot_number || !phoneWills.has(w.will_slot_number)).map(w => item(w, w.will_slot_number)) : [],
+      },
+      missingInApp: {
+        notes: [...phoneSlots].filter(s => !appSlots.has(s)).sort((a, b) => a - b),
+        wills: [...phoneWills].filter(s => !appWillSlots.has(s)).sort((a, b) => a - b),
+      },
+    };
+  });
 }
 
 async function failedSyncCounts() {
@@ -101,6 +145,7 @@ async function runReconcile({ trigger = 'manual', runBy = null, applyFixes = tru
     const matchedKeys = new Set();
     const fixes = [];
     const issues = [];
+    const contentToCompare = [];
     let matched = 0, appOnlyUs = 0;
     const who = (u) => ({ userId: u.id, name: u.full_name || null, email: u.email || null, phone: u.phone });
 
@@ -142,8 +187,33 @@ async function runReconcile({ trigger = 'manual', runBy = null, applyFixes = tru
       if (acct.verified !== true) {
         issues.push({ ...who(u), type: 'PHONE_SIGNIN_OFF', label: 'Active in the app, but phone sign-in is switched off' });
       }
+      contentToCompare.push({ u, acct });
     }
     const phoneOnly = phoneAccounts.filter(a => !matchedKeys.has(phoneKey(a.userId))).length;
+
+    // Recordings and wills: what each side has, by keypad slot / will slot. Never changed automatically:
+    // a Super admin reviews the list and presses "Copy to the phone line".
+    const content = await compareContent(contentToCompare);
+    for (const c of content) {
+      const u = c.u;
+      if (c.missingOnPhone.notes.length || c.missingOnPhone.wills.length) {
+        issues.push({
+          ...who(u), type: 'CONTENT_MISSING_ON_PHONE_LINE', fixable: true,
+          label: `${countText(c.missingOnPhone.notes.length, 'voice note')}${c.missingOnPhone.notes.length && c.missingOnPhone.wills.length ? ' and ' : ''}${countText(c.missingOnPhone.wills.length, 'voice will')} in the app but not on their phone line`,
+          items: c.missingOnPhone,
+        });
+      }
+      if (c.missingInApp.notes.length || c.missingInApp.wills.length) {
+        issues.push({
+          ...who(u), type: 'CONTENT_MISSING_IN_APP',
+          label: `On the phone line but not in the app: ${[
+            c.missingInApp.notes.length ? `keypad slot${c.missingInApp.notes.length > 1 ? 's' : ''} ${c.missingInApp.notes.join(', ')}` : '',
+            c.missingInApp.wills.length ? `will slot${c.missingInApp.wills.length > 1 ? 's' : ''} ${c.missingInApp.wills.join(', ')}` : '',
+          ].filter(Boolean).join('; ')}`,
+          items: c.missingInApp,
+        });
+      }
+    }
 
     let fixesApplied = false;
     if (fixes.length > MAX_AUTO_FIXES) {
@@ -159,6 +229,8 @@ async function runReconcile({ trigger = 'manual', runBy = null, applyFixes = tru
       matched, phoneOnly, appOnlyUs,
       fixes: fixes.length, fixesApplied,
       needsAttention: issues.length,
+      contentMissingOnPhoneLine: issues.filter(i => i.type === 'CONTENT_MISSING_ON_PHONE_LINE').length,
+      contentMissingInApp: issues.filter(i => i.type === 'CONTENT_MISSING_IN_APP').length,
       appFailedSyncs: failed.appDead,
       phoneLineFailedSyncs: failed.phoneLineDead,
     };

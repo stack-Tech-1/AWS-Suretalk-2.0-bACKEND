@@ -536,7 +536,7 @@ router.post('/', authenticate, [
           let assignedSlot = null;
           let slotToTry = candidateSlot;
 
-          while (slotToTry <= 15 && !assignedSlot) {
+          while (slotToTry <= slotLimit && !assignedSlot) {
             // Skip slots already taken in PostgreSQL
             if (takenInPostgres.has(slotToTry)) {
               slotToTry++;
@@ -605,7 +605,7 @@ router.post('/', authenticate, [
             note.ivr_slot_number = assignedSlot; // include in API response
             console.log(`Voice note ${note.id} assigned IVR slot ${assignedSlot} for user ${req.user.id}`);
           } else {
-            console.warn(`No available IVR slots for user ${req.user.id} — all 15 slots occupied in DynamoDB`);
+            console.warn(`No available IVR slots for user ${req.user.id} — all ${slotLimit} keypad slots are taken`);
           }
         }
       } catch (slotError) {
@@ -806,16 +806,10 @@ router.delete('/:id', authenticate, async (req, res) => {
       [id]
     );
 
-    // Fire-and-forget: sync delete to IVR
-    // Only sync deletion if this note had an IVR slot assigned
-    if (note.source === 'app' && note.ivr_slot_number) {
-      syncToIvr({
-        userId: req.user.phone || '',
-        slotNumber: note.ivr_slot_number.toString(),
-        voiceMessage: note.s3_key,
-        action: 'delete',
-        source: 'app'
-      }, 'sync-slot');
+    // Fire-and-forget: free the keypad slot on the phone line (notes recorded by phone too — otherwise
+    // the slot would stay on the keypad after its recording is gone)
+    if (note.ivr_slot_number) {
+      require('../utils/phoneLineContent').removeNote(req.user.phone, note.ivr_slot_number);
     }
 
     // Fire-and-forget: delete from Twilio if IVR recording
@@ -945,12 +939,16 @@ router.post('/:id/convert-to-will', authenticate, validateTier('LEGACY_VAULT_PRE
     const limitError = await willLimitError(pool, req.user.id, req.user.subscription_tier);
     if (limitError) return res.status(403).json({ success: false, code: 'WILL_LIMIT', error: limitError });
 
-    await pool.query(
+    // A will gets its own will slot (1–9); the note's keypad slot is freed on the phone line
+    const phoneLineContent = require('../utils/phoneLineContent');
+    const willSlot = await phoneLineContent.freeWillSlot(req.user.id);
+    const inserted = await pool.query(
       `INSERT INTO voice_wills (
          user_id, title, description, s3_key, s3_bucket,
          twilio_recording_sid, will_slot_number, source, created_at
        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-       ON CONFLICT DO NOTHING`,
+       ON CONFLICT DO NOTHING
+       RETURNING *`,
       [
         req.user.id,
         n.title,
@@ -958,7 +956,7 @@ router.post('/:id/convert-to-will', authenticate, validateTier('LEGACY_VAULT_PRE
         n.s3_key,
         n.s3_bucket,
         n.twilio_recording_sid,
-        n.ivr_slot_number,
+        willSlot,
         n.source,
         n.created_at
       ]
@@ -968,6 +966,12 @@ router.post('/:id/convert-to-will', authenticate, validateTier('LEGACY_VAULT_PRE
       `UPDATE voice_notes SET is_will = TRUE, deleted_at = NOW() WHERE id = $1`,
       [n.id]
     );
+
+    if (n.ivr_slot_number) phoneLineContent.removeNote(req.user.phone, n.ivr_slot_number);
+    if (inserted.rows[0]?.will_slot_number) {
+      phoneLineContent.sendWill(req.user.phone, inserted.rows[0])
+        .catch(err => console.warn('Will sync to phone line failed (queued for retry):', err.message));
+    }
 
     res.json({ success: true, message: 'Recording moved to Voice Wills' });
 

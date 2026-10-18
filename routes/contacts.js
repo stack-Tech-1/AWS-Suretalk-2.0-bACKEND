@@ -5,6 +5,24 @@ const { body, validationResult } = require('express-validator');
 const { authenticate, validateTier } = require('../middleware/auth');
 const { pool } = require('../config/database');
 const { effectiveLimit } = require('../utils/planLimits');
+const { changeContact } = require('../utils/phoneLineContent');
+
+// Every phone-line slot that calls this contact: keypad slots of their voice notes, and will slots
+// where they're the first beneficiary (the one the phone line calls)
+async function tellPhoneLineContactChanged(user, contactId, newPhone) {
+  if (!user.phone) return;
+  const notes = await pool.query(
+    `SELECT ivr_slot_number FROM voice_notes WHERE user_id = $1 AND contact_id = $2 AND deleted_at IS NULL AND ivr_slot_number IS NOT NULL`,
+    [user.id, contactId]
+  );
+  for (const n of notes.rows) changeContact(user.phone, { slot: n.ivr_slot_number, contact: newPhone });
+  const wills = await pool.query(
+    `SELECT will_slot_number FROM voice_wills
+     WHERE user_id = $1 AND beneficiaries[1] = $2 AND deleted_at IS NULL AND will_slot_number IS NOT NULL`,
+    [user.id, contactId]
+  );
+  for (const w of wills.rows) changeContact(user.phone, { kind: 'will', slot: w.will_slot_number, contact: newPhone });
+}
 
 // Get contact statistics
 router.get('/stats', authenticate, async (req, res) => {
@@ -230,7 +248,7 @@ router.put('/:id', authenticate, async (req, res) => {
 
     // Check ownership
     const ownershipCheck = await pool.query(
-      'SELECT id FROM contacts WHERE id = $1 AND user_id = $2',
+      'SELECT id, phone FROM contacts WHERE id = $1 AND user_id = $2',
       [id, req.user.id]
     );
 
@@ -240,6 +258,7 @@ router.put('/:id', authenticate, async (req, res) => {
         error: 'Contact not found'
       });
     }
+    const oldPhone = ownershipCheck.rows[0].phone;
 
     // If phone is being updated, check for duplicates
     if (phone) {
@@ -321,6 +340,12 @@ router.put('/:id', authenticate, async (req, res) => {
 
     const result = await pool.query(query, values);
 
+    // New number: the keypad slots and will slots that call this contact get it too
+    if (phone !== undefined && phone !== oldPhone) {
+      tellPhoneLineContactChanged(req.user, id, phone || '')
+        .catch(err => console.warn('Contact change sync to phone line failed:', err.message));
+    }
+
     res.json({
       success: true,
       message: 'Contact updated successfully',
@@ -353,6 +378,11 @@ router.delete('/:id', authenticate, async (req, res) => {
         error: 'Contact not found'
       });
     }
+
+    // The phone line stops calling this person from any keypad or will slot (they're told before the
+    // contact row goes, while we can still find which slots used it)
+    await tellPhoneLineContactChanged(req.user, id, '')
+      .catch(err => console.warn('Contact removal sync to phone line failed:', err.message));
 
     // Delete contact
     await pool.query(

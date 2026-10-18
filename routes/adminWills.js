@@ -359,9 +359,11 @@ async function backupTwilioRecording(will) {
   return key;
 }
 
+// For the phone line's sync-slot function (wills use kind: 'will'; slotNumber = the will slot 1–9)
 const ivrWillPayload = (will, action) => ({
   userId: will.owner_phone,
-  willSlotNumber: will.will_slot_number?.toString() || will.id.toString(),
+  kind: 'will',
+  slotNumber: String(will.will_slot_number),
   ...(action === 'create' ? {
     contact: will.contact_phone || will.title || 'Unknown',
     // Prefer the S3 backup: the phone line may have deleted the original Twilio recording on removal
@@ -401,7 +403,7 @@ router.post('/wills/:id/remove', authenticateAdmin, [
     );
     // Recipients' links stop working while the will is removed
     await pool.query('UPDATE will_release_links SET revoked_at = CURRENT_TIMESTAMP WHERE will_id = $1 AND revoked_at IS NULL', [will.id]);
-    if (will.owner_phone) syncToIvr(ivrWillPayload(will, 'delete'), 'sync-will');
+    if (will.owner_phone && will.will_slot_number) syncToIvr(ivrWillPayload(will, 'delete'), 'sync-slot');
 
     logSystem(req.user.id, 'warning', 'Voice will removed from service', { willId: will.id, reason: req.body.reason.trim(), backupKey });
     logAdminAudit({ userId: req.user.id, action: 'REMOVE_WILL', targetId: will.id, newValue: { reason: req.body.reason.trim(), recordingKept: true, backupKey }, ipAddress: req.ip });
@@ -426,7 +428,7 @@ router.post('/wills/:id/restore', authenticateAdmin, async (req, res) => {
     );
     // Links that haven't expired work again
     await pool.query('UPDATE will_release_links SET revoked_at = NULL WHERE will_id = $1 AND expires_at > NOW()', [will.id]);
-    if (will.owner_phone) syncToIvr(ivrWillPayload(will, 'create'), 'sync-will');
+    if (will.owner_phone && will.will_slot_number) syncToIvr(ivrWillPayload(will, 'create'), 'sync-slot');
 
     logSystem(req.user.id, 'info', 'Voice will restored', { willId: will.id });
     logAdminAudit({ userId: req.user.id, action: 'RESTORE_WILL', targetId: will.id, oldValue: { reason: will.admin_removed_reason }, ipAddress: req.ip });
