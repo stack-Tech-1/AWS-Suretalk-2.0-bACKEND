@@ -10,6 +10,7 @@ const tokenService = require('../utils/tokens');
 const emailService = require('../utils/emailService');
 const twilio = require('twilio');
 const { normalizeTier, TIERS } = require('../utils/tierMapping');
+const { checkCode, markCodeUsed } = require('../utils/phoneCodes');
 const axios = require('axios');
 const { requireTurnstile } = require('../middleware/turnstile');
 
@@ -1113,26 +1114,15 @@ router.post('/claim-account', validateClaimAccount, async (req, res) => {
     }
     const ivrUser = userResult.rows[0];
 
-    // 2. Find latest valid, unused OTP
-    const otpResult = await pool.query(
-      `SELECT id, otp_hash FROM phone_otps
-       WHERE phone = $1 AND expires_at > NOW() AND used_at IS NULL
-       ORDER BY created_at DESC LIMIT 1`,
-      [phone]
-    );
-    if (otpResult.rows.length === 0) {
-      return res.status(400).json({ success: false, error: 'OTP expired or not found' });
+    // 2–4. Check the texted code (only claim codes; thrown away after 5 wrong guesses), then use it up
+    const otpCheck = await checkCode(phone, 'claim_account', otp);
+    if (!otpCheck.ok) {
+      const error = otpCheck.reason === 'NO_CODE' ? 'OTP expired or not found'
+        : otpCheck.reason === 'TOO_MANY_GUESSES' ? 'Too many wrong codes. Request a new one.'
+        : 'Invalid OTP';
+      return res.status(400).json({ success: false, error });
     }
-    const otpRow = otpResult.rows[0];
-
-    // 3. Verify OTP
-    const otpValid = await bcrypt.compare(otp, otpRow.otp_hash);
-    if (!otpValid) {
-      return res.status(400).json({ success: false, error: 'Invalid OTP' });
-    }
-
-    // 4. Mark OTP as used
-    await pool.query('UPDATE phone_otps SET used_at = NOW() WHERE id = $1', [otpRow.id]);
+    await markCodeUsed(otpCheck.id);
 
     // 5. Check email uniqueness
     const emailCheck = await pool.query(

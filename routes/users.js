@@ -1710,6 +1710,7 @@ const phoneLineId = (phone) => {
   return null;
 };
 const phoneLineConfigured = () => !!(process.env.IVR_API_URL && process.env.IVR_REQUEST_KEY);
+const { issueCode, checkCode, markCodeUsed } = require('../utils/phoneCodes');
 const WEAK_PINS = new Set(['1234', '4321', '0123', '1111', '0000']);
 const pinAttempts = new Map(); // userId -> timestamps, max 5 tries an hour
 
@@ -1739,8 +1740,39 @@ router.get('/phone-line', authenticate, async (req, res) => {
   }
 });
 
+// Step 1: text a 6-digit code to the account's phone number, proving the person owns it
+// before a phone-line account is created for that number.
+router.post('/phone-line/send-code', authenticate, async (req, res) => {
+  try {
+    if (req.isImpersonating) return res.status(403).json({ success: false, error: 'Not available while viewing as this user' });
+    const id = phoneLineId(req.user.phone);
+    if (!id) return res.status(400).json({ success: false, code: 'NOT_US', error: 'The phone line currently supports US (+1) numbers only' });
+    if (!phoneLineConfigured() || !process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_PHONE_NUMBER) {
+      return res.status(503).json({ success: false, error: 'Phone line is not available right now' });
+    }
+    if (await phoneLineAccountExists(id)) {
+      return res.status(409).json({ success: false, code: 'ALREADY_EXISTS', error: 'This number already has a phone line account. Call in and use your existing PIN.' });
+    }
+    const issued = await issueCode(req.user.phone, 'phone_line');
+    if (!issued.ok) return res.status(429).json({ success: false, code: 'TOO_MANY_CODES', error: 'Too many codes sent. Wait 10 minutes and try again.' });
+
+    const twilio = require('twilio')(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+    await twilio.messages.create({
+      to: `+1${id}`,
+      from: process.env.TWILIO_PHONE_NUMBER,
+      body: `Your SureTalk code to set up phone access is ${issued.code}. It expires in 10 minutes. Don't share it with anyone.`
+    });
+    res.json({ success: true, message: 'Code sent' });
+  } catch (err) {
+    console.error('Phone line send-code error:', err.message);
+    res.status(502).json({ success: false, code: 'SMS_FAILED', error: 'We could not send the code. Check your phone number and try again.' });
+  }
+});
+
+// Step 2: the code + the chosen PIN create the phone-line account
 router.post('/phone-line/pin', authenticate, [
-  body('pin').isString().matches(/^\d{4}$/).withMessage('Your PIN must be exactly 4 digits')
+  body('pin').isString().matches(/^\d{4}$/).withMessage('Your PIN must be exactly 4 digits'),
+  body('code').isString().matches(/^\d{6}$/).withMessage('Enter the 6-digit code we texted you')
 ], async (req, res) => {
   try {
     if (req.isImpersonating) return res.status(403).json({ success: false, error: 'Not available while viewing as this user' });
@@ -1758,6 +1790,17 @@ router.post('/phone-line/pin', authenticate, [
     if (recent.length >= 5) return res.status(429).json({ success: false, error: 'Too many attempts. Try again in an hour.' });
     pinAttempts.set(req.user.id, [...recent, now]);
 
+    // Proof they own the number: the code texted by /phone-line/send-code
+    const check = await checkCode(req.user.phone, 'phone_line', req.body.code);
+    if (!check.ok) {
+      const messages = {
+        NO_CODE: 'Your code has expired. Request a new one.',
+        WRONG_CODE: "That code isn't right. Check the text message and try again.",
+        TOO_MANY_GUESSES: 'Too many wrong codes. Request a new one.',
+      };
+      return res.status(400).json({ success: false, code: `CODE_${check.reason}`, error: messages[check.reason] });
+    }
+
     const axios = require('axios');
     const r = await axios.post(`${process.env.IVR_API_URL}/saveUserDataNew`, {
       key: process.env.IVR_REQUEST_KEY,
@@ -1766,6 +1809,7 @@ router.post('/phone-line/pin', authenticate, [
       subscription_tier: ivrTierName(req.user.subscription_tier)
     }, { timeout: 10000, validateStatus: () => true });
 
+    if (r.status === 201 || r.status === 200) markCodeUsed(check.id).catch(() => {});
     if (r.status === 201) {
       pool.query(
         `INSERT INTO system_logs (user_id, level, service, message, metadata) VALUES ($1, 'info', 'account', 'Phone line account created', $2)`,
