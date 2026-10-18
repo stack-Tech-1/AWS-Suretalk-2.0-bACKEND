@@ -1,13 +1,7 @@
 const axios = require('axios');
 const { pool } = require('../config/database');
 const logger = require('../utils/logger');
-const AWS = require('aws-sdk');
-
-const ses = new AWS.SES({
-  region: process.env.AWS_REGION,
-  accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
-});
+const emailService = require('../utils/emailService');
 
 const MAX_ATTEMPTS = 5;
 const POLL_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
@@ -81,22 +75,9 @@ const processOutbox = async () => {
         logger.error(`CRITICAL: sync_outbox record ${row.id} (${row.event_type}) dead after ${MAX_ATTEMPTS} attempts. Manual intervention required.`);
 
         try {
-          await ses.sendEmail({
-            Destination: { ToAddresses: [process.env.ADMIN_EMAIL] },
-            Message: {
-              Body: {
-                Text: {
-                  Charset: 'UTF-8',
-                  Data: `DEAD SYNC ITEM - App → IVR\n\nRecord ID: ${row.id}\nEvent Type: ${row.event_type}\nError: ${err.message}\nPayload: ${JSON.stringify(row.payload, null, 2)}\n\nLogin to admin dashboard to retry manually.`
-                }
-              },
-              Subject: {
-                Charset: 'UTF-8',
-                Data: `[SureTalk] Dead sync: ${row.event_type}`
-              }
-            },
-            Source: process.env.SES_FROM_EMAIL
-          }).promise();
+          await emailService.sendSyncFailureAlert(process.env.ADMIN_EMAIL, {
+            recordId: row.id, eventType: row.event_type, error: err.message, payload: row.payload
+          });
           logger.info(`Dead letter alert sent for record ${row.id}`);
         } catch (sesError) {
           logger.error('Failed to send dead letter SES alert:', sesError.message);

@@ -6,7 +6,7 @@ const { authenticate } = require('../middleware/auth');
 const { pool } = require('../config/database');
 const { generateDownloadUrl } = require('../utils/s3Storage');
 const Twilio = require('twilio');
-const nodemailer = require('nodemailer');
+const emailService = require('../utils/emailService');
 const { createNotification } = require('./notifications');
 const { v4: uuidv4 } = require('uuid');
 
@@ -14,19 +14,6 @@ const { v4: uuidv4 } = require('uuid');
 const twilioClient = process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN
   ? new Twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
   : null;
-
-
-  // Initialize email transporter
-const emailTransporter = nodemailer.createTransport({
-  host: process.env.SMTP_HOST,
-  port: process.env.SMTP_PORT,
-  secure: process.env.SMTP_SECURE === 'true',
-  auth: {
-    user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS
-  }
-});
-
 
 
 // Get all scheduled messages
@@ -706,58 +693,13 @@ router.post('/schedule-with-contacts', authenticate, [
   }
 });
 
-// Add email/SMS sending functionality
-const sendEmailNotification = async (to, subject, message, downloadUrl, voiceNoteTitle, senderName) => {
-  try {
-    const emailHtml = `
-      <!DOCTYPE html>
-      <html>
-      <head>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>${subject}</title>
-        <style>
-          body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto; padding: 20px; }
-          .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; text-align: center; border-radius: 10px 10px 0 0; }
-          .content { background: #f9f9f9; padding: 30px; border-radius: 0 0 10px 10px; }
-          .button { display: inline-block; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 12px 30px; text-decoration: none; border-radius: 5px; margin: 20px 0; }
-          .footer { margin-top: 30px; padding-top: 20px; border-top: 1px solid #eee; color: #666; font-size: 12px; }
-        </style>
-      </head>
-      <body>
-        <div class="header">
-          <h1>${voiceNoteTitle}</h1>
-          <p>A voice message from ${senderName}</p>
-        </div>
-        <div class="content">
-          <p>${message}</p>
-          <p>Click the button below to listen to the voice note:</p>
-          <a href="${downloadUrl}" class="button">Listen to Voice Note</a>
-          <p><small>This link will expire in 7 days.</small></p>
-          <div class="footer">
-            <p>Sent via SureTalk - Your Voice, Preserved Forever</p>
-            <p>If you didn't expect this message, please ignore it.</p>
-          </div>
-        </div>
-      </body>
-      </html>
-    `;
-
-    const mailOptions = {
-      from: `"SureTalk" <${process.env.SMTP_FROM || 'noreply@suretalk.com'}>`,
-      to,
-      subject,
-      html: emailHtml,
-      text: `${message}\n\nListen to voice note: ${downloadUrl}\n\nThis link will expire in 7 days.`
-    };
-
-    await emailTransporter.sendMail(mailOptions);
-    return true;
-  } catch (error) {
-    console.error('Email sending error:', error);
-    throw error;
-  }
-};
+// Email: the shared SureTalk email design via AWS SES (utils/emailService.js). Only the test send uses it;
+// its link is valid for 1 hour.
+const sendEmailNotification = (to, subject, message, downloadUrl, voiceNoteTitle, senderName) =>
+  emailService.sendVoiceMessageEmail(to, {
+    subject, title: voiceNoteTitle, message, listenUrl: downloadUrl, senderName,
+    expiresText: 'This test link expires in 1 hour.'
+  });
 
 const sendSMSNotification = async (to, message, downloadUrl, voiceNoteTitle, senderName) => {
   try {

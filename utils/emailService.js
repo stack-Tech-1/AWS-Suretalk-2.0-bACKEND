@@ -1,17 +1,13 @@
 // utils/emailService.js
+// Every email SureTalk sends, built on one design (utils/emailTemplate.js). All names, messages and
+// other values are escaped by the template, so customer-entered text can't inject links or markup.
 const AWS = require('aws-sdk');
 const logger = require('./logger');
+const t = require('./emailTemplate');
 
-// ─── Brand tokens ────────────────────────────────────────────────────────────
-const BRAND = {
-  navy:    '#0C1128',
-  blue:    '#5371FF',
-  coral:   '#FF5758',
-  bg:      '#FAF9F7',
-  muted:   '#6B7280',
-  surface: '#FFFFFF',
-  year:    new Date().getFullYear()
-};
+const TIER_LABELS = { LITE: 'SureTalk LITE', ESSENTIAL: 'SureTalk Essential', LEGACY_VAULT_PREMIUM: 'SureTalk Premium (Legacy Vault)' };
+const money = (cents, currency = 'USD') =>
+  new Intl.NumberFormat('en-US', { style: 'currency', currency: String(currency).toUpperCase() }).format((cents || 0) / 100);
 
 class EmailService {
   constructor() {
@@ -21,100 +17,10 @@ class EmailService {
       secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
     });
     this.fromEmail = process.env.SES_FROM_EMAIL;
-    this.siteUrl  = process.env.FRONTEND_URL || 'https://app.suretalknow.com';
+    this.siteUrl = process.env.FRONTEND_URL || 'https://app.suretalknow.com';
   }
 
-  // ── PRIVATE: shared HTML wrapper ─────────────────────────────────────────
-  _wrap({ title, preheader, headerAccent = BRAND.blue, body, toEmail }) {
-    return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>${title}</title>
-  <style>
-    body,table,td,a{-webkit-text-size-adjust:100%;-ms-text-size-adjust:100%}
-    body{margin:0;padding:0;background:${BRAND.bg};font-family:'Helvetica Neue',Helvetica,Arial,sans-serif;color:#1A1F3A}
-    table{border-spacing:0}
-    img{border:0;display:block}
-    .wrapper{width:100%;background:${BRAND.bg};padding:32px 0}
-    .card{max-width:600px;margin:0 auto;background:${BRAND.surface};border-radius:12px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,.08)}
-    .header{background:${headerAccent};padding:36px 40px;text-align:center}
-    .logo-mark{display:inline-block;background:rgba(255,255,255,.15);border-radius:10px;padding:10px 18px;margin-bottom:16px}
-    .logo-text{font-size:22px;font-weight:900;letter-spacing:-.02em;color:#fff;margin:0}
-    .logo-dot{color:rgba(255,255,255,.6)}
-    .header-title{font-size:26px;font-weight:800;color:#fff;margin:0;letter-spacing:-.02em;line-height:1.2}
-    .content{padding:40px}
-    .greeting{font-size:18px;font-weight:700;color:#0C1128;margin:0 0 16px}
-    p{font-size:15px;line-height:1.75;color:#374151;margin:0 0 16px}
-    .btn{display:inline-block;padding:14px 32px;background:${BRAND.blue};color:#fff!important;text-decoration:none;border-radius:8px;font-weight:700;font-size:15px;letter-spacing:.01em;margin:8px 0}
-    .btn-coral{background:${BRAND.coral}}
-    .divider{height:1px;background:#E8E4DC;margin:28px 0}
-    .info-box{background:${BRAND.bg};border-left:3px solid ${BRAND.blue};border-radius:0 8px 8px 0;padding:16px 20px;margin:20px 0}
-    .info-box.warn{border-left-color:${BRAND.coral};background:#FFF5F5}
-    .detail-row{display:flex;justify-content:space-between;margin:0 0 8px;font-size:14px}
-    .detail-label{color:${BRAND.muted}}
-    .detail-value{font-weight:600;color:#0C1128}
-    .footer{background:#F3F1EE;padding:28px 40px;text-align:center}
-    .footer p{font-size:12px;color:${BRAND.muted};margin:0 0 6px;line-height:1.6}
-    .footer a{color:${BRAND.blue};text-decoration:none}
-    .social-row{margin:14px 0}
-    @media(max-width:640px){
-      .content{padding:28px 24px}
-      .header{padding:28px 24px}
-      .footer{padding:24px}
-    }
-  </style>
-</head>
-<body>
-  ${preheader ? `<div style="display:none;max-height:0;overflow:hidden;mso-hide:all">${preheader}&nbsp;‌&nbsp;‌&nbsp;‌</div>` : ''}
-  <div class="wrapper">
-    <table class="card" width="100%" cellpadding="0" cellspacing="0" role="presentation">
-      <!-- HEADER -->
-      <tr><td class="header">
-        <div class="logo-mark">
-          <p class="logo-text">Sure<span class="logo-dot">Talk</span></p>
-        </div>
-        <h1 class="header-title">${title}</h1>
-      </td></tr>
-      <!-- BODY -->
-      <tr><td class="content">
-        ${body}
-      </td></tr>
-      <!-- FOOTER -->
-      <tr><td class="footer">
-        <p><strong style="color:#0C1128">SureTalk</strong> — Voice Messaging Without Internet</p>
-        <p>
-          <a href="${this.siteUrl}">Dashboard</a> &nbsp;·&nbsp;
-          <a href="${this.siteUrl}/usersDashboard/billing">Billing</a> &nbsp;·&nbsp;
-          <a href="${this.siteUrl}/usersDashboard/settings">Settings</a>
-        </p>
-        <p style="margin-top:12px">
-          This email was sent to ${toEmail || 'you'} because you have a SureTalk account.<br>
-          © ${BRAND.year} SureTalk. All rights reserved.
-        </p>
-      </td></tr>
-    </table>
-  </div>
-</body>
-</html>`;
-  }
-
-  // ── PRIVATE: plain-text fallback builder ──────────────────────────────────
-  _text(title, lines) {
-    return [
-      `SureTalk — ${title}`,
-      '='.repeat(50),
-      '',
-      ...lines,
-      '',
-      '─'.repeat(50),
-      `© ${BRAND.year} SureTalk. All rights reserved.`,
-      this.siteUrl
-    ].join('\n');
-  }
-
-  // ── PRIVATE: SES send helper ──────────────────────────────────────────────
+  // ── SES send helper ───────────────────────────────────────────────────────
   async _send({ to, subject, html, text }) {
     const params = {
       Source: this.fromEmail,
@@ -136,34 +42,26 @@ class EmailService {
   // 1. ACCOUNT VERIFICATION
   // ══════════════════════════════════════════════════════════════════════════
   async sendVerificationEmail(toEmail, verificationToken, userName) {
-    const link = `${this.siteUrl}/verify-email?token=${verificationToken}`;
-    const html = this._wrap({
-      title: 'Verify Your Email',
+    const link = `${this.siteUrl}/verify-email?token=${encodeURIComponent(verificationToken)}`;
+    const html = t.render({
+      category: 'Account', title: 'Verify your email', toEmail,
       preheader: 'One click to activate your SureTalk account.',
-      toEmail,
-      body: `
-        <p class="greeting">Hi ${userName},</p>
-        <p>Thanks for signing up! Click the button below to verify your email address and activate your SureTalk account.</p>
-        <p style="text-align:center;margin:32px 0">
-          <a href="${link}" class="btn">Verify My Email</a>
-        </p>
-        <p>Or paste this link into your browser:</p>
-        <p style="word-break:break-all;font-size:13px;color:${BRAND.muted}">${link}</p>
-        <div class="divider"></div>
-        <p style="font-size:13px;color:${BRAND.muted}">This link expires in 24 hours. If you didn't create a SureTalk account, you can safely ignore this email.</p>`
+      body: [
+        t.greeting(userName),
+        t.p('Thanks for signing up! Click the button below to verify your email address and activate your SureTalk account.'),
+        t.button('Verify my email', link),
+        t.linkFallback(link),
+        t.divider(),
+        t.p("This link expires in 24 hours. If you didn't create a SureTalk account, you can safely ignore this email.", { muted: true, small: true }),
+      ]
     });
     return this._send({
       to: toEmail,
       subject: 'Verify Your SureTalk Account',
       html,
-      text: this._text('Verify Your Email', [
-        `Hi ${userName},`,
-        '',
-        'Verify your email by visiting this link:',
-        link,
-        '',
-        'This link expires in 24 hours.'
-      ])
+      text: t.text({ title: 'Verify your email', toEmail, lines: [
+        `Hi ${userName || 'there'},`, '', 'Verify your email by visiting this link:', link, '', 'This link expires in 24 hours.'
+      ] })
     });
   }
 
@@ -171,33 +69,25 @@ class EmailService {
   // 2. PASSWORD RESET
   // ══════════════════════════════════════════════════════════════════════════
   async sendPasswordResetEmail(toEmail, resetLink, userName) {
-    const html = this._wrap({
-      title: 'Reset Your Password',
+    const html = t.render({
+      category: 'Account', title: 'Reset your password', toEmail,
       preheader: 'We received a request to reset your SureTalk password.',
-      toEmail,
-      body: `
-        <p class="greeting">Hi ${userName},</p>
-        <p>We received a request to reset your SureTalk password. Click the button below to choose a new one.</p>
-        <p style="text-align:center;margin:32px 0">
-          <a href="${resetLink}" class="btn">Reset My Password</a>
-        </p>
-        <p>Or paste this link into your browser:</p>
-        <p style="word-break:break-all;font-size:13px;color:${BRAND.muted}">${resetLink}</p>
-        <div class="divider"></div>
-        <p style="font-size:13px;color:${BRAND.muted}">This link expires in 1 hour. If you didn't request a password reset, no action is needed — your password has not been changed.</p>`
+      body: [
+        t.greeting(userName),
+        t.p('We received a request to reset your SureTalk password. Click the button below to choose a new one.'),
+        t.button('Reset my password', resetLink),
+        t.linkFallback(resetLink),
+        t.divider(),
+        t.p("This link expires in 1 hour. If you didn't request a password reset, no action is needed: your password has not been changed.", { muted: true, small: true }),
+      ]
     });
     return this._send({
       to: toEmail,
       subject: 'Reset Your SureTalk Password',
       html,
-      text: this._text('Reset Your Password', [
-        `Hi ${userName},`,
-        '',
-        'Reset your password by visiting:',
-        resetLink,
-        '',
-        'This link expires in 1 hour.'
-      ])
+      text: t.text({ title: 'Reset your password', toEmail, lines: [
+        `Hi ${userName || 'there'},`, '', 'Reset your password by visiting:', resetLink, '', 'This link expires in 1 hour.'
+      ] })
     });
   }
 
@@ -206,36 +96,28 @@ class EmailService {
   // ══════════════════════════════════════════════════════════════════════════
   async sendWelcomeEmail(toEmail, userName) {
     try {
-      const html = this._wrap({
-        title: 'Welcome to SureTalk!',
+      const dashboard = `${this.siteUrl}/usersDashboard`;
+      const html = t.render({
+        category: 'Account', title: 'Welcome to SureTalk', subtitle: 'Your account is verified and ready to go.', toEmail,
         preheader: 'Your account is verified and ready to go.',
-        toEmail,
-        body: `
-          <p class="greeting">Welcome, ${userName}! 🎉</p>
-          <p>Your email is verified and your SureTalk account is ready. Here's what you can do right now:</p>
-          <div class="info-box">
-            <p style="margin:0 0 8px"><strong>📞 Record a voice note</strong><br>Call in or use the web dashboard to record your first message.</p>
-          </div>
-          <div class="info-box">
-            <p style="margin:0 0 8px"><strong>👥 Add trusted contacts</strong><br>Add the people who can receive and play your voice notes.</p>
-          </div>
-          <div class="info-box">
-            <p style="margin:0 0 8px"><strong>📅 Schedule a message</strong><br>Set a voice message to be delivered automatically at a future date.</p>
-          </div>
-          <p style="text-align:center;margin:32px 0">
-            <a href="${this.siteUrl}/usersDashboard" class="btn">Go to My Dashboard</a>
-          </p>`
+        body: [
+          t.lead(`Welcome, ${userName || 'there'}!`),
+          t.p("Your email is verified and your SureTalk account is ready. Here's what you can do right now:"),
+          t.steps([
+            ['Record a voice note', 'Call in or use the web dashboard to record your first message.'],
+            ['Add trusted contacts', 'Add the people who can receive and play your voice notes.'],
+            ['Schedule a message', 'Set a voice message to be delivered automatically at a future date.'],
+          ]),
+          t.button('Go to my dashboard', dashboard),
+        ]
       });
-      return this._send({
+      return await this._send({
         to: toEmail,
-        subject: 'Welcome to SureTalk — You\'re all set!',
+        subject: "Welcome to SureTalk — You're all set!",
         html,
-        text: this._text('Welcome to SureTalk!', [
-          `Welcome, ${userName}!`,
-          '',
-          'Your account is verified and ready.',
-          `Log in at: ${this.siteUrl}`
-        ])
+        text: t.text({ title: 'Welcome to SureTalk', toEmail, lines: [
+          `Welcome, ${userName || 'there'}!`, '', 'Your account is verified and ready.', `Log in at: ${this.siteUrl}`
+        ] })
       });
     } catch (err) {
       logger.error('Failed to send welcome email:', err);
@@ -248,85 +130,65 @@ class EmailService {
   async sendPaymentFailedEmail(toEmail, userName, { amountDue, currency = 'USD', nextRetryDate, attemptCount = 1 }) {
     const billingUrl = `${this.siteUrl}/usersDashboard/billing`;
     const isLastWarning = attemptCount >= 3;
-    const formattedAmount = new Intl.NumberFormat('en-US', { style: 'currency', currency: currency.toUpperCase() }).format(amountDue / 100);
-
-    const html = this._wrap({
-      title: isLastWarning ? 'Action Required: Final Payment Attempt' : 'Payment Failed',
-      preheader: `We couldn't process your ${formattedAmount} payment. Please update your card.`,
-      headerAccent: BRAND.coral,
-      toEmail,
-      body: `
-        <p class="greeting">Hi ${userName},</p>
-        <p>We were unable to process your SureTalk subscription payment. Please update your payment method to keep your account active.</p>
-        <div class="info-box warn">
-          <table width="100%" cellpadding="0" cellspacing="0">
-            <tr><td class="detail-label">Amount due</td><td align="right" class="detail-value">${formattedAmount}</td></tr>
-            <tr><td class="detail-label">Attempt</td><td align="right" class="detail-value">${attemptCount} of 4</td></tr>
-            ${nextRetryDate ? `<tr><td class="detail-label">Next retry</td><td align="right" class="detail-value">${nextRetryDate}</td></tr>` : ''}
-          </table>
-        </div>
-        ${isLastWarning ? `
-        <p><strong style="color:${BRAND.coral}">This is our final attempt.</strong> If payment is not resolved, your account will be suspended and you will lose access to your voice notes and contacts.</p>` : `
-        <p>We'll automatically try again. To avoid any interruption to your service, please update your payment method now.</p>`}
-        <p style="text-align:center;margin:32px 0">
-          <a href="${billingUrl}" class="btn btn-coral">Update Payment Method</a>
-        </p>
-        <div class="divider"></div>
-        <p style="font-size:13px;color:${BRAND.muted}">If you believe this is an error, please contact us. Your data is safe — we won't delete anything.</p>`
+    const amount = money(amountDue, currency);
+    const html = t.render({
+      category: 'Billing', accent: 'urgent', toEmail,
+      title: isLastWarning ? 'Action required: final payment attempt' : 'Payment failed',
+      preheader: `We couldn't process your ${amount} payment. Please update your card.`,
+      body: [
+        t.greeting(userName),
+        t.p('We were unable to process your SureTalk subscription payment. Please update your payment method to keep your account active.'),
+        t.details([
+          ['Amount due', amount],
+          ['Attempt', `${attemptCount} of 4`],
+          nextRetryDate ? ['Next retry', nextRetryDate] : null,
+        ]),
+        isLastWarning
+          ? t.callout('If payment is not resolved, your account will be suspended and you will lose access to your voice notes and contacts.', { tone: 'warn', title: 'This is our final attempt' })
+          : t.p("We'll automatically try again. To avoid any interruption to your service, please update your payment method now."),
+        t.button('Update payment method', billingUrl, { tone: 'urgent' }),
+        t.divider(),
+        t.p("If you believe this is an error, please contact us. Your data is safe: we won't delete anything.", { muted: true, small: true }),
+      ]
     });
-
     return this._send({
       to: toEmail,
       subject: isLastWarning
-        ? `⚠️ Final notice: Your SureTalk payment needs attention`
-        : `Action needed: SureTalk payment of ${formattedAmount} failed`,
+        ? 'Final notice: Your SureTalk payment needs attention'
+        : `Action needed: SureTalk payment of ${amount} failed`,
       html,
-      text: this._text('Payment Failed', [
-        `Hi ${userName},`,
-        '',
-        `We couldn't process your payment of ${formattedAmount}.`,
-        `Please update your payment method at: ${billingUrl}`,
-        '',
-        nextRetryDate ? `Next retry: ${nextRetryDate}` : ''
-      ])
+      text: t.text({ title: 'Payment failed', toEmail, lines: [
+        `Hi ${userName || 'there'},`, '', `We couldn't process your payment of ${amount}.`,
+        `Please update your payment method at: ${billingUrl}`, '', nextRetryDate ? `Next retry: ${nextRetryDate}` : ''
+      ] })
     });
   }
 
   // ══════════════════════════════════════════════════════════════════════════
-  // 5. ACCOUNT SUSPENDED (all retries exhausted)
+  // 5. ACCOUNT SUSPENDED (all payment retries exhausted)
   // ══════════════════════════════════════════════════════════════════════════
   async sendAccountSuspendedEmail(toEmail, userName) {
     const billingUrl = `${this.siteUrl}/usersDashboard/billing`;
-    const html = this._wrap({
-      title: 'Your Account Has Been Paused',
+    const html = t.render({
+      category: 'Billing', accent: 'urgent', title: 'Your account has been paused', toEmail,
       preheader: 'Reactivate your SureTalk account to regain access.',
-      headerAccent: BRAND.coral,
-      toEmail,
-      body: `
-        <p class="greeting">Hi ${userName},</p>
-        <p>Your SureTalk subscription has been suspended because we were unable to collect payment after multiple attempts.</p>
-        <div class="info-box warn">
-          <p style="margin:0"><strong>Your account is currently paused.</strong> You cannot access voice notes, contacts, or scheduled messages until your subscription is reactivated.</p>
-        </div>
-        <p><strong>The good news:</strong> Your data is completely safe. All your voice notes and contacts are preserved. You just need to update your payment method to restore access instantly.</p>
-        <p style="text-align:center;margin:32px 0">
-          <a href="${billingUrl}" class="btn btn-coral">Reactivate My Account</a>
-        </p>
-        <div class="divider"></div>
-        <p style="font-size:13px;color:${BRAND.muted}">Need help? Reply to this email and our team will assist you.</p>`
+      body: [
+        t.greeting(userName),
+        t.p('Your SureTalk subscription has been suspended because we were unable to collect payment after multiple attempts.'),
+        t.callout('You cannot access voice notes, contacts, or scheduled messages until your subscription is reactivated.', { tone: 'warn', title: 'Your account is currently paused' }),
+        t.p(t.rich(t.b('The good news:'), ' Your data is completely safe. All your voice notes and contacts are preserved. You just need to update your payment method to restore access instantly.')),
+        t.button('Reactivate my account', billingUrl, { tone: 'urgent' }),
+        t.divider(),
+        t.p('Need help? Reply to this email and our team will assist you.', { muted: true, small: true }),
+      ]
     });
-
     return this._send({
       to: toEmail,
       subject: 'Your SureTalk account has been paused',
       html,
-      text: this._text('Account Suspended', [
-        `Hi ${userName},`,
-        '',
-        'Your SureTalk account has been paused due to a failed payment.',
-        'Your data is safe. Reactivate at:',
-        billingUrl
-      ])
+      text: t.text({ title: 'Account paused', toEmail, lines: [
+        `Hi ${userName || 'there'},`, '', 'Your SureTalk account has been paused due to a failed payment.', 'Your data is safe. Reactivate at:', billingUrl
+      ] })
     });
   }
 
@@ -335,45 +197,32 @@ class EmailService {
   // ══════════════════════════════════════════════════════════════════════════
   async sendPaymentSuccessEmail(toEmail, userName, { amountPaid, currency = 'USD', tier, nextBillingDate }) {
     const billingUrl = `${this.siteUrl}/usersDashboard/billing`;
-    const formattedAmount = new Intl.NumberFormat('en-US', { style: 'currency', currency: currency.toUpperCase() }).format(amountPaid / 100);
-    const tierLabel = { LITE: 'SureTalk LITE', ESSENTIAL: 'SureTalk Essential', LEGACY_VAULT_PREMIUM: 'SureTalk Premium (Legacy Vault)' }[tier] || tier;
-
-    const html = this._wrap({
-      title: 'Payment Confirmed',
-      preheader: `Your ${formattedAmount} payment was successful.`,
-      toEmail,
-      body: `
-        <p class="greeting">Hi ${userName},</p>
-        <p>Your SureTalk subscription has been renewed. Thank you!</p>
-        <div class="info-box">
-          <table width="100%" cellpadding="0" cellspacing="0">
-            <tr><td class="detail-label">Plan</td><td align="right" class="detail-value">${tierLabel}</td></tr>
-            <tr><td class="detail-label">Amount charged</td><td align="right" class="detail-value">${formattedAmount}</td></tr>
-            ${nextBillingDate ? `<tr><td class="detail-label">Next billing date</td><td align="right" class="detail-value">${nextBillingDate}</td></tr>` : ''}
-          </table>
-        </div>
-        <p>Everything is active and ready. Keep using SureTalk as normal.</p>
-        <p style="text-align:center;margin:32px 0">
-          <a href="${this.siteUrl}/usersDashboard" class="btn">Go to Dashboard</a>
-          &nbsp;
-          <a href="${billingUrl}" style="display:inline-block;padding:14px 32px;color:${BRAND.blue};text-decoration:none;font-weight:700;font-size:15px">View Billing</a>
-        </p>
-        <div class="divider"></div>
-        <p style="font-size:13px;color:${BRAND.muted}">To manage or cancel your subscription, visit your <a href="${billingUrl}" style="color:${BRAND.blue}">billing page</a>.</p>`
+    const amount = money(amountPaid, currency);
+    const tierLabel = TIER_LABELS[tier] || tier;
+    const html = t.render({
+      category: 'Billing', accent: 'success', title: 'Payment confirmed', subtitle: 'Thank you. Your subscription has been renewed.', toEmail,
+      preheader: `Your ${amount} payment was successful.`,
+      body: [
+        t.greeting(userName),
+        t.details([
+          ['Plan', tierLabel],
+          ['Amount charged', amount],
+          nextBillingDate ? ['Next billing date', nextBillingDate] : null,
+        ]),
+        t.p('Everything is active and ready. Keep using SureTalk as normal.'),
+        t.button('Go to dashboard', `${this.siteUrl}/usersDashboard`),
+        t.divider(),
+        t.p(t.rich('To manage or cancel your subscription, visit your ', t.a('billing page', billingUrl), '.'), { muted: true, small: true }),
+      ]
     });
-
     return this._send({
       to: toEmail,
-      subject: `Payment confirmed — ${formattedAmount} charged for ${tierLabel}`,
+      subject: `Payment confirmed — ${amount} charged for ${tierLabel}`,
       html,
-      text: this._text('Payment Confirmed', [
-        `Hi ${userName},`,
-        '',
-        `Payment of ${formattedAmount} confirmed for ${tierLabel}.`,
-        nextBillingDate ? `Next billing date: ${nextBillingDate}` : '',
-        '',
-        `Manage billing: ${billingUrl}`
-      ])
+      text: t.text({ title: 'Payment confirmed', toEmail, lines: [
+        `Hi ${userName || 'there'},`, '', `Payment of ${amount} confirmed for ${tierLabel}.`,
+        nextBillingDate ? `Next billing date: ${nextBillingDate}` : '', '', `Manage billing: ${billingUrl}`
+      ] })
     });
   }
 
@@ -383,238 +232,236 @@ class EmailService {
   async sendSubscriptionCancelledEmail(toEmail, userName, { tier, accessUntilDate }) {
     const billingUrl = `${this.siteUrl}/usersDashboard/billing`;
     const tierLabel = { LITE: 'SureTalk LITE', ESSENTIAL: 'SureTalk Essential', LEGACY_VAULT_PREMIUM: 'SureTalk Premium' }[tier] || tier;
-
-    const html = this._wrap({
-      title: 'Subscription Cancelled',
+    const html = t.render({
+      category: 'Billing', title: 'Subscription cancelled', toEmail,
       preheader: 'Your SureTalk subscription has been cancelled.',
-      toEmail,
-      body: `
-        <p class="greeting">Hi ${userName},</p>
-        <p>Your <strong>${tierLabel}</strong> subscription has been cancelled. We're sorry to see you go.</p>
-        <div class="info-box">
-          <p style="margin:0">
-            Your account will continue on the <strong>free LITE plan</strong>.
-            ${accessUntilDate ? `You had paid access until <strong>${accessUntilDate}</strong>.` : ''}
-            Your voice notes and contacts are preserved.
-          </p>
-        </div>
-        <p><strong>What you still have on LITE:</strong></p>
-        <ul style="font-size:15px;color:#374151;padding-left:20px;line-height:2">
-          <li>Up to 3 voice notes</li>
-          <li>Up to 3 contacts</li>
-          <li>Phone-based access</li>
-        </ul>
-        <p>Changed your mind? You can reactivate your subscription at any time.</p>
-        <p style="text-align:center;margin:32px 0">
-          <a href="${billingUrl}" class="btn">Reactivate Subscription</a>
-        </p>
-        <div class="divider"></div>
-        <p style="font-size:13px;color:${BRAND.muted}">Your card will not be charged again. If you have questions, just reply to this email.</p>`
+      body: [
+        t.greeting(userName),
+        t.p(t.rich('Your ', t.b(tierLabel), " subscription has been cancelled. We're sorry to see you go.")),
+        t.callout(t.rich(
+          'Your account will continue on the ', t.b('free LITE plan'), '. ',
+          accessUntilDate ? t.rich('You had paid access until ', t.b(accessUntilDate), '. ') : '',
+          'Your voice notes and contacts are preserved.'
+        ), { tone: 'info' }),
+        t.p(t.b('What you still have on LITE:')),
+        t.list(['Up to 3 voice notes', 'Up to 3 contacts', 'Phone-based access']),
+        t.p('Changed your mind? You can reactivate your subscription at any time.'),
+        t.button('Reactivate subscription', billingUrl),
+        t.divider(),
+        t.p('Your card will not be charged again. If you have questions, just reply to this email.', { muted: true, small: true }),
+      ]
     });
-
     return this._send({
       to: toEmail,
       subject: 'Your SureTalk subscription has been cancelled',
       html,
-      text: this._text('Subscription Cancelled', [
-        `Hi ${userName},`,
-        '',
-        `Your ${tierLabel} subscription has been cancelled.`,
-        'Your account has been moved to the free LITE plan.',
-        'Your data is safe.',
-        '',
-        `Reactivate at: ${billingUrl}`
-      ])
+      text: t.text({ title: 'Subscription cancelled', toEmail, lines: [
+        `Hi ${userName || 'there'},`, '', `Your ${tierLabel} subscription has been cancelled.`,
+        'Your account has been moved to the free LITE plan.', 'Your data is safe.', '', `Reactivate at: ${billingUrl}`
+      ] })
     });
   }
 
   // ══════════════════════════════════════════════════════════════════════════
-  // 9. ACCOUNT DELETED
+  // 8. ACCOUNT DELETED
   // ══════════════════════════════════════════════════════════════════════════
   async sendAccountDeletedEmail(toEmail, userName) {
-    const html = this._wrap({
-      title: 'Account Deleted',
+    const html = t.render({
+      category: 'Account', title: 'Account deleted', toEmail,
       preheader: 'Your SureTalk account has been deleted.',
-      headerAccent: BRAND.navy,
-      toEmail,
-      body: `
-        <p class="greeting">Hi ${userName},</p>
-        <p>Your SureTalk account has been successfully deleted. We're sorry to see you go.</p>
-        <div class="info-box">
-          <p style="margin:0">
-            <strong>What this means:</strong><br>
-            Your account access has been removed immediately. Any active subscription has been cancelled — you will not be charged again.
-            Your personal data is retained for a period required by applicable law before being permanently removed.
-          </p>
-        </div>
-        <p>If you change your mind, you're always welcome back. Simply create a new account at <a href="${this.siteUrl}/signup" style="color:${BRAND.blue}">suretalknow.com</a>.</p>
-        <p>If you did not request this deletion or believe this was made in error, please contact our support team immediately by replying to this email.</p>
-        <div class="divider"></div>
-        <p style="font-size:13px;color:${BRAND.muted}">Thank you for using SureTalk. We hope to see you again someday.</p>`
+      reason: `This is a confirmation that the SureTalk account for ${toEmail || 'this address'} was deleted.`,
+      body: [
+        t.greeting(userName),
+        t.p("Your SureTalk account has been successfully deleted. We're sorry to see you go."),
+        t.callout('Your account access has been removed immediately. Any active subscription has been cancelled: you will not be charged again. Your personal data is retained for a period required by applicable law before being permanently removed.', { tone: 'neutral', title: 'What this means' }),
+        t.p(t.rich("If you change your mind, you're always welcome back. Simply create a new account at ", t.a('suretalknow.com', `${this.siteUrl}/signup`), '.')),
+        t.p('If you did not request this deletion or believe this was made in error, please contact our support team immediately by replying to this email.'),
+        t.divider(),
+        t.p('Thank you for using SureTalk. We hope to see you again someday.', { muted: true, small: true }),
+      ]
     });
-
     return this._send({
       to: toEmail,
       subject: 'Your SureTalk account has been deleted',
       html,
-      text: this._text('Account Deleted', [
-        `Hi ${userName},`,
-        '',
-        'Your SureTalk account has been successfully deleted.',
-        'Any active subscription has been cancelled — you will not be charged again.',
-        '',
-        'If this was a mistake, please reply to this email immediately.',
-        '',
-        `Create a new account anytime at ${this.siteUrl}/signup`
-      ])
+      text: t.text({ title: 'Account deleted', lines: [
+        `Hi ${userName || 'there'},`, '', 'Your SureTalk account has been successfully deleted.',
+        'Any active subscription has been cancelled. You will not be charged again.', '',
+        'If this was a mistake, please reply to this email immediately.', '', `Create a new account anytime at ${this.siteUrl}/signup`
+      ] })
     });
   }
 
   // ══════════════════════════════════════════════════════════════════════════
-  // 8. TRIAL ENDING IN 3 DAYS
+  // 9. TRIAL ENDING IN 3 DAYS
   // ══════════════════════════════════════════════════════════════════════════
   async sendTrialEndingEmail(toEmail, userName, { trialEndDate, tier }) {
     const billingUrl = `${this.siteUrl}/usersDashboard/billing`;
     const tierLabel = { ESSENTIAL: 'SureTalk Essential ($6.99/mo)', LEGACY_VAULT_PREMIUM: 'SureTalk Premium ($12.99/mo)' }[tier] || tier;
-
-    const html = this._wrap({
-      title: 'Your Trial Ends in 3 Days',
+    const html = t.render({
+      category: 'Billing', title: 'Your trial ends in 3 days', toEmail,
       preheader: `Your free trial ends on ${trialEndDate}. Add a card to keep your access.`,
-      toEmail,
-      body: `
-        <p class="greeting">Hi ${userName},</p>
-        <p>Your free trial of <strong>${tierLabel}</strong> ends on <strong>${trialEndDate}</strong>.</p>
-        <p>To keep your full access — including all your voice notes, contacts, and features — add a payment method before your trial expires.</p>
-        <div class="info-box">
-          <p style="margin:0">After your trial ends, your account will move to the free <strong>LITE plan</strong> if no payment method is on file. You won't lose your data, but features will be limited.</p>
-        </div>
-        <p style="text-align:center;margin:32px 0">
-          <a href="${billingUrl}" class="btn">Add Payment Method</a>
-        </p>
-        <div class="divider"></div>
-        <p style="font-size:13px;color:${BRAND.muted}">You can cancel anytime from your billing page. No charge until your trial ends.</p>`
+      body: [
+        t.greeting(userName),
+        t.p(t.rich('Your free trial of ', t.b(tierLabel), ' ends on ', t.b(trialEndDate), '.')),
+        t.p('To keep your full access, including all your voice notes, contacts, and features, add a payment method before your trial expires.'),
+        t.callout(t.rich("After your trial ends, your account will move to the free ", t.b('LITE plan'), " if no payment method is on file. You won't lose your data, but features will be limited."), { tone: 'info' }),
+        t.button('Add payment method', billingUrl),
+        t.divider(),
+        t.p('You can cancel anytime from your billing page. No charge until your trial ends.', { muted: true, small: true }),
+      ]
     });
-
     return this._send({
       to: toEmail,
       subject: `Your SureTalk trial ends on ${trialEndDate} — keep your access`,
       html,
-      text: this._text('Trial Ending Soon', [
-        `Hi ${userName},`,
-        '',
-        `Your free trial ends on ${trialEndDate}.`,
-        `Add a payment method to continue: ${billingUrl}`
-      ])
+      text: t.text({ title: 'Trial ending soon', toEmail, lines: [
+        `Hi ${userName || 'there'},`, '', `Your free trial ends on ${trialEndDate}.`, `Add a payment method to continue: ${billingUrl}`
+      ] })
     });
   }
 
   // ══════════════════════════════════════════════════════════════════════════
-  // 9. VOICE WILL RELEASED TO A BENEFICIARY
+  // 10. VOICE WILL RELEASED TO A BENEFICIARY
   // ══════════════════════════════════════════════════════════════════════════
   async sendWillReleasedEmail(toEmail, recipientName, { ownerName, listenUrl, expiresDate }) {
-    const esc = (s) => String(s || '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-    const owner = esc(ownerName) || 'Someone';
-    const html = this._wrap({
-      title: 'A voice will has been shared with you',
-      preheader: `${ownerName || 'Someone'} left a voice will for you on SureTalk.`,
-      headerAccent: BRAND.navy,
-      toEmail,
-      body: `
-        <p class="greeting">Hi ${esc(recipientName) || 'there'},</p>
-        <p><strong>${owner}</strong> recorded a voice will on SureTalk and named you as someone who should hear it. It has now been released to you.</p>
-        <div style="text-align:center;margin:28px 0">
-          <a href="${listenUrl}" class="btn">Listen to the voice will</a>
-        </div>
-        <div class="info-box">
-          <p style="margin:0">
-            This private link was created for you. Please don't forward it.<br>
-            It works until <strong>${esc(expiresDate)}</strong>.
-          </p>
-        </div>
-        <p style="font-size:13px;color:${BRAND.muted}">If you weren't expecting this or think it reached you by mistake, reply to this email and our team will help.</p>`
+    const owner = ownerName || 'Someone';
+    const html = t.render({
+      category: 'Legacy Vault', title: 'A voice will has been shared with you', toEmail,
+      preheader: `${owner} left a voice will for you on SureTalk.`,
+      reason: 'You received this email because a SureTalk member named you as a recipient of their voice will.',
+      accountLinks: false,
+      body: [
+        t.greeting(recipientName),
+        t.p(t.rich(t.b(owner), ' recorded a voice will on SureTalk and named you as someone who should hear it. It has now been released to you.')),
+        t.button('Listen to the voice will', listenUrl),
+        t.callout(`This private link was created for you. Please don't forward it. It works until ${expiresDate}.`, { tone: 'neutral' }),
+        t.p("If you weren't expecting this or think it reached you by mistake, reply to this email and our team will help.", { muted: true, small: true }),
+      ]
     });
-
     return this._send({
       to: toEmail,
-      subject: `${ownerName || 'Someone'} left a voice will for you on SureTalk`,
+      subject: `${owner} left a voice will for you on SureTalk`,
       html,
-      text: this._text('A voice will has been shared with you', [
-        `Hi ${recipientName || 'there'},`,
-        '',
-        `${ownerName || 'Someone'} recorded a voice will on SureTalk and named you as someone who should hear it.`,
-        `Listen here (private link, works until ${expiresDate}): ${listenUrl}`,
-        '',
-        'If you think this reached you by mistake, reply to this email.'
-      ])
+      text: t.text({ title: 'A voice will has been shared with you', lines: [
+        `Hi ${recipientName || 'there'},`, '', `${owner} recorded a voice will on SureTalk and named you as someone who should hear it.`,
+        `Listen here (private link, works until ${expiresDate}): ${listenUrl}`, '', 'If you think this reached you by mistake, reply to this email.'
+      ] })
     });
   }
 
   // ══════════════════════════════════════════════════════════════════════════
-  // 10. NEW ADMIN ACCESS REQUEST (to super admins)
+  // 11. NEW ADMIN ACCESS REQUEST (to super admins)
   // ══════════════════════════════════════════════════════════════════════════
   async sendAdminRequestNotification(toEmail, { applicantName, applicantEmail, department, reason }) {
-    const esc = (s) => String(s || '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
     const reviewUrl = `${this.siteUrl}/adminDashboard/admin-requests`;
-    const html = this._wrap({
-      title: 'New admin access request',
+    const html = t.render({
+      category: 'Admin', title: 'New admin access request', toEmail,
       preheader: `${applicantName} asked for access to the SureTalk admin console.`,
-      headerAccent: BRAND.navy,
-      toEmail,
-      body: `
-        <p class="greeting">Hi,</p>
-        <p><strong>${esc(applicantName)}</strong> (${esc(applicantEmail)}) has asked for access to the SureTalk admin console.</p>
-        <div class="info-box">
-          <p style="margin:0">
-            ${department ? `<strong>Department:</strong> ${esc(department)}<br>` : ''}
-            <strong>Reason:</strong> ${esc(reason) || '—'}
-          </p>
-        </div>
-        <div style="text-align:center;margin:28px 0"><a href="${reviewUrl}" class="btn">Review the request</a></div>
-        <p style="font-size:13px;color:${BRAND.muted}">Only approve people you know. Admins can see every user's data.</p>`
+      reason: "You're receiving this because you're a SureTalk super admin.",
+      body: [
+        t.lead('Hi,'),
+        t.p(t.rich(t.b(applicantName), ` (${applicantEmail || 'no email'}) has asked for access to the SureTalk admin console.`)),
+        t.details([
+          department ? ['Department', department] : null,
+          ['Reason', reason || '—'],
+        ]),
+        t.button('Review the request', reviewUrl),
+        t.p("Only approve people you know. Admins can see every user's data.", { muted: true, small: true }),
+      ]
     });
     return this._send({
       to: toEmail,
       subject: `Admin access request from ${applicantName}`,
       html,
-      text: this._text('New admin access request', [
-        `${applicantName} (${applicantEmail}) asked for admin access.`,
-        department ? `Department: ${department}` : '',
-        `Reason: ${reason || '—'}`,
-        '',
-        `Review it here: ${reviewUrl}`
-      ])
+      text: t.text({ title: 'New admin access request', lines: [
+        `${applicantName} (${applicantEmail}) asked for admin access.`, department ? `Department: ${department}` : '',
+        `Reason: ${reason || '—'}`, '', `Review it here: ${reviewUrl}`
+      ] })
     });
   }
 
   // ══════════════════════════════════════════════════════════════════════════
-  // 11. ADMIN ACCESS DECISION (to the applicant)
+  // 12. ADMIN ACCESS DECISION (to the applicant)
   // ══════════════════════════════════════════════════════════════════════════
   async sendAdminRequestDecision(toEmail, userName, { approved, reason }) {
-    const esc = (s) => String(s || '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
     const loginUrl = `${this.siteUrl}/admin/login`;
-    const html = this._wrap({
+    const html = t.render({
+      category: 'Admin', accent: approved ? 'success' : 'brand', toEmail,
       title: approved ? 'Admin access approved' : 'Admin access request',
       preheader: approved ? 'You can now sign in to the SureTalk admin console.' : 'An update on your SureTalk admin access request.',
-      headerAccent: BRAND.navy,
-      toEmail,
-      body: approved ? `
-        <p class="greeting">Hi ${esc(userName)},</p>
-        <p>Your request for access to the SureTalk admin console has been <strong>approved</strong>.</p>
-        <div style="text-align:center;margin:28px 0"><a href="${loginUrl}" class="btn">Sign in to the admin console</a></div>
-        <p style="font-size:13px;color:${BRAND.muted}">For your account's safety, turn on two-step verification after you sign in (Security &amp; audit page).</p>`
-      : `
-        <p class="greeting">Hi ${esc(userName)},</p>
-        <p>Your request for access to the SureTalk admin console was <strong>not approved</strong>.</p>
-        ${reason ? `<div class="info-box"><p style="margin:0"><strong>Reason:</strong> ${esc(reason)}</p></div>` : ''}
-        <p>If you think this is a mistake, reply to this email.</p>`
+      body: approved ? [
+        t.greeting(userName),
+        t.p(t.rich('Your request for access to the SureTalk admin console has been ', t.b('approved'), '.')),
+        t.button('Sign in to the admin console', loginUrl),
+        t.p("For your account's safety, turn on two-step verification after you sign in (Security & audit page).", { muted: true, small: true }),
+      ] : [
+        t.greeting(userName),
+        t.p(t.rich('Your request for access to the SureTalk admin console was ', t.b('not approved'), '.')),
+        reason ? t.callout(reason, { tone: 'neutral', title: 'Reason' }) : '',
+        t.p('If you think this is a mistake, reply to this email.'),
+      ].filter(Boolean)
     });
     return this._send({
       to: toEmail,
       subject: approved ? 'Your SureTalk admin access is approved' : 'Your SureTalk admin access request',
       html,
-      text: this._text(approved ? 'Admin access approved' : 'Admin access request', approved
-        ? [`Hi ${userName},`, '', 'Your admin access request was approved.', `Sign in: ${loginUrl}`]
-        : [`Hi ${userName},`, '', 'Your admin access request was not approved.', reason ? `Reason: ${reason}` : '', 'Reply to this email if you think this is a mistake.'])
+      text: t.text({ title: approved ? 'Admin access approved' : 'Admin access request', toEmail, lines: approved
+        ? [`Hi ${userName || 'there'},`, '', 'Your admin access request was approved.', `Sign in: ${loginUrl}`]
+        : [`Hi ${userName || 'there'},`, '', 'Your admin access request was not approved.', reason ? `Reason: ${reason}` : '', 'Reply to this email if you think this is a mistake.'] })
+    });
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // 13. VOICE MESSAGE DELIVERED BY EMAIL (scheduled messages and test sends)
+  // ══════════════════════════════════════════════════════════════════════════
+  async sendVoiceMessageEmail(toEmail, { title, message, listenUrl, senderName, expiresText = 'This link expires in 7 days.', subject }) {
+    const sender = senderName || 'SureTalk';
+    const noteTitle = title || 'Voice Note';
+    const html = t.render({
+      category: 'Voice message', title: 'Voice message for you', subtitle: `A message from ${sender}`,
+      preheader: `${sender} sent you a voice message on SureTalk.`,
+      reason: `You received this email because ${sender} sent you a voice message with SureTalk.`,
+      accountLinks: false,
+      body: [
+        t.callout(message || 'You have received a voice message.', { tone: 'info', title: noteTitle }),
+        t.p('Click the button below to listen:'),
+        t.button('Listen to voice note', listenUrl),
+        t.p(`Sent via SureTalk. ${expiresText}`, { muted: true, small: true, center: true }),
+      ]
+    });
+    return this._send({
+      to: toEmail,
+      subject: subject || `Voice Note from ${sender}: ${noteTitle}`,
+      html,
+      text: t.text({ title: 'Voice message for you', lines: [
+        `${message || 'You have received a voice message.'}`, '', `Listen here: ${listenUrl}`, '', expiresText
+      ] })
+    });
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // 14. INTERNAL: A SYNC TO THE PHONE LINE FAILED FOR GOOD (to ADMIN_EMAIL)
+  // ══════════════════════════════════════════════════════════════════════════
+  async sendSyncFailureAlert(toEmail, { recordId, eventType, error, payload }) {
+    const reviewUrl = `${this.siteUrl}/adminDashboard/super`;
+    const payloadText = JSON.stringify(payload, null, 2);
+    const html = t.render({
+      category: 'Admin', accent: 'urgent', title: 'A change could not reach the phone line',
+      preheader: `Sync of type ${eventType} failed after every retry.`,
+      reason: "You're receiving this because this address is set as SureTalk's admin alert address.",
+      body: [
+        t.p('The app tried to send this change to the phone line several times and gave up. Retry or dismiss it from the Failed syncs tab.'),
+        t.details([['Record ID', recordId], ['Type', eventType], ['Error', error || '—']]),
+        t.pre(payloadText),
+        t.button('Open failed syncs', reviewUrl, { tone: 'urgent' }),
+      ]
+    });
+    return this._send({
+      to: toEmail,
+      subject: `[SureTalk] Dead sync: ${eventType}`,
+      html,
+      text: `DEAD SYNC ITEM - App to phone line\n\nRecord ID: ${recordId}\nEvent Type: ${eventType}\nError: ${error}\nPayload: ${payloadText}\n\nOpen ${reviewUrl} to retry or dismiss it.`
     });
   }
 }

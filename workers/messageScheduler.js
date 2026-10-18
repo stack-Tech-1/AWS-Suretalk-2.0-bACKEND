@@ -7,10 +7,10 @@
 // EC2_STREAM_URL       — https://test-api.suretalknow.com
 
 const { pool } = require('../config/database');
-const AWS = require('aws-sdk');
 const twilio = require('twilio');
 const { generateDownloadUrl } = require('../utils/s3Storage');
 const logger = require('../utils/logger');
+const emailService = require('../utils/emailService');
 const { signedEc2RecordingUrl, signedEc2S3Url, TTL: AUDIO_TTL } = require('../utils/audioSigning');
 
 // After this many failed attempts a message is marked 'failed' (an admin can retry it)
@@ -20,64 +20,9 @@ const twilioClient = process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_T
   ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
   : null;
 
-const ses = new AWS.SES({
-  region: process.env.AWS_REGION,
-  accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
-});
-
-// Email sending function (AWS SES)
-const sendEmail = async (to, title, message, downloadUrl, senderName) => {
-  const emailHtml = `
-    <!DOCTYPE html>
-    <html>
-    <head><meta charset="UTF-8"></head>
-    <body style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
-      <div style="background: linear-gradient(135deg, #6366f1 0%, #7c3aed 100%);
-                  color: white; padding: 30px; text-align: center; border-radius: 12px 12px 0 0;">
-        <h1 style="margin: 0; font-size: 24px;">Voice Message for You</h1>
-        <p style="margin: 10px 0 0; opacity: 0.9;">A message from ${senderName}</p>
-      </div>
-      <div style="background: #f9f9f9; padding: 30px; border-radius: 0 0 12px 12px; border: 1px solid #e2e8f0;">
-        <p style="color: #334155; font-size: 16px;">${message || 'You have received a voice message.'}</p>
-        <p style="color: #64748b;">Click the button below to listen:</p>
-        <div style="text-align: center; margin: 30px 0;">
-          <a href="${downloadUrl}"
-             style="display: inline-block; background: linear-gradient(135deg, #6366f1, #7c3aed);
-                    color: white; padding: 14px 32px; text-decoration: none; border-radius: 8px;
-                    font-weight: bold; font-size: 16px;">
-            🎧 Listen to Voice Note
-          </a>
-        </div>
-        <p style="color: #94a3b8; font-size: 12px; text-align: center;">
-          Sent via SureTalk. This link expires in 7 days.
-        </p>
-      </div>
-    </body>
-    </html>
-  `;
-
-  const params = {
-    Destination: { ToAddresses: [to] },
-    Message: {
-      Body: {
-        Html: { Charset: 'UTF-8', Data: emailHtml },
-        Text: {
-          Charset: 'UTF-8',
-          Data: `${message || 'You have received a voice message.'}\n\nListen here: ${downloadUrl}\n\nThis link expires in 7 days.`
-        }
-      },
-      Subject: {
-        Charset: 'UTF-8',
-        Data: `Voice Note from ${senderName}: ${title}`
-      }
-    },
-    Source: process.env.SES_FROM_EMAIL
-  };
-
-  await ses.sendEmail(params).promise();
-  logger.info(`Email sent via SES to ${to}`);
-};
+// Email delivery: the shared SureTalk email design (utils/emailService.js)
+const sendEmail = (to, title, message, downloadUrl, senderName) =>
+  emailService.sendVoiceMessageEmail(to, { title, message, listenUrl: downloadUrl, senderName });
 
 // Escape text placed inside TwiML (XML). Signed audio URLs contain "&", and custom messages and
 // sender names are user-supplied — unescaped they break the call or inject TwiML verbs.
