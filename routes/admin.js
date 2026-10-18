@@ -533,6 +533,8 @@ router.get('/settings/service-status', authenticateAdmin, async (req, res) => {
 // ==================== SUPPORT ROUTES ====================
 
 // Helper function to generate unique ticket number
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 const generateTicketNumber = async () => {
   const year = new Date().getFullYear();
   let isUnique = false;
@@ -568,9 +570,8 @@ router.get('/support/tickets', authenticateAdmin, async (req, res) => {
         u.full_name as user_name,
         a.email as assigned_to_email,
         a.full_name as assigned_to_name,
-        (SELECT COUNT(*) FROM support_tickets st2
-         LEFT JOIN users u2 ON st2.user_id = u2.id
-         WHERE 1=1) as total_count
+        (SELECT COUNT(*) FROM ticket_responses tr WHERE tr.ticket_id = st.id)::int as response_count,
+        COUNT(*) OVER()::int as total_count
       FROM support_tickets st
       LEFT JOIN users u ON st.user_id = u.id
       LEFT JOIN users a ON st.assigned_to = a.id
@@ -639,24 +640,10 @@ router.get('/support/tickets', authenticateAdmin, async (req, res) => {
 
     const result = await pool.query(query, queryParams);
 
-    const ticketsWithResponses = await Promise.all(
-      result.rows.map(async (ticket) => {
-        const responseCount = await pool.query(
-          'SELECT COUNT(*) as count FROM ticket_responses WHERE ticket_id = $1',
-          [ticket.id]
-        );
-        
-        return {
-          ...ticket,
-          response_count: parseInt(responseCount.rows[0].count)
-        };
-      })
-    );
-
     res.json({
       success: true,
       data: {
-        tickets: ticketsWithResponses,
+        tickets: result.rows,
         pagination: {
           page: parseInt(page),
           limit: parseInt(limit),
@@ -679,6 +666,9 @@ router.get('/support/tickets', authenticateAdmin, async (req, res) => {
 router.get('/support/tickets/:id', authenticateAdmin, async (req, res) => {
   try {
     const { id } = req.params;
+    if (!UUID_RE.test(id)) {
+      return res.status(404).json({ success: false, error: 'Ticket not found' });
+    }
 
     const ticketQuery = await pool.query(`
       SELECT 
@@ -753,10 +743,12 @@ router.post('/support/tickets/:id/respond', authenticateAdmin, [
     const { id } = req.params;
     const { message, isInternal = false } = req.body;
 
-    const ticketCheck = await pool.query(
-      'SELECT id, status FROM support_tickets WHERE id = $1',
+    const ticketCheck = UUID_RE.test(id) ? await pool.query(
+      `SELECT st.id, st.status, st.ticket_number, st.subject, u.email AS user_email, u.full_name AS user_name
+       FROM support_tickets st LEFT JOIN users u ON u.id = st.user_id
+       WHERE st.id = $1`,
       [id]
-    );
+    ) : { rows: [] };
 
     if (ticketCheck.rows.length === 0) {
       return res.status(404).json({
@@ -764,6 +756,7 @@ router.post('/support/tickets/:id/respond', authenticateAdmin, [
         error: 'Ticket not found'
       });
     }
+    const ticket = ticketCheck.rows[0];
 
     const response = await pool.query(
       `INSERT INTO ticket_responses (ticket_id, user_id, message, is_internal)
@@ -772,10 +765,21 @@ router.post('/support/tickets/:id/respond', authenticateAdmin, [
       [id, req.user.id, message, isInternal]
     );
 
+    // A reply to the customer means someone is working on it
     await pool.query(
-      'UPDATE support_tickets SET updated_at = CURRENT_TIMESTAMP WHERE id = $1',
-      [id]
+      `UPDATE support_tickets
+       SET updated_at = CURRENT_TIMESTAMP,
+           status = CASE WHEN $2 AND status = 'open' THEN 'in_progress' ELSE status END
+       WHERE id = $1`,
+      [id, !isInternal]
     );
+
+    // Tell the customer (internal notes are never sent)
+    if (!isInternal && ticket.user_email) {
+      require('../utils/emailService').sendSupportReplyEmail(ticket.user_email, ticket.user_name, {
+        ticketId: id, ticketNumber: ticket.ticket_number, subject: ticket.subject, message,
+      }).catch(err => console.error('Support reply email failed:', err.message));
+    }
 
     logAdminAudit({ userId: req.user.id, action: 'RESPOND_TICKET', targetId: id, newValue: { message, isInternal }, ipAddress: req.ip });
 
@@ -810,7 +814,7 @@ router.put('/support/tickets/:id/status', authenticateAdmin, [
     const { id } = req.params;
     const { status } = req.body;
 
-    const updates = ['status = $1'];
+    const updates = ['status = $1', 'updated_at = CURRENT_TIMESTAMP'];
     const values = [status];
     let paramCount = 2;
 
@@ -821,18 +825,27 @@ router.put('/support/tickets/:id/status', authenticateAdmin, [
       paramCount++;
     } else if (status === 'closed') {
       updates.push('closed_at = CURRENT_TIMESTAMP');
+    } else {
+      // Re-opened: it's no longer resolved/closed, and stays out of the resolution-time average
+      updates.push('resolved_by = NULL', 'resolved_at = NULL', 'closed_at = NULL');
     }
 
+    if (!UUID_RE.test(id)) {
+      return res.status(404).json({ success: false, error: 'Ticket not found' });
+    }
     values.push(id);
 
     const query = `
-      UPDATE support_tickets 
+      UPDATE support_tickets
       SET ${updates.join(', ')}
       WHERE id = $${paramCount}
       RETURNING *
     `;
 
     const result = await pool.query(query, values);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Ticket not found' });
+    }
 
     logAdminAudit({ userId: req.user.id, action: 'UPDATE_TICKET_STATUS', targetId: id, newValue: { status }, ipAddress: req.ip });
 
@@ -853,7 +866,7 @@ router.put('/support/tickets/:id/status', authenticateAdmin, [
 
 // Assign ticket to admin
 router.put('/support/tickets/:id/assign', authenticateAdmin, [
-  body('adminId').optional().isUUID()
+  body('adminId').optional({ checkFalsy: true }).custom(v => v === 'me' || UUID_RE.test(v))
 ], async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -867,7 +880,20 @@ router.put('/support/tickets/:id/assign', authenticateAdmin, [
     const { id } = req.params;
     const { adminId } = req.body;
 
-    const assignValue = adminId || null;
+    const assignValue = adminId === 'me' ? req.user.id : (adminId || null);
+    if (!UUID_RE.test(id)) {
+      return res.status(404).json({ success: false, error: 'Ticket not found' });
+    }
+    // Only approved admins can be given a ticket
+    if (assignValue) {
+      const admin = await pool.query(
+        `SELECT id FROM users WHERE id = $1 AND is_admin = true AND admin_status = 'approved' AND deleted_at IS NULL`,
+        [assignValue]
+      );
+      if (admin.rows.length === 0) {
+        return res.status(400).json({ success: false, error: 'That person is not an approved admin' });
+      }
+    }
 
     const result = await pool.query(
       `UPDATE support_tickets 
@@ -910,6 +936,9 @@ router.put('/support/tickets/:id/notes', authenticateAdmin, [
   try {
     const { id } = req.params;
     const { notes } = req.body;
+    if (!UUID_RE.test(id)) {
+      return res.status(404).json({ success: false, error: 'Ticket not found' });
+    }
 
     const result = await pool.query(
       `UPDATE support_tickets 
@@ -948,23 +977,23 @@ router.get('/support/stats', authenticateAdmin, async (req, res) => {
   try {
     const stats = await pool.query(`
       SELECT 
-        COUNT(*) as total_tickets,
-        COUNT(CASE WHEN status = 'open' THEN 1 END) as open_tickets,
-        COUNT(CASE WHEN status = 'in_progress' THEN 1 END) as in_progress_tickets,
-        COUNT(CASE WHEN status = 'resolved' THEN 1 END) as resolved_tickets,
-        COUNT(CASE WHEN status = 'closed' THEN 1 END) as closed_tickets,
-        COUNT(CASE WHEN priority = 'critical' THEN 1 END) as critical_tickets,
-        COUNT(CASE WHEN priority = 'high' THEN 1 END) as high_tickets,
-        COUNT(CASE WHEN assigned_to IS NULL THEN 1 END) as unassigned_tickets,
-        AVG(CASE WHEN resolved_at IS NOT NULL THEN EXTRACT(EPOCH FROM (resolved_at - created_at)) END) as avg_resolution_seconds,
-        COUNT(CASE WHEN DATE(created_at) = CURRENT_DATE THEN 1 END) as today_tickets
+        COUNT(*)::int as total_tickets,
+        COUNT(CASE WHEN status = 'open' THEN 1 END)::int as open_tickets,
+        COUNT(CASE WHEN status = 'in_progress' THEN 1 END)::int as in_progress_tickets,
+        COUNT(CASE WHEN status = 'resolved' THEN 1 END)::int as resolved_tickets,
+        COUNT(CASE WHEN status = 'closed' THEN 1 END)::int as closed_tickets,
+        COUNT(CASE WHEN priority = 'critical' THEN 1 END)::int as critical_tickets,
+        COUNT(CASE WHEN priority = 'high' THEN 1 END)::int as high_tickets,
+        COUNT(CASE WHEN assigned_to IS NULL THEN 1 END)::int as unassigned_tickets,
+        ROUND(AVG(CASE WHEN resolved_at IS NOT NULL THEN EXTRACT(EPOCH FROM (resolved_at - created_at)) END))::int as avg_resolution_seconds,
+        COUNT(CASE WHEN DATE(created_at) = CURRENT_DATE THEN 1 END)::int as today_tickets
       FROM support_tickets
     `);
 
     const categoryStats = await pool.query(`
       SELECT 
         category,
-        COUNT(*) as count
+        COUNT(*)::int as count
       FROM support_tickets
       GROUP BY category
       ORDER BY count DESC
@@ -1003,7 +1032,7 @@ router.get('/support/knowledge-base', authenticateAdmin, async (req, res) => {
         ub.full_name as updated_by_name,
         pb.email as published_by_email,
         pb.full_name as published_by_name,
-        (SELECT COUNT(*) FROM knowledge_base_articles) as total_count
+        COUNT(*) OVER()::int as total_count
       FROM knowledge_base_articles kba
       LEFT JOIN users cb ON kba.created_by = cb.id
       LEFT JOIN users ub ON kba.updated_by = ub.id
@@ -1174,10 +1203,13 @@ router.put('/support/knowledge-base/:id', authenticateAdmin, [
       });
     }
 
-    updates.push(`updated_by = $${paramCount}`);
+    updates.push(`updated_by = $${paramCount}`, 'updated_at = CURRENT_TIMESTAMP');
     values.push(req.user.id);
     paramCount++;
 
+    if (!UUID_RE.test(id)) {
+      return res.status(404).json({ success: false, error: 'Article not found' });
+    }
     values.push(id);
 
     const query = `
@@ -1217,6 +1249,9 @@ router.put('/support/knowledge-base/:id', authenticateAdmin, [
 router.delete('/support/knowledge-base/:id', authenticateAdmin, async (req, res) => {
   try {
     const { id } = req.params;
+    if (!UUID_RE.test(id)) {
+      return res.status(404).json({ success: false, error: 'Article not found' });
+    }
 
     const result = await pool.query(
       'DELETE FROM knowledge_base_articles WHERE id = $1 RETURNING id',
@@ -1251,12 +1286,12 @@ router.get('/support/knowledge-base/stats', authenticateAdmin, async (req, res) 
   try {
     const stats = await pool.query(`
       SELECT 
-        COUNT(*) as total_articles,
-        COUNT(CASE WHEN published = true THEN 1 END) as published_articles,
-        COUNT(CASE WHEN published = false THEN 1 END) as draft_articles,
-        COALESCE(SUM(views), 0) as total_views,
-        COALESCE(SUM(helpful_votes), 0) as total_helpful_votes,
-        COALESCE(SUM(not_helpful_votes), 0) as total_not_helpful_votes,
+        COUNT(*)::int as total_articles,
+        COUNT(CASE WHEN published = true THEN 1 END)::int as published_articles,
+        COUNT(CASE WHEN published = false THEN 1 END)::int as draft_articles,
+        COALESCE(SUM(views), 0)::int as total_views,
+        COALESCE(SUM(helpful_votes), 0)::int as total_helpful_votes,
+        COALESCE(SUM(not_helpful_votes), 0)::int as total_not_helpful_votes,
         (
           SELECT category 
           FROM knowledge_base_articles 
@@ -1270,8 +1305,8 @@ router.get('/support/knowledge-base/stats', authenticateAdmin, async (req, res) 
     const categoryStats = await pool.query(`
       SELECT 
         category,
-        COUNT(*) as article_count,
-        COALESCE(SUM(views), 0) as total_views
+        COUNT(*)::int as article_count,
+        COALESCE(SUM(views), 0)::int as total_views
       FROM knowledge_base_articles
       WHERE published = true
       GROUP BY category
@@ -1292,6 +1327,23 @@ router.get('/support/knowledge-base/stats', authenticateAdmin, async (req, res) 
       success: false,
       error: 'Failed to fetch knowledge base statistics'
     });
+  }
+});
+
+// Get one knowledge base article (defined after /stats so "stats" isn't read as an id)
+router.get('/support/knowledge-base/:id', authenticateAdmin, async (req, res) => {
+  try {
+    if (!UUID_RE.test(req.params.id)) {
+      return res.status(404).json({ success: false, error: 'Article not found' });
+    }
+    const result = await pool.query('SELECT * FROM knowledge_base_articles WHERE id = $1', [req.params.id]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Article not found' });
+    }
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    console.error('Get article error:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch article' });
   }
 });
 

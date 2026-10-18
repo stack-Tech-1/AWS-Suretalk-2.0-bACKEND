@@ -5,7 +5,9 @@ const AWS = require('aws-sdk');
 const logger = require('./logger');
 const t = require('./emailTemplate');
 
-const TIER_LABELS = { LITE: 'SureTalk LITE', ESSENTIAL: 'SureTalk Essential', LEGACY_VAULT_PREMIUM: 'SureTalk Premium (Legacy Vault)' };
+// Customer-typed text with its line breaks kept (escaped)
+const multiline = (s) => t.raw(String(s || '').split(/\r?\n/).map(t.esc).join('<br>'));
+const TIER_LABELS ={ LITE: 'SureTalk LITE', ESSENTIAL: 'SureTalk Essential', LEGACY_VAULT_PREMIUM: 'SureTalk Premium (Legacy Vault)' };
 const money = (cents, currency = 'USD') =>
   new Intl.NumberFormat('en-US', { style: 'currency', currency: String(currency).toUpperCase() }).format((cents || 0) / 100);
 
@@ -409,6 +411,63 @@ class EmailService {
       text: t.text({ title: approved ? 'Admin access approved' : 'Admin access request', toEmail, lines: approved
         ? [`Hi ${userName || 'there'},`, '', 'Your admin access request was approved.', `Sign in: ${loginUrl}`]
         : [`Hi ${userName || 'there'},`, '', 'Your admin access request was not approved.', reason ? `Reason: ${reason}` : '', 'Reply to this email if you think this is a mistake.'] })
+    });
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // 12b. SUPPORT: NEW TICKET (to the support inbox) and REPLY (to the customer)
+  // ══════════════════════════════════════════════════════════════════════════
+  async sendNewTicketNotification(toEmail, { ticketId, ticketNumber, subject, category, priority, customerName, customerEmail, description }) {
+    const url = `${this.siteUrl}/adminDashboard/helpandsupport/tickets/${ticketId}`;
+    const html = t.render({
+      category: 'Support', title: 'New support ticket', toEmail,
+      preheader: `${ticketNumber}: ${subject}`,
+      reason: "You're receiving this because this address is SureTalk's support inbox.",
+      body: [
+        t.lead('Hi,'),
+        t.p(t.rich(t.b(customerName || customerEmail || 'A customer'), ' opened a support ticket.')),
+        t.details([
+          ['Ticket', ticketNumber],
+          ['Subject', subject],
+          ['Category', category],
+          ['Priority', priority],
+          customerEmail ? ['Customer', customerEmail] : null,
+        ]),
+        t.callout(multiline(description), { tone: 'neutral', title: 'Their message' }),
+        t.button('Open the ticket', url),
+      ]
+    });
+    return this._send({
+      to: toEmail,
+      subject: `[${ticketNumber}] New ${priority} ticket: ${subject}`,
+      html,
+      text: t.text({ title: 'New support ticket', lines: [
+        `${customerName || customerEmail || 'A customer'} opened ${ticketNumber}: ${subject}`,
+        `Category: ${category} · Priority: ${priority}`, '', description, '', `Open it: ${url}`
+      ] })
+    });
+  }
+
+  async sendSupportReplyEmail(toEmail, userName, { ticketId, ticketNumber, subject, message }) {
+    const url = `${this.siteUrl}/usersDashboard/helpandsupport/tickets/${ticketId}`;
+    const html = t.render({
+      category: 'Support', title: 'We replied to your ticket', toEmail, accountLinks: true,
+      preheader: `A reply about "${subject}"`,
+      body: [
+        t.greeting(userName),
+        t.p(t.rich('Our support team replied to your ticket ', t.b(ticketNumber), ` (${subject}).`)),
+        t.callout(multiline(message), { tone: 'info', title: 'Reply from SureTalk Support' }),
+        t.button('View the conversation', url),
+        t.p('To answer, reply on the ticket page so the whole conversation stays in one place.', { muted: true, small: true }),
+      ]
+    });
+    return this._send({
+      to: toEmail,
+      subject: `[${ticketNumber}] Reply to: ${subject}`,
+      html,
+      text: t.text({ title: 'We replied to your ticket', toEmail, lines: [
+        `Hi ${userName || 'there'},`, '', `Our support team replied to ${ticketNumber} (${subject}):`, '', message, '', `View and answer: ${url}`
+      ] })
     });
   }
 

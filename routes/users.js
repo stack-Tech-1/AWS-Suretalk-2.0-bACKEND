@@ -2,9 +2,9 @@
 const express = require('express');
 const router = express.Router();
 const { body, validationResult } = require('express-validator');
-const { authenticate, authenticateAdmin } = require('../middleware/auth');
+const { authenticate } = require('../middleware/auth');
 const { pool } = require('../config/database');
-const { syncToIvr, syncAccountToIvr } = require('../utils/syncIvr'); // Import sync helper
+const { syncAccountToIvr } = require('../utils/syncIvr'); // Import sync helper
 const { ivrTierName, normalizeTier } = require('../utils/tierMapping');
 
 // Get user profile
@@ -277,189 +277,6 @@ router.get('/limits', authenticate, async (req, res) => {
   }
 });
 
-// Admin: Get all users
-router.get('/', authenticateAdmin, async (req, res) => {
-  try {
-    const { page = 1, limit = 50, search, tier, status } = req.query;
-    const offset = (page - 1) * limit;
-
-    let query = `
-      SELECT 
-        id, email, phone, full_name, subscription_tier, 
-        subscription_status, verified, created_at, last_login,
-        (SELECT COUNT(*) FROM users WHERE deleted_at IS NULL) as total_count
-      FROM users 
-      WHERE deleted_at IS NULL
-    `;
-
-    const queryParams = [];
-    let paramCount = 1;
-
-    if (search) {
-      query += ` AND (email ILIKE $${paramCount} OR phone ILIKE $${paramCount} OR full_name ILIKE $${paramCount})`;
-      queryParams.push(`%${search}%`);
-      paramCount++;
-    }
-
-    if (tier && tier !== 'all') {
-      query += ` AND subscription_tier = $${paramCount}`;
-      queryParams.push(tier);
-      paramCount++;
-    }
-
-    if (status && status !== 'all') {
-      query += ` AND subscription_status = $${paramCount}`;
-      queryParams.push(status);
-      paramCount++;
-    }
-
-    query += ` ORDER BY created_at DESC LIMIT $${paramCount} OFFSET $${paramCount + 1}`;
-    queryParams.push(parseInt(limit), offset);
-
-    const result = await pool.query(query, queryParams);
-
-    res.json({
-      success: true,
-      data: {
-        users: result.rows,
-        pagination: {
-          page: parseInt(page),
-          limit: parseInt(limit),
-          total: result.rows[0]?.total_count || 0,
-          totalPages: Math.ceil((result.rows[0]?.total_count || 0) / limit)
-        }
-      }
-    });
-
-  } catch (error) {
-    console.error('Get users error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to fetch users'
-    });
-  }
-});
-
-// Admin: Update user (tier, verification, status)
-router.put('/:id', authenticateAdmin, [
-  body('subscription_tier').optional().isIn(['LITE', 'ESSENTIAL', 'PREMIUM', 'LEGACY_VAULT_PREMIUM']),
-  body('verified').optional().isBoolean(),
-  body('subscription_status').optional().isIn(['active', 'inactive', 'past_due', 'canceled']),
-  body('phone').optional().isMobilePhone()
-], async (req, res) => {
-  try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({
-        success: false,
-        errors: errors.array()
-      });
-    }
-
-    const { id } = req.params;
-    const { subscription_tier, verified, subscription_status, phone } = req.body;
-
-    // Build dynamic update
-    const updates = [];
-    const values = [];
-    let paramCount = 1;
-
-    if (subscription_tier !== undefined) {
-      updates.push(`subscription_tier = $${paramCount}`);
-      values.push(subscription_tier);
-      paramCount++;
-    }
-    if (verified !== undefined) {
-      updates.push(`verified = $${paramCount}`);
-      values.push(verified);
-      paramCount++;
-    }
-    if (subscription_status !== undefined) {
-      updates.push(`subscription_status = $${paramCount}`);
-      values.push(subscription_status);
-      paramCount++;
-    }
-    if (phone !== undefined) {
-      // Check phone uniqueness
-      const phoneCheck = await pool.query(
-        'SELECT id FROM users WHERE phone = $1 AND id != $2',
-        [phone, id]
-      );
-      if (phoneCheck.rows.length > 0) {
-        return res.status(400).json({
-          success: false,
-          error: 'Phone number already in use'
-        });
-      }
-      updates.push(`phone = $${paramCount}`);
-      values.push(phone);
-      paramCount++;
-    }
-
-    if (updates.length === 0) {
-      return res.status(400).json({
-        success: false,
-        error: 'No fields to update'
-      });
-    }
-
-    updates.push(`updated_at = CURRENT_TIMESTAMP`);
-    values.push(id);
-
-    const query = `
-      UPDATE users 
-      SET ${updates.join(', ')}
-      WHERE id = $${paramCount}
-      RETURNING id, email, phone, subscription_tier, verified, subscription_status
-    `;
-
-    const result = await pool.query(query, values);
-    if (result.rows.length === 0) {
-      return res.status(404).json({
-        success: false,
-        error: 'User not found'
-      });
-    }
-
-    const updatedUser = result.rows[0];
-
-    // Fire-and-forget sync to IVR for tier change
-    if (subscription_tier !== undefined) {
-      syncToIvr({
-        userId: updatedUser.phone,
-        subscription_tier: ivrTierName(updatedUser.subscription_tier),
-        verified: updatedUser.verified,
-        action: 'update_tier',
-        source: 'app'
-      }, 'sync-user');
-    }
-
-    // Fire-and-forget sync for verification change (if not already sent with tier)
-    if (verified !== undefined && subscription_tier === undefined) {
-      syncToIvr({
-        userId: updatedUser.phone,
-        verified: updatedUser.verified,
-        action: 'update_verification',
-        source: 'app'
-      }, 'sync-user');
-    }
-
-    res.json({
-      success: true,
-      message: 'User updated successfully',
-      data: updatedUser
-    });
-
-  } catch (error) {
-    console.error('Admin update user error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to update user'
-    });
-  }
-});
-
-
 // ==================== USER SUPPORT ROUTES ====================
 
 // User creates a support ticket
@@ -511,6 +328,13 @@ router.post('/support/tickets', authenticate, [
       RETURNING *`,
       [req.user.id, ticketNumber, subject, description, category, priority]
     );
+
+    // Let the support inbox know (the customer still gets their ticket even if this email fails)
+    const emailService = require('../utils/emailService');
+    emailService.sendNewTicketNotification(process.env.SUPPORT_INBOX_EMAIL || require('../utils/emailTemplate').SUPPORT_EMAIL, {
+      ticketId: ticket.rows[0].id, ticketNumber, subject, category, priority, description,
+      customerName: req.user.full_name, customerEmail: req.user.email,
+    }).catch(err => console.error('New ticket email failed:', err.message));
 
     res.status(201).json({
       success: true,
@@ -687,10 +511,15 @@ router.post('/support/tickets/:id/respond', authenticate, [
       [id, req.user.id, message]
     );
 
+    // A customer reply re-opens a ticket that was marked resolved/closed, so support sees it again
     await pool.query(
-      `UPDATE support_tickets 
-       SET status = 'in_progress', updated_at = CURRENT_TIMESTAMP
-       WHERE id = $1 AND status = 'open'`,
+      `UPDATE support_tickets
+       SET updated_at = CURRENT_TIMESTAMP,
+           status = CASE WHEN status IN ('resolved', 'closed') THEN 'open' ELSE status END,
+           resolved_at = CASE WHEN status IN ('resolved', 'closed') THEN NULL ELSE resolved_at END,
+           resolved_by = CASE WHEN status IN ('resolved', 'closed') THEN NULL ELSE resolved_by END,
+           closed_at = CASE WHEN status IN ('resolved', 'closed') THEN NULL ELSE closed_at END
+       WHERE id = $1`,
       [id]
     );
 
@@ -720,7 +549,7 @@ router.get('/support/knowledge-base', async (req, res) => {
         kba.id, kba.title, kba.content, kba.category, kba.tags,
         kba.views, kba.helpful_votes, kba.not_helpful_votes,
         kba.created_at, kba.updated_at,
-        (SELECT COUNT(*) FROM knowledge_base_articles WHERE published = true) as total_count
+        COUNT(*) OVER()::int as total_count
       FROM knowledge_base_articles kba
       WHERE kba.published = true
     `;
@@ -749,13 +578,6 @@ router.get('/support/knowledge-base', async (req, res) => {
 
     const result = await pool.query(query, queryParams);
 
-    result.rows.forEach(article => {
-      pool.query(
-        'UPDATE knowledge_base_articles SET views = views + 1 WHERE id = $1',
-        [article.id]
-      ).catch(console.error);
-    });
-
     res.json({
       success: true,
       data: {
@@ -775,6 +597,28 @@ router.get('/support/knowledge-base', async (req, res) => {
       success: false,
       error: 'Failed to fetch knowledge base articles'
     });
+  }
+});
+
+// One published article (opening it counts as a view)
+router.get('/support/knowledge-base/:id', async (req, res) => {
+  try {
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(req.params.id)) {
+      return res.status(404).json({ success: false, error: 'Article not found' });
+    }
+    const result = await pool.query(
+      `UPDATE knowledge_base_articles SET views = views + 1
+       WHERE id = $1 AND published = true
+       RETURNING id, title, content, category, tags, views, helpful_votes, not_helpful_votes, created_at, updated_at`,
+      [req.params.id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Article not found' });
+    }
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    console.error('Get article error:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch article' });
   }
 });
 
