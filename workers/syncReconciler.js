@@ -123,6 +123,9 @@ function planSide(phoneList, slotField, appItems, appSlotOf, maxSlots) {
     duplicates: duplicates.sort((a, b) => a.slot - b.slot),
     missing: missing.slice(0, free.length).map((a, i) => ({ id: a.id, title: a.title, slot: free[i] })),
     noRoom: Math.max(0, missing.length - free.length),
+    // Missing items that won't fit but claim a slot the phone line uses for another recording: the app
+    // drops that claim (the item stays in the app, over the plan's keypad limit)
+    unplaced: missing.slice(free.length).filter(a => a.appSlot && (taken.has(a.appSlot) || relink.some(r => r.to === a.appSlot))).map(a => a.id),
     inAppMissing,
     repeatedSlots: [...counts].filter(([, n]) => n > 1).map(([s]) => s).sort((a, b) => a - b),
   };
@@ -176,6 +179,8 @@ async function fixContent(userIds) {
   const results = [];
   for (const p of plans) {
     const r = { userId: p.u.id, name: p.u.full_name || p.u.email, relinked: 0, duplicatesRemoved: 0, notes: 0, wills: 0 };
+    for (const id of p.notes.unplaced) await pool.query('UPDATE voice_notes SET ivr_slot_number = NULL WHERE id = $1', [id]);
+    for (const id of p.wills.unplaced) await pool.query('UPDATE voice_wills SET will_slot_number = NULL WHERE id = $1', [id]);
     for (const x of p.notes.relink) { await pool.query('UPDATE voice_notes SET ivr_slot_number = $1 WHERE id = $2', [x.to, x.id]); r.relinked++; }
     for (const x of p.wills.relink) { await pool.query('UPDATE voice_wills SET will_slot_number = $1 WHERE id = $2', [x.to, x.id]); r.relinked++; }
     for (const d of p.notes.duplicates) { await phoneLineContent.removeNote(p.u.phone, d.slot); r.duplicatesRemoved++; }
@@ -191,6 +196,50 @@ async function fixContent(userIds) {
     results.push(r);
   }
   return results;
+}
+
+async function followPhoneLineSchedules(apply) {
+  const appMsgs = (await pool.query(
+    `SELECT sm.id, sm.metadata->>'ivrScheduleId' AS sid, sm.scheduled_for, u.id AS user_id, u.full_name, u.email, u.phone
+     FROM scheduled_messages sm JOIN users u ON u.id = sm.user_id
+     WHERE sm.metadata->>'source' = 'ivr' AND sm.metadata->>'ivrScheduleId' IS NOT NULL AND sm.delivery_status = 'scheduled'`
+  )).rows;
+  if (!appMsgs.length) return [];
+  const phone = new Map();
+  let ExclusiveStartKey;
+  do {
+    const r = await dynamo().send(new ScanCommand({
+      TableName: process.env.DYNAMO_SCHEDULES_TABLE || 'SCHEDULES',
+      ProjectionExpression: 'scheduleId, #st',
+      ExpressionAttributeNames: { '#st': 'status' },
+      ExclusiveStartKey,
+    }));
+    for (const i of r.Items || []) phone.set(i.scheduleId, i.status);
+    ExclusiveStartKey = r.LastEvaluatedKey;
+  } while (ExclusiveStartKey);
+  // Nothing read from the phone line (empty table, wrong name, no access): compare nothing rather than
+  // treat every phone-scheduled message as cancelled
+  if (phone.size === 0) return [];
+
+  const out = [];
+  for (const m of appMsgs) {
+    const st = phone.get(m.sid);
+    const to = st === 'COMPLETED' ? 'delivered' : st === 'FAILED' ? 'failed' : st === undefined ? 'cancelled' : null;
+    if (!to) continue; // PENDING / PROCESSING: still on its way
+    out.push({ userId: m.user_id, name: m.full_name || null, email: m.email || null, phone: m.phone, type: 'SCHEDULE_FOLLOWED_PHONE_LINE',
+      label: `Phone-scheduled message for ${new Date(m.scheduled_for).toISOString().slice(0, 16).replace('T', ' ')} UTC was ${to} on the phone line; the app now shows that` });
+    if (apply) {
+      await pool.query(
+        `UPDATE scheduled_messages SET delivery_status = $2::text, updated_at = NOW(),
+                delivered_at = CASE WHEN $2::text = 'delivered' THEN COALESCE(delivered_at, NOW()) ELSE delivered_at END,
+                failed_at = CASE WHEN $2::text = 'failed' THEN COALESCE(failed_at, NOW()) ELSE failed_at END,
+                cancelled_at = CASE WHEN $2::text = 'cancelled' THEN COALESCE(cancelled_at, NOW()) ELSE cancelled_at END
+         WHERE id = $1 AND delivery_status = 'scheduled'`,
+        [m.id, to]
+      );
+    }
+  }
+  return out;
 }
 
 async function failedSyncCounts() {
@@ -333,6 +382,20 @@ async function runReconcile({ trigger = 'manual', runBy = null, applyFixes = tru
     } else if (applyFixes && fixes.length) {
       for (const f of fixes) await syncAccountToIvr(f.phone, f.change);
       fixesApplied = true;
+    }
+
+    // Messages scheduled BY PHONE are sent by the phone line, so its SCHEDULES record decides their state.
+    // A delivery result or cancellation that never reached the app is applied here (app only).
+    try {
+      const preview = await followPhoneLineSchedules(false);
+      if (preview.length > MAX_AUTO_FIXES) {
+        issues.unshift({ type: 'TOO_MANY_DIFFERENCES', label: `${preview.length} phone-scheduled messages differ from the phone line, more than the safety limit of ${MAX_AUTO_FIXES}, so none were changed.` });
+      } else if (preview.length) {
+        const scheduleFixes = applyFixes ? await followPhoneLineSchedules(true) : preview;
+        for (const s of scheduleFixes) fixes.push(s);
+      }
+    } catch (err) {
+      logger.warn(`Reconcile: could not compare scheduled messages: ${err.message}`);
     }
 
     const summary = {

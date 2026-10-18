@@ -606,7 +606,104 @@ app.post('/api/sync/slot', syncAuth, async (req, res) => {
 });
 
 // Receive schedule created from IVR
+// Phone menu "my scheduled messages": the messages this person scheduled IN THE APP (the phone line adds
+// them to its own list). Same shape as the phone line's items; ids start with "app-" so its cancel step
+// knows to send them back here.
+app.get('/api/sync/schedules', syncAuth, async (req, res) => {
+  try {
+    const dbUserId = await findUserIdByPhone(req.query.userId);
+    if (!dbUserId) return res.status(404).json({ success: false, error: 'User not found' });
+    const r = await pool.query(
+      `SELECT sm.id, sm.scheduled_for, sm.recipient_phone, sm.recipient_email, sm.delivery_method,
+              c.name AS contact_name, vn.s3_key, vn.s3_bucket, vn.source, vn.twilio_recording_sid
+       FROM scheduled_messages sm
+       LEFT JOIN contacts c ON c.id = sm.recipient_contact_id
+       LEFT JOIN voice_notes vn ON vn.id = sm.voice_note_id
+       WHERE sm.user_id = $1 AND sm.delivery_status = 'scheduled' AND sm.scheduled_for > NOW()
+         AND COALESCE(sm.metadata->>'source', 'app') <> 'ivr'
+       ORDER BY sm.scheduled_for`,
+      [dbUserId]
+    );
+    const { resolveIvrPlaybackUrl } = require('./utils/resolveAudioUrl');
+    const schedules = r.rows.map(m => ({
+      scheduleId: `app-${m.id}`,
+      recordingSid: `app-${m.id}`,
+      contact: m.recipient_phone || m.recipient_email || '',
+      contactName: m.contact_name || null,
+      audioUrl: m.s3_key ? resolveIvrPlaybackUrl(m) : null,
+      scheduledFor: new Date(m.scheduled_for).toISOString(),
+      type: 'voiceMessage',
+      source: 'app',
+      deliveryMethod: m.delivery_method,
+    }));
+    res.json({ success: true, count: schedules.length, schedules });
+  } catch (err) {
+    console.error('List app schedules for phone line failed:', err.message);
+    res.status(500).json({ success: false, error: 'Failed to list scheduled messages' });
+  }
+});
+
+// Cancellations and delivery results from the phone line (Phase 3 Part C):
+//   { action: 'cancel', appScheduleId }        a caller cancelled an app-scheduled message on the phone menu
+//   { action: 'cancel', scheduleId }           a phone-scheduled message was cancelled on the phone line
+//   { action: 'status', scheduleId, status: 'delivered' | 'failed', error }   the phone line sent (or failed) it
+async function handlePhoneScheduleUpdate(req, res) {
+  const { action, scheduleId, appScheduleId, status, error, userId } = req.body;
+  pool.query(`INSERT INTO sync_received_log (source, event_type, payload) VALUES ('ivr', $1, $2)`,
+    [`schedule_${action}`, JSON.stringify(req.body)]).catch(() => {});
+
+  if (action === 'cancel' && appScheduleId) {
+    const id = String(appScheduleId).replace(/^app-/, '');
+    if (!/^[0-9a-f-]{36}$/i.test(id)) return res.status(404).json({ success: false, error: 'Scheduled message not found' });
+    const owner = await findUserIdByPhone(userId);
+    const m = (await pool.query('SELECT id, user_id, delivery_status FROM scheduled_messages WHERE id = $1', [id])).rows[0];
+    if (!m || !owner || m.user_id !== owner) return res.status(404).json({ success: false, error: 'Scheduled message not found' });
+    if (m.delivery_status !== 'scheduled') {
+      return res.status(409).json({ success: false, error: `Already ${m.delivery_status}` });
+    }
+    await pool.query(
+      `UPDATE scheduled_messages SET delivery_status = 'cancelled', cancelled_at = NOW(), updated_at = NOW(),
+              metadata = COALESCE(metadata, '{}'::jsonb) || '{"cancelledVia":"phone"}'::jsonb
+       WHERE id = $1 AND delivery_status = 'scheduled'`,
+      [id]
+    );
+    return res.json({ success: true });
+  }
+
+  if (!scheduleId) return res.status(400).json({ success: false, error: 'Missing scheduleId' });
+  if (action === 'cancel') {
+    const r = await pool.query(
+      `UPDATE scheduled_messages SET delivery_status = 'cancelled', cancelled_at = NOW(), updated_at = NOW()
+       WHERE metadata->>'ivrScheduleId' = $1 AND delivery_status NOT IN ('delivered', 'failed', 'cancelled')
+       RETURNING id`,
+      [scheduleId]
+    );
+    return res.status(r.rowCount ? 200 : 404).json({ success: !!r.rowCount, ...(r.rowCount ? {} : { error: 'Scheduled message not found' }) });
+  }
+  if (action === 'status' && (status === 'delivered' || status === 'failed')) {
+    const r = await pool.query(
+      `UPDATE scheduled_messages
+       SET delivery_status = $2::text,
+           delivered_at = CASE WHEN $2::text = 'delivered' THEN NOW() ELSE delivered_at END,
+           failed_at = CASE WHEN $2::text = 'failed' THEN NOW() ELSE failed_at END,
+           error_message = CASE WHEN $2::text = 'failed' THEN $3 ELSE error_message END,
+           delivery_attempts = COALESCE(delivery_attempts, 0) + 1, last_attempt_at = NOW(), updated_at = NOW()
+       WHERE metadata->>'ivrScheduleId' = $1 AND delivery_status NOT IN ('cancelled')
+       RETURNING id`,
+      [scheduleId, status, error ? String(error).slice(0, 500) : null]
+    );
+    return res.status(r.rowCount ? 200 : 404).json({ success: !!r.rowCount, ...(r.rowCount ? {} : { error: 'Scheduled message not found' }) });
+  }
+  return res.status(400).json({ success: false, error: 'Invalid action' });
+}
+
 app.post('/api/sync/schedule', syncAuth, async (req, res) => {
+  if (req.body?.action === 'cancel' || req.body?.action === 'status') {
+    return handlePhoneScheduleUpdate(req, res).catch(err => {
+      console.error('Phone schedule update failed:', err.message);
+      res.status(500).json({ success: false, error: 'Failed to update scheduled message' });
+    });
+  }
   const {
     scheduleId,
     userId: ivrUserId,   // phone number from IVR

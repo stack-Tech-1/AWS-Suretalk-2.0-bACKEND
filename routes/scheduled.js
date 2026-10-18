@@ -15,6 +15,22 @@ const twilioClient = process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_T
   ? new Twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
   : null;
 
+// Messages scheduled by phone are sent by the phone line, not by this app: cancelling one here must
+// cancel it on the phone line first, or the call would still go out. Returns the phone line's status
+// (200 cancelled, 404 already gone) or null when it couldn't be reached.
+const isPhoneScheduled = (m) => m?.metadata?.source === 'ivr' && m?.metadata?.ivrScheduleId;
+async function cancelOnPhoneLine(phone, ivrScheduleId) {
+  if (!process.env.IVR_API_URL || !process.env.IVR_REQUEST_KEY) return null;
+  try {
+    const r = await require('axios').post(`${process.env.IVR_API_URL}/deleteScheduledMessage`,
+      { key: process.env.IVR_REQUEST_KEY, userId: phone, scheduleId: ivrScheduleId, source: 'app' },
+      { timeout: 8000, validateStatus: () => true });
+    return r.status;
+  } catch (err) {
+    console.error('Phone line cancel failed:', err.message);
+    return null;
+  }
+}
 
 // Get all scheduled messages
 router.get('/', authenticate, async (req, res) => {
@@ -308,7 +324,7 @@ router.put('/:id', authenticate, async (req, res) => {
 
     // Check ownership
     const ownershipCheck = await pool.query(
-      'SELECT id FROM scheduled_messages WHERE id = $1 AND user_id = $2',
+      'SELECT id, metadata FROM scheduled_messages WHERE id = $1 AND user_id = $2',
       [id, req.user.id]
     );
 
@@ -316,6 +332,13 @@ router.put('/:id', authenticate, async (req, res) => {
       return res.status(404).json({
         success: false,
         error: 'Scheduled message not found'
+      });
+    }
+    if (isPhoneScheduled(ownershipCheck.rows[0])) {
+      return res.status(409).json({
+        success: false,
+        code: 'PHONE_SCHEDULED',
+        error: 'This message was scheduled by phone, so it can only be cancelled here. To change it, cancel it and schedule it again.'
       });
     }
 
@@ -382,7 +405,7 @@ router.delete('/:id', authenticate, async (req, res) => {
 
     // Check ownership
     const ownershipCheck = await pool.query(
-      'SELECT id FROM scheduled_messages WHERE id = $1 AND user_id = $2',
+      'SELECT id, metadata, delivery_status FROM scheduled_messages WHERE id = $1 AND user_id = $2',
       [id, req.user.id]
     );
 
@@ -391,6 +414,19 @@ router.delete('/:id', authenticate, async (req, res) => {
         success: false,
         error: 'Scheduled message not found'
       });
+    }
+
+    // Scheduled by phone: the phone line sends it, so cancel it there first
+    const msg = ownershipCheck.rows[0];
+    if (isPhoneScheduled(msg) && !['delivered', 'failed', 'cancelled'].includes(msg.delivery_status)) {
+      const status = await cancelOnPhoneLine(req.user.phone, msg.metadata.ivrScheduleId);
+      if (status !== 200 && status !== 404) {
+        return res.status(502).json({
+          success: false,
+          code: 'PHONE_LINE_UNAVAILABLE',
+          error: 'Could not cancel this message on the phone line right now, so it is still scheduled. Try again in a moment.'
+        });
+      }
     }
 
     // Only allow cancellation if not already delivered
@@ -409,8 +445,8 @@ router.delete('/:id', authenticate, async (req, res) => {
 
     // Update status to cancelled
     await pool.query(
-      `UPDATE scheduled_messages 
-       SET delivery_status = 'cancelled', updated_at = CURRENT_TIMESTAMP
+      `UPDATE scheduled_messages
+       SET delivery_status = 'cancelled', cancelled_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
        WHERE id = $1`,
       [id]
     );
