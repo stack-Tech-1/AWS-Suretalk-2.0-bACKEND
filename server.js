@@ -338,12 +338,13 @@ app.post('/api/sync/user', syncAuth, async (req, res) => {
             console.error(`Unsubscribe from IVR: Stripe cancel failed for ${u.id}: ${stripeErr.message}`);
           }
         }
+        const lite = require('./utils/planLimits').limitsFor('LITE');
         await pool.query(
           `UPDATE users
            SET subscription_tier = 'LITE', subscription_status = 'active', stripe_subscription_id = NULL,
-               storage_limit_gb = 1, contacts_limit = 3, voice_notes_limit = 3, updated_at = NOW()
+               storage_limit_gb = $2, contacts_limit = $3, voice_notes_limit = $4, updated_at = NOW()
            WHERE id = $1`,
-          [u.id]
+          [u.id, lite.storageGb, lite.contacts, lite.voiceNotes]
         );
       }
     } else if (action === 'create' || action === 'update') {
@@ -353,6 +354,8 @@ app.post('/api/sync/user', syncAuth, async (req, res) => {
         [userId]
       );
 
+      // A plan change by phone also moves the account's limits (otherwise a phone upgrade stays at the old limits)
+      const planLim = require('./utils/planLimits').limitsFor(normalizedTier);
       if (existing.rows.length > 0 && existing.rows[0].password_hash) {
         // Claimed account — only update subscription fields, never touch name/email/password
         await pool.query(
@@ -362,6 +365,7 @@ app.post('/api/sync/user', syncAuth, async (req, res) => {
                stripe_customer_id         = COALESCE($3, stripe_customer_id),
                stripe_subscription_id     = COALESCE($4, stripe_subscription_id),
                stripe_subscription_status = COALESCE($5, stripe_subscription_status),
+               storage_limit_gb = $7, contacts_limit = $8, voice_notes_limit = $9,
                updated_at                 = NOW()
            WHERE phone = $6`,
           [
@@ -370,7 +374,8 @@ app.post('/api/sync/user', syncAuth, async (req, res) => {
             stripeCustomerId,
             stripeSubscriptionId,
             subscriptionStatus,
-            userId
+            userId,
+            planLim.storageGb, planLim.contacts, planLim.voiceNotes
           ]
         );
       } else {
@@ -378,15 +383,19 @@ app.post('/api/sync/user', syncAuth, async (req, res) => {
         await pool.query(
           `INSERT INTO users (
               phone, subscription_tier, status, created_at,
-              source, stripe_customer_id, stripe_subscription_id, stripe_subscription_status
+              source, stripe_customer_id, stripe_subscription_id, stripe_subscription_status,
+              storage_limit_gb, contacts_limit, voice_notes_limit
            )
-           VALUES ($1, $2, $3, $4, 'ivr', $5, $6, $7)
+           VALUES ($1, $2, $3, $4, 'ivr', $5, $6, $7, $8, $9, $10)
            ON CONFLICT (phone) DO UPDATE SET
              subscription_tier          = EXCLUDED.subscription_tier,
              status                     = EXCLUDED.status,
              stripe_customer_id         = EXCLUDED.stripe_customer_id,
              stripe_subscription_id     = EXCLUDED.stripe_subscription_id,
              stripe_subscription_status = EXCLUDED.stripe_subscription_status,
+             storage_limit_gb           = EXCLUDED.storage_limit_gb,
+             contacts_limit             = EXCLUDED.contacts_limit,
+             voice_notes_limit          = EXCLUDED.voice_notes_limit,
              updated_at                 = NOW()`,
           [
             userId,
@@ -395,7 +404,8 @@ app.post('/api/sync/user', syncAuth, async (req, res) => {
             createdAt || new Date(),
             stripeCustomerId,
             stripeSubscriptionId,
-            subscriptionStatus
+            subscriptionStatus,
+            planLim.storageGb, planLim.contacts, planLim.voiceNotes
           ]
         );
       }

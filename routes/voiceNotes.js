@@ -14,6 +14,26 @@ const Twilio = require('twilio');
 const twilioClient = process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN
   ? new Twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
   : null;
+const { limitsFor, effectiveLimit, willLimitError } = require('../utils/planLimits');
+
+// Voice notes = phone-line slots (3 / 9 / 9). Over the limit after a downgrade: existing notes stay,
+// but nothing new can be added. Returns the message to show, or null when there's room.
+async function noteLimitError(userId) {
+  // Counted the same way as the voice-notes list (will recordings aren't voice notes)
+  const u = (await pool.query(
+    `SELECT subscription_tier, voice_notes_limit,
+            (SELECT COUNT(*)::int FROM voice_notes
+             WHERE user_id = $1 AND deleted_at IS NULL AND is_will = FALSE AND s3_bucket IS DISTINCT FROM $2) AS note_count
+     FROM users WHERE id = $1`,
+    [userId, BUCKETS.WILLS]
+  )).rows[0];
+  if (!u) return 'Account not found';
+  const max = effectiveLimit(u.subscription_tier, 'voiceNotes', u.voice_notes_limit);
+  if (u.note_count < max) return null;
+  return u.note_count > max
+    ? `You have ${u.note_count} voice notes and your plan allows ${max}. Your notes are kept, but delete ${u.note_count - max + 1} or upgrade to add a new one.`
+    : `Voice note limit reached (${max} on your plan). Delete one or upgrade to add more.`;
+}
 
 // Get all voice notes for user
 router.get('/', authenticate, async (req, res) => {
@@ -114,7 +134,7 @@ router.get('/ivr-slots', authenticate, async (req, res) => {
       id: r.id
     }));
     const takenNums = new Set(taken.map(t => t.slot));
-    const slotLimit = req.user.subscription_tier === 'LITE' ? 3 : 9;
+    const slotLimit = limitsFor(req.user.subscription_tier).slots;
     const available = Array.from({ length: slotLimit }, (_, i) => i + 1).filter(n => !takenNums.has(n));
     res.json({ success: true, data: { taken, available, totalSlots: slotLimit } });
   } catch (error) {
@@ -211,24 +231,8 @@ router.post('/upload-url', authenticate, [
 
     const { fileName, fileType } = req.body;
 
-    // Check user's storage limits
-    const userQuery = await pool.query(
-      `SELECT subscription_tier, 
-              (SELECT COUNT(*) FROM voice_notes WHERE user_id = $1 AND deleted_at IS NULL) as note_count
-       FROM users WHERE id = $1`,
-      [req.user.id]
-    );
-
-    const user = userQuery.rows[0];
-    const tier = user.subscription_tier;
-
-    // Apply limits based on tier
-    if (tier === 'LITE' && user.note_count >= 3) {
-      return res.status(403).json({
-        success: false,
-        error: 'LITE tier limit reached (3 notes max). Upgrade to add more notes.'
-      });
-    }
+    const limitError = await noteLimitError(req.user.id);
+    if (limitError) return res.status(403).json({ success: false, code: 'NOTE_LIMIT', error: limitError });
 
     // Generate upload URL
     const uploadData = await generateUploadUrl(req.user.id, fileName, fileType, 'VOICE_NOTES');
@@ -259,6 +263,12 @@ router.post('/upload', authenticate, uploadToS3('VOICE_NOTES').single('audio'), 
 
     const { title, description, duration, tags, isPermanent } = req.body;
     const file = req.file;
+
+    const limitError = await noteLimitError(req.user.id);
+    if (limitError) {
+      deleteFromS3(file.key, file.bucket).catch(() => {}); // don't keep a file we won't record
+      return res.status(403).json({ success: false, code: 'NOTE_LIMIT', error: limitError });
+    }
 
     // Validate tier for permanent storage
     if (isPermanent === 'true' && req.user.subscription_tier !== 'LEGACY_VAULT_PREMIUM') {
@@ -324,7 +334,7 @@ router.post('/', authenticate, [
   body('duration').isInt({ min: 1 }),
   body('contactId').optional().isUUID(),
   body('contactPending').optional().isBoolean(),
-  body('slotNumber').optional().isInt({ min: 1, max: 15 })
+  body('slotNumber').optional().isInt({ min: 1, max: 9 })
 ], async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -355,6 +365,9 @@ router.post('/', authenticate, [
       return res.status(400).json({ success: false, error: 'Invalid recording file' });
     }
 
+    const limitError = await noteLimitError(req.user.id);
+    if (limitError) return res.status(403).json({ success: false, code: 'NOTE_LIMIT', error: limitError });
+
     // Process tags - handle both array and string formats
     let processedTags = [];
     if (tags) {
@@ -375,7 +388,7 @@ router.post('/', authenticate, [
 
     // Validate slot is within the user's tier limit
     if (slotNumber) {
-      const slotLimit = req.user.subscription_tier === 'LITE' ? 3 : 9;
+      const slotLimit = limitsFor(req.user.subscription_tier).slots;
       if (parseInt(slotNumber) > slotLimit) {
         return res.status(403).json({
           success: false,
@@ -489,7 +502,7 @@ router.post('/', authenticate, [
         );
 
         // Use user-requested slot if provided, otherwise find the lowest available
-        const slotLimit = req.user.subscription_tier === 'LITE' ? 3 : 9;
+        const slotLimit = limitsFor(req.user.subscription_tier).slots;
         let candidateSlot = null;
         if (slotNumber && !takenInPostgres.has(parseInt(slotNumber))) {
           candidateSlot = parseInt(slotNumber);
@@ -928,6 +941,9 @@ router.post('/:id/convert-to-will', authenticate, validateTier('LEGACY_VAULT_PRE
     }
 
     const n = noteResult.rows[0];
+
+    const limitError = await willLimitError(pool, req.user.id, req.user.subscription_tier);
+    if (limitError) return res.status(403).json({ success: false, code: 'WILL_LIMIT', error: limitError });
 
     await pool.query(
       `INSERT INTO voice_wills (

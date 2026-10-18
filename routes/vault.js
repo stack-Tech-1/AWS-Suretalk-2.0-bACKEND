@@ -12,6 +12,7 @@ const {
   isOwnS3Key
 } = require('../utils/s3Storage');
 const { syncToIvr } = require('../utils/syncIvr');
+const { willLimitError } = require('../utils/planLimits');
 const { resolveIvrPlaybackUrl } = require('../utils/resolveAudioUrl');
 const { signedProxyRecordingPath } = require('../utils/audioSigning');
 const Twilio = require('twilio');
@@ -211,6 +212,9 @@ router.post('/wills', authenticate, validateTier('LEGACY_VAULT_PREMIUM'), [
     if (!isOwnS3Key(s3Key, req.user.id)) {
       return res.status(400).json({ success: false, error: 'Invalid recording file' });
     }
+
+    const limitError = await willLimitError(pool, req.user.id, req.user.subscription_tier);
+    if (limitError) return res.status(403).json({ success: false, code: 'WILL_LIMIT', error: limitError });
 
     // Keep only beneficiaries that are this user's own contacts
     let ownBeneficiaries = [];

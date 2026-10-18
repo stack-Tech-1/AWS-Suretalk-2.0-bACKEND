@@ -9,7 +9,7 @@ const { authenticate, isAccountSuspended } = require('../middleware/auth');
 const tokenService = require('../utils/tokens');
 const emailService = require('../utils/emailService');
 const twilio = require('twilio');
-const { normalizeTier, TIERS } = require('../utils/tierMapping');
+const { normalizeTier } = require('../utils/tierMapping');
 const { checkCode, markCodeUsed } = require('../utils/phoneCodes');
 const axios = require('axios');
 const { requireTurnstile } = require('../middleware/turnstile');
@@ -68,29 +68,9 @@ router.post('/register', requireTurnstile, validateRegister, async (req, res) =>
     const passwordHash = await bcrypt.hash(password, saltRounds);
 
     // Set default limits based on tier
-    let storageLimitGb, contactsLimit, voiceNotesLimit;
     const normalizedTier = normalizeTier(subscriptionTier || 'ESSENTIAL');
-    switch (normalizedTier) {
-      case TIERS.LITE:
-        storageLimitGb = 1;
-        contactsLimit = 3;
-        voiceNotesLimit = 3;
-        break;
-      case TIERS.ESSENTIAL:
-        storageLimitGb = 5;
-        contactsLimit = 9;
-        voiceNotesLimit = 100;
-        break;
-      case TIERS.PREMIUM:
-        storageLimitGb = 50;
-        contactsLimit = 50;
-        voiceNotesLimit = 1000;
-        break;
-      default:
-        storageLimitGb = 5;
-        contactsLimit = 9;
-        voiceNotesLimit = 100;
-    }
+    const { storageGb: storageLimitGb, contacts: contactsLimit, voiceNotes: voiceNotesLimit } =
+      require('../utils/planLimits').limitsFor(normalizedTier);
 
     // Create user with email_verified = false
     const newUser = await pool.query(

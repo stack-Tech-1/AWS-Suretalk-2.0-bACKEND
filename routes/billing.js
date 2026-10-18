@@ -7,6 +7,8 @@ const { pool } = require('../config/database');
 const Stripe = require('stripe');
 const https = require('https');
 const { normalizeTier } = require('../utils/tierMapping');
+const { limitsFor } = require('../utils/planLimits');
+const pick = ({ voiceNotes, contacts, slots, wills, storageGb }) => ({ voiceNotes, contacts, slots, wills, storageGb });
 
 const _stripeAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 60_000, freeSocketTimeout: 45_000 });
 const stripe = process.env.STRIPE_SECRET_KEY
@@ -24,16 +26,13 @@ router.get('/plans', authenticate, async (req, res) => {
         currency: 'usd',
         interval: 'month',
         features: [
-          '3 voice notes max',
-          '3 contacts max',
+          '3 slots (a contact and their voice note each)',
           '180-day retention',
           'Basic IVR access',
           'Phone-only access'
         ],
         limits: {
-          voiceNotes: 3,
-          contacts: 3,
-          storageGb: 1,
+          ...pick(limitsFor('LITE')),
           retentionDays: 180
         }
       },
@@ -44,17 +43,14 @@ router.get('/plans', authenticate, async (req, res) => {
         currency: 'usd',
         interval: 'month',
         features: [
-          'Unlimited voice notes',
-          '9 contacts',
+          '9 slots (a contact and their voice note each)',
           '1-year retention',
           'Advanced IVR features',
           'Web dashboard access',
           'Export capabilities'
         ],
         limits: {
-          voiceNotes: 100,
-          contacts: 9,
-          storageGb: 5,
+          ...pick(limitsFor('ESSENTIAL')),
           retentionDays: 365
         }
       },
@@ -66,16 +62,14 @@ router.get('/plans', authenticate, async (req, res) => {
         interval: 'month',
         features: [
           'All Essential features',
+          '9 slots plus 9 voice will slots',
           'Permanent storage',
-          'Voice Wills',
           'Scheduled legacy messages',
           'Bank-level encryption',
           'Priority support'
         ],
         limits: {
-          voiceNotes: 500,
-          contacts: 25,
-          storageGb: 50,
+          ...pick(limitsFor('LEGACY_VAULT_PREMIUM')),
           retentionDays: 99999 // Permanent
         }
       }
@@ -708,24 +702,13 @@ async function handleCheckoutSessionCompleted(session) {
            subscription_status = 'active',
            stripe_subscription_id = $2::VARCHAR,
            stripe_customer_id = $3::VARCHAR,
-           contacts_limit = CASE $1::VARCHAR
-             WHEN 'ESSENTIAL' THEN 9 
-             WHEN 'LEGACY_VAULT_PREMIUM' THEN 25 
-             ELSE 3 
-           END,
-           storage_limit_gb = CASE $1::VARCHAR
-             WHEN 'ESSENTIAL' THEN 5 
-             WHEN 'LEGACY_VAULT_PREMIUM' THEN 50 
-             ELSE 1 
-           END,
-           voice_notes_limit = CASE $1::VARCHAR
-             WHEN 'ESSENTIAL' THEN 100 
-             WHEN 'LEGACY_VAULT_PREMIUM' THEN 500 
-             ELSE 3 
-           END
+           contacts_limit = $5,
+           storage_limit_gb = $6,
+           voice_notes_limit = $7
        WHERE id = $4::UUID
        RETURNING *`,
-      [tier, subscription.id, session.customer, userId]
+      [tier, subscription.id, session.customer, userId,
+       limitsFor(tier).contacts, limitsFor(tier).storageGb, limitsFor(tier).voiceNotes]
     );
     
     if (result.rowCount === 0) {
@@ -1145,12 +1128,7 @@ router.get('/payment-methods', authenticate, async (req, res) => {
 
 // Helper function to get limits for tier
 function getLimitsForTier(tier) {
-  const limits = {
-    LITE: { storageGb: 1, contacts: 3, voiceNotes: 3 },
-    ESSENTIAL: { storageGb: 5, contacts: 9, voiceNotes: 100 },
-    LEGACY_VAULT_PREMIUM: { storageGb: 50, contacts: 25, voiceNotes: 500 }
-  };
-  return limits[tier] || limits.LITE;
+  return limitsFor(tier);
 }
 
 module.exports = router;

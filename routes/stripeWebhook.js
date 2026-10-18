@@ -26,11 +26,7 @@ function getTierFromPriceId(priceId) {
   return map[priceId] || 'LITE';
 }
 
-const TIER_LIMITS = {
-  LITE:                 { contacts: 3,  voiceNotes: 3,   storageGb: 1  },
-  ESSENTIAL:            { contacts: 9,  voiceNotes: 100, storageGb: 5  },
-  LEGACY_VAULT_PREMIUM: { contacts: 25, voiceNotes: 500, storageGb: 50 }
-};
+const { PLAN_LIMITS: TIER_LIMITS } = require('../utils/planLimits');
 
 async function setUserLimits(userId, tier) {
   const l = TIER_LIMITS[tier] || TIER_LIMITS.LITE;

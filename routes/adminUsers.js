@@ -17,11 +17,7 @@ const stripe = process.env.STRIPE_SECRET_KEY ? require('stripe')(process.env.STR
 
 const TIERS = ['LITE', 'ESSENTIAL', 'LEGACY_VAULT_PREMIUM'];
 // Same limits Stripe checkout and the webhook apply (routes/billing.js, routes/stripeWebhook.js)
-const TIER_LIMITS = {
-  LITE:                 { storageGb: 1,  contacts: 3,  voiceNotes: 3,   price: 0 },
-  ESSENTIAL:            { storageGb: 5,  contacts: 9,  voiceNotes: 100, price: 6.99 },
-  LEGACY_VAULT_PREMIUM: { storageGb: 50, contacts: 25, voiceNotes: 500, price: 12.99 },
-};
+const { PLAN_LIMITS: TIER_LIMITS } = require('../utils/planLimits');
 const ACTIVE_STATUSES = ['active', 'trialing', 'past_due']; // statuses middleware/auth.js lets in
 
 // Paying through Stripe — plan changes must go through Stripe or the next renewal undoes them
@@ -415,10 +411,12 @@ router.get('/users/:id/activity', authenticateAdmin, async (req, res) => {
 // ── Shared account operations ────────────────────────────────────────────────
 async function applyPlan(userId, tier, customLimits = null) {
   const defaults = TIER_LIMITS[tier];
+  // Custom limits can only be lower than the plan: notes and contacts must fit the phone line's keypad slots
+  const capped = (v, max) => (v === null || v === undefined ? max : Math.min(Number(v), max));
   const limits = {
     storageGb: customLimits?.storageGb ?? defaults.storageGb,
-    contacts: customLimits?.contacts ?? defaults.contacts,
-    voiceNotes: customLimits?.voiceNotes ?? defaults.voiceNotes,
+    contacts: capped(customLimits?.contacts, defaults.contacts),
+    voiceNotes: capped(customLimits?.voiceNotes, defaults.voiceNotes),
   };
   const updated = (await pool.query(
     `UPDATE users SET subscription_tier = $1, storage_limit_gb = $2, contacts_limit = $3, voice_notes_limit = $4,

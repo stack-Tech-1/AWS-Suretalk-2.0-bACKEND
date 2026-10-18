@@ -245,6 +245,11 @@ router.get('/limits', authenticate, async (req, res) => {
     );
 
     const usage = usageQuery.rows[0];
+    const { limitsFor, effectiveLimit } = require('../utils/planLimits');
+    const wills = (await pool.query(
+      'SELECT COUNT(*)::int AS n FROM voice_wills WHERE user_id = $1 AND deleted_at IS NULL AND admin_removed_at IS NULL',
+      [req.user.id]
+    )).rows[0].n;
 
     res.json({
       success: true,
@@ -258,12 +263,17 @@ router.get('/limits', authenticate, async (req, res) => {
           },
           contacts: {
             current: usage.contacts_count,
-            max: user.contacts_limit
+            max: effectiveLimit(user.subscription_tier, 'contacts', user.contacts_limit)
           },
           voiceNotes: {
             current: usage.voice_notes_count,
-            max: user.voice_notes_limit
-          }
+            max: effectiveLimit(user.subscription_tier, 'voiceNotes', user.voice_notes_limit)
+          },
+          voiceWills: {
+            current: wills,
+            max: limitsFor(user.subscription_tier).wills
+          },
+          slots: limitsFor(user.subscription_tier).slots
         }
       }
     });

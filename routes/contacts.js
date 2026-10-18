@@ -4,10 +4,7 @@ const router = express.Router();
 const { body, validationResult } = require('express-validator');
 const { authenticate, validateTier } = require('../middleware/auth');
 const { pool } = require('../config/database');
-
-
-
-
+const { effectiveLimit } = require('../utils/planLimits');
 
 // Get contact statistics
 router.get('/stats', authenticate, async (req, res) => {
@@ -29,13 +26,14 @@ router.get('/stats', authenticate, async (req, res) => {
     );
 
     const user = userQuery.rows[0];
+    const limit = effectiveLimit(user.subscription_tier, 'contacts', user.contacts_limit);
 
     res.json({
       success: true,
       data: {
         ...statsQuery.rows[0],
-        contact_limit: user.contacts_limit,
-        remaining_contacts: user.contacts_limit - statsQuery.rows[0].total_contacts,
+        contact_limit: limit,
+        remaining_contacts: Math.max(0, limit - Number(statsQuery.rows[0].total_contacts)),
         tier: user.subscription_tier
       }
     });
@@ -163,20 +161,17 @@ router.post('/', authenticate, [
     );
 
     const user = userQuery.rows[0];
-    const tier = user.subscription_tier;
 
-    // Apply limits
-    if (tier === 'LITE' && user.contact_count >= 3) {
+    // Contacts = phone-line slots (3 / 9 / 9). Over the limit after a downgrade: kept, but no new ones
+    const maxContacts = effectiveLimit(user.subscription_tier, 'contacts', user.contacts_limit);
+    const contactCount = Number(user.contact_count);
+    if (contactCount >= maxContacts) {
       return res.status(403).json({
         success: false,
-        error: 'LITE tier limit reached (3 contacts max). Upgrade to add more contacts.'
-      });
-    }
-
-    if (user.contact_count >= user.contacts_limit) {
-      return res.status(403).json({
-        success: false,
-        error: `Contact limit reached (${user.contacts_limit} contacts max). Upgrade to add more contacts.`
+        code: 'CONTACT_LIMIT',
+        error: contactCount > maxContacts
+          ? `You have ${contactCount} contacts and your plan allows ${maxContacts}. Your contacts are kept, but delete ${contactCount - maxContacts + 1} or upgrade to add a new one.`
+          : `Contact limit reached (${maxContacts} on your plan). Delete one or upgrade to add more.`
       });
     }
 

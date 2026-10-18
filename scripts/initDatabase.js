@@ -47,7 +47,7 @@ async function initDatabase() {
         
         storage_limit_gb INTEGER DEFAULT 5,
         contacts_limit INTEGER,  
-        voice_notes_limit INTEGER DEFAULT 100,
+        voice_notes_limit INTEGER DEFAULT 3,
         
         stripe_customer_id VARCHAR(255),
         stripe_subscription_id VARCHAR(255),
@@ -77,13 +77,9 @@ async function initDatabase() {
       CREATE OR REPLACE FUNCTION set_user_limits()
       RETURNS TRIGGER AS $$
       BEGIN
+        -- Same numbers as utils/planLimits.js (keypad slots: Lite 3, Essential 9, Premium 9)
         IF NEW.contacts_limit IS NULL THEN
-          CASE NEW.subscription_tier
-            WHEN 'LITE' THEN NEW.contacts_limit := 3;
-            WHEN 'ESSENTIAL' THEN NEW.contacts_limit := 9;
-            WHEN 'LEGACY_VAULT_PREMIUM' THEN NEW.contacts_limit := 50;
-            ELSE NEW.contacts_limit := 3;
-          END CASE;
+          NEW.contacts_limit := CASE WHEN NEW.subscription_tier IN ('ESSENTIAL', 'LEGACY_VAULT_PREMIUM', 'PREMIUM') THEN 9 ELSE 3 END;
         END IF;
         RETURN NEW;
       END;
