@@ -842,19 +842,7 @@ app.post('/api/sync/will', syncAuth, async (req, res) => {
       const twilioRecordingSid    = isTwilioSid ? voiceMessage : null;
       const twilioSyncStatus      = isTwilioSid ? 'synced' : 'pending';
 
-      // One-time self-heal: migrate any existing rows where SID was stored in s3_key
-      pool.query(`
-        UPDATE voice_wills
-        SET twilio_recording_sid = s3_key,
-            s3_key = null,
-            twilio_sync_status = 'synced'
-        WHERE s3_key LIKE 'RE%'
-          AND length(s3_key) > 30
-          AND s3_key NOT LIKE '%/%'
-          AND s3_key NOT LIKE 'http%'
-          AND twilio_recording_sid IS NULL
-          AND deleted_at IS NULL
-      `).catch(err => console.warn('SID migration:', err.message));
+      // (The old "self-heal" that rewrote voice_wills on every phone will is now migration 022, run once.)
 
       // Check if will already exists (idempotency)
       const existing = await pool.query(

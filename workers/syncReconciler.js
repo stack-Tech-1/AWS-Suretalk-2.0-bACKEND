@@ -179,8 +179,13 @@ async function fixContent(userIds) {
   const results = [];
   for (const p of plans) {
     const r = { userId: p.u.id, name: p.u.full_name || p.u.email, relinked: 0, duplicatesRemoved: 0, notes: 0, wills: 0 };
-    for (const id of p.notes.unplaced) await pool.query('UPDATE voice_notes SET ivr_slot_number = NULL WHERE id = $1', [id]);
-    for (const id of p.wills.unplaced) await pool.query('UPDATE voice_wills SET will_slot_number = NULL WHERE id = $1', [id]);
+    // Clear every slot that's about to change first: two live notes can't share a slot number
+    // (index voice_notes_user_slot_unique), so swaps and moves into a slot another note still claims
+    // would otherwise fail half-way
+    const noteIds = [...p.notes.unplaced, ...p.notes.relink.map(x => x.id), ...p.notes.missing.map(x => x.id)];
+    const willIds = [...p.wills.unplaced, ...p.wills.relink.map(x => x.id), ...p.wills.missing.map(x => x.id)];
+    if (noteIds.length) await pool.query('UPDATE voice_notes SET ivr_slot_number = NULL WHERE id = ANY($1)', [noteIds]);
+    if (willIds.length) await pool.query('UPDATE voice_wills SET will_slot_number = NULL WHERE id = ANY($1)', [willIds]);
     for (const x of p.notes.relink) { await pool.query('UPDATE voice_notes SET ivr_slot_number = $1 WHERE id = $2', [x.to, x.id]); r.relinked++; }
     for (const x of p.wills.relink) { await pool.query('UPDATE voice_wills SET will_slot_number = $1 WHERE id = $2', [x.to, x.id]); r.relinked++; }
     for (const d of p.notes.duplicates) { await phoneLineContent.removeNote(p.u.phone, d.slot); r.duplicatesRemoved++; }
