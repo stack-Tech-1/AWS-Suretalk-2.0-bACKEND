@@ -11,7 +11,7 @@ const {
   BUCKETS,
   isOwnS3Key
 } = require('../utils/s3Storage');
-const { willLimitError } = require('../utils/planLimits');
+const { willLimitError, WILL_MAX_SECONDS } = require('../utils/planLimits');
 const phoneLineContent = require('../utils/phoneLineContent');
 const { resolveIvrPlaybackUrl } = require('../utils/resolveAudioUrl');
 const { signedProxyRecordingPath } = require('../utils/audioSigning');
@@ -215,6 +215,10 @@ router.post('/wills', authenticate, validateTier('LEGACY_VAULT_PREMIUM'), [
 
     const limitError = await willLimitError(pool, req.user.id, req.user.subscription_tier);
     if (limitError) return res.status(403).json({ success: false, code: 'WILL_LIMIT', error: limitError });
+    // Up to 5 minutes per will (a couple of seconds of leeway for how browsers measure length)
+    if (Number(req.body.duration) > WILL_MAX_SECONDS + 2) {
+      return res.status(400).json({ success: false, code: 'WILL_TOO_LONG', error: 'A voice will can be up to 5 minutes long.' });
+    }
 
     // Keep only beneficiaries that are this user's own contacts
     let ownBeneficiaries = [];

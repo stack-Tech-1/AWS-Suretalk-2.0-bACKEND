@@ -3,7 +3,7 @@
 //
 // A "slot" is one keypad position on the phone line (press 1–9): a contact plus their voice note.
 // Voice notes = slots, so every note in the app also has a home on the phone line.
-// Voice wills (Premium) have their own 9 keypad positions.
+// Voice wills (Premium) have their own keypad positions: 3, each recording up to WILL_MAX_SECONDS long.
 //
 // Over the limit (e.g. after a downgrade): nothing is deleted. Existing items can still be played,
 // edited and deleted, but nothing new can be added until the person is back under the limit.
@@ -12,7 +12,7 @@ const { TIERS, normalizeTier } = require('./tierMapping');
 const PLAN_LIMITS = {
   [TIERS.LITE]:      { slots: 3, contacts: 3, voiceNotes: 3, wills: 0, storageGb: 1,  price: 0 },
   [TIERS.ESSENTIAL]: { slots: 9, contacts: 9, voiceNotes: 9, wills: 0, storageGb: 5,  price: 6.99 },
-  [TIERS.PREMIUM]:   { slots: 9, contacts: 9, voiceNotes: 9, wills: 9, storageGb: 50, price: 12.99 },
+  [TIERS.PREMIUM]:   { slots: 9, contacts: 9, voiceNotes: 9, wills: 3, storageGb: 50, price: 12.99 },
 };
 
 const limitsFor = (tier) => PLAN_LIMITS[normalizeTier(tier)];
@@ -38,4 +38,7 @@ async function willLimitError(pool, userId, tier) {
     : `Voice will limit reached (${max} on your plan). Delete one to add another.`;
 }
 
-module.exports = { PLAN_LIMITS, limitsFor, effectiveLimit, willLimitError };
+// A voice will recording can be up to 5 minutes long (the phone line stops will recordings at 5 minutes too)
+const WILL_MAX_SECONDS = 300;
+
+module.exports = { PLAN_LIMITS, limitsFor, effectiveLimit, willLimitError, WILL_MAX_SECONDS };

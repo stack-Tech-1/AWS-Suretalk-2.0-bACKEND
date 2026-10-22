@@ -62,7 +62,7 @@ router.get('/plans', authenticate, async (req, res) => {
         interval: 'month',
         features: [
           'All Essential features',
-          '9 slots plus 9 voice will slots',
+          '9 slots plus 3 voice wills (5 minutes each)',
           'Permanent storage',
           'Scheduled legacy messages',
           'Bank-level encryption',

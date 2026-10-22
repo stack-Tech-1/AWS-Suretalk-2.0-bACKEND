@@ -8,7 +8,7 @@ const { syncToIvr } = require('./syncIvr');
 const { limitsFor } = require('./planLimits');
 const { resolveIvrPlaybackUrl } = require('./resolveAudioUrl');
 
-const WILL_SLOTS = 9;
+const WILL_SLOTS = limitsFor('LEGACY_VAULT_PREMIUM').wills; // 3
 const lowestFree = (taken, max) => { for (let s = 1; s <= max; s++) if (!taken.has(s)) return s; return null; };
 
 // Lowest keypad slot not used by one of the person's live notes (null when all are used)
@@ -20,7 +20,7 @@ async function freeNoteSlot(userId, tier, db = pool) {
   return lowestFree(new Set(r.rows.map(x => x.ivr_slot_number)), limitsFor(tier).slots);
 }
 
-// Lowest will slot not used by one of the person's wills (removed-by-admin wills keep theirs: they can be restored)
+// Lowest will slot (1–3) not used by one of the person's wills (removed-by-admin wills keep theirs: they can be restored)
 async function freeWillSlot(userId, db = pool) {
   const r = await db.query(
     `SELECT will_slot_number FROM voice_wills WHERE user_id = $1 AND deleted_at IS NULL AND will_slot_number IS NOT NULL`,
