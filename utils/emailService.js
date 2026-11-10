@@ -129,9 +129,11 @@ class EmailService {
   // ══════════════════════════════════════════════════════════════════════════
   // 4. PAYMENT FAILED
   // ══════════════════════════════════════════════════════════════════════════
-  async sendPaymentFailedEmail(toEmail, userName, { amountDue, currency = 'USD', nextRetryDate, attemptCount = 1 }) {
-    const billingUrl = `${this.siteUrl}/usersDashboard/billing`;
-    const isLastWarning = attemptCount >= 3;
+  // actionUrl: where "Update payment method" goes (phone-only customers get Stripe's invoice page,
+  // as they have no app account). No nextRetryDate = Stripe's last try.
+  async sendPaymentFailedEmail(toEmail, userName, { amountDue, currency = 'USD', nextRetryDate, attemptCount = 1, actionUrl }) {
+    const billingUrl = actionUrl || `${this.siteUrl}/usersDashboard/billing`;
+    const isLastWarning = !nextRetryDate;
     const amount = money(amountDue, currency);
     const html = t.render({
       category: 'Billing', accent: 'urgent', toEmail,
@@ -142,11 +144,11 @@ class EmailService {
         t.p('We were unable to process your SureTalk subscription payment. Please update your payment method to keep your account active.'),
         t.details([
           ['Amount due', amount],
-          ['Attempt', `${attemptCount} of 4`],
+          ['Attempt', String(attemptCount)],
           nextRetryDate ? ['Next retry', nextRetryDate] : null,
         ]),
         isLastWarning
-          ? t.callout('If payment is not resolved, your account will be suspended and you will lose access to your voice notes and contacts.', { tone: 'warn', title: 'This is our final attempt' })
+          ? t.callout('If payment is not resolved, your plan will move to the free Lite plan. Nothing is deleted, but you won\'t be able to add new recordings above the Lite limit, and voice wills stay locked until you subscribe again.', { tone: 'warn', title: 'This is our final attempt' })
           : t.p("We'll automatically try again. To avoid any interruption to your service, please update your payment method now."),
         t.button('Update payment method', billingUrl, { tone: 'urgent' }),
         t.divider(),
@@ -169,27 +171,33 @@ class EmailService {
   // ══════════════════════════════════════════════════════════════════════════
   // 5. ACCOUNT SUSPENDED (all payment retries exhausted)
   // ══════════════════════════════════════════════════════════════════════════
-  async sendAccountSuspendedEmail(toEmail, userName) {
+  // The plan ended after failed payments: the person is on free Lite with everything kept (plan rules).
+  // phoneOnly: no app account, so they subscribe again by calling the phone line.
+  async sendAccountSuspendedEmail(toEmail, userName, { phoneOnly = false } = {}) {
     const billingUrl = `${this.siteUrl}/usersDashboard/billing`;
+    const again = phoneOnly
+      ? 'To get your plan back, call the SureTalk line and choose a plan from the menu.'
+      : 'To get your plan back, choose a plan on your Billing page.';
     const html = t.render({
-      category: 'Billing', accent: 'urgent', title: 'Your account has been paused', toEmail,
-      preheader: 'Reactivate your SureTalk account to regain access.',
+      category: 'Billing', accent: 'urgent', title: 'Your plan has moved to Lite', toEmail,
+      preheader: 'We could not collect your payment, so your plan has moved to the free Lite plan.',
       body: [
         t.greeting(userName),
-        t.p('Your SureTalk subscription has been suspended because we were unable to collect payment after multiple attempts.'),
-        t.callout('You cannot access voice notes, contacts, or scheduled messages until your subscription is reactivated.', { tone: 'warn', title: 'Your account is currently paused' }),
-        t.p(t.rich(t.b('The good news:'), ' Your data is completely safe. All your voice notes and contacts are preserved. You just need to update your payment method to restore access instantly.')),
-        t.button('Reactivate my account', billingUrl, { tone: 'urgent' }),
+        t.p('We were unable to collect your SureTalk payment after several attempts, so your subscription has ended and your account is now on the free Lite plan.'),
+        t.callout('You can still sign in and listen to everything you have saved. You can\'t add new recordings above the Lite limit, and voice wills stay locked until you subscribe again.', { tone: 'warn', title: 'What this means' }),
+        t.p(t.rich(t.b('Nothing has been deleted.'), ' ', again)),
+        phoneOnly ? null : t.button('Choose a plan', billingUrl, { tone: 'urgent' }),
         t.divider(),
         t.p('Need help? Reply to this email and our team will assist you.', { muted: true, small: true }),
-      ]
+      ].filter(Boolean)
     });
     return this._send({
       to: toEmail,
-      subject: 'Your SureTalk account has been paused',
+      subject: 'Your SureTalk plan has moved to Lite',
       html,
-      text: t.text({ title: 'Account paused', toEmail, lines: [
-        `Hi ${userName || 'there'},`, '', 'Your SureTalk account has been paused due to a failed payment.', 'Your data is safe. Reactivate at:', billingUrl
+      text: t.text({ title: 'Your plan has moved to Lite', toEmail, lines: [
+        `Hi ${userName || 'there'},`, '', 'We could not collect your payment, so your plan has moved to the free Lite plan.',
+        'Nothing has been deleted.', again, phoneOnly ? '' : billingUrl
       ] })
     });
   }
@@ -197,7 +205,8 @@ class EmailService {
   // ══════════════════════════════════════════════════════════════════════════
   // 6. PAYMENT SUCCEEDED / RENEWAL RECEIPT
   // ══════════════════════════════════════════════════════════════════════════
-  async sendPaymentSuccessEmail(toEmail, userName, { amountPaid, currency = 'USD', tier, nextBillingDate }) {
+  // phoneOnly: no app account (paid on a call), so no dashboard links
+  async sendPaymentSuccessEmail(toEmail, userName, { amountPaid, currency = 'USD', tier, nextBillingDate, phoneOnly = false }) {
     const billingUrl = `${this.siteUrl}/usersDashboard/billing`;
     const amount = money(amountPaid, currency);
     const tierLabel = TIER_LABELS[tier] || tier;
@@ -212,10 +221,12 @@ class EmailService {
           nextBillingDate ? ['Next billing date', nextBillingDate] : null,
         ]),
         t.p('Everything is active and ready. Keep using SureTalk as normal.'),
-        t.button('Go to dashboard', `${this.siteUrl}/usersDashboard`),
+        phoneOnly ? null : t.button('Go to dashboard', `${this.siteUrl}/usersDashboard`),
         t.divider(),
-        t.p(t.rich('To manage or cancel your subscription, visit your ', t.a('billing page', billingUrl), '.'), { muted: true, small: true }),
-      ]
+        phoneOnly
+          ? t.p('To change or cancel your plan, call the SureTalk line or reply to this email.', { muted: true, small: true })
+          : t.p(t.rich('To manage or cancel your subscription, visit your ', t.a('billing page', billingUrl), '.'), { muted: true, small: true }),
+      ].filter(Boolean)
     });
     return this._send({
       to: toEmail,
@@ -223,7 +234,7 @@ class EmailService {
       html,
       text: t.text({ title: 'Payment confirmed', toEmail, lines: [
         `Hi ${userName || 'there'},`, '', `Payment of ${amount} confirmed for ${tierLabel}.`,
-        nextBillingDate ? `Next billing date: ${nextBillingDate}` : '', '', `Manage billing: ${billingUrl}`
+        nextBillingDate ? `Next billing date: ${nextBillingDate}` : '', '', phoneOnly ? 'To change or cancel your plan, call the SureTalk line.' : `Manage billing: ${billingUrl}`
       ] })
     });
   }
@@ -231,7 +242,7 @@ class EmailService {
   // ══════════════════════════════════════════════════════════════════════════
   // 7. SUBSCRIPTION CANCELLED
   // ══════════════════════════════════════════════════════════════════════════
-  async sendSubscriptionCancelledEmail(toEmail, userName, { tier, accessUntilDate }) {
+  async sendSubscriptionCancelledEmail(toEmail, userName, { tier, accessUntilDate, phoneOnly = false }) {
     const billingUrl = `${this.siteUrl}/usersDashboard/billing`;
     const tierLabel = { LITE: 'SureTalk LITE', ESSENTIAL: 'SureTalk Essential', LEGACY_VAULT_PREMIUM: 'SureTalk Premium' }[tier] || tier;
     const html = t.render({
@@ -247,11 +258,13 @@ class EmailService {
         ), { tone: 'info' }),
         t.p(t.b('What you still have on LITE:')),
         t.list(['Up to 3 voice notes', 'Up to 3 contacts', 'Phone-based access']),
-        t.p('Changed your mind? You can reactivate your subscription at any time.'),
-        t.button('Reactivate subscription', billingUrl),
+        t.p(phoneOnly
+          ? 'Changed your mind? Call the SureTalk line and choose a plan from the menu at any time.'
+          : 'Changed your mind? You can reactivate your subscription at any time.'),
+        phoneOnly ? null : t.button('Reactivate subscription', billingUrl),
         t.divider(),
         t.p('Your card will not be charged again. If you have questions, just reply to this email.', { muted: true, small: true }),
-      ]
+      ].filter(Boolean)
     });
     return this._send({
       to: toEmail,
@@ -259,7 +272,7 @@ class EmailService {
       html,
       text: t.text({ title: 'Subscription cancelled', toEmail, lines: [
         `Hi ${userName || 'there'},`, '', `Your ${tierLabel} subscription has been cancelled.`,
-        'Your account has been moved to the free LITE plan.', 'Your data is safe.', '', `Reactivate at: ${billingUrl}`
+        'Your account has been moved to the free LITE plan.', 'Your data is safe.', '', phoneOnly ? 'To subscribe again, call the SureTalk line.' : `Reactivate at: ${billingUrl}`
       ] })
     });
   }
@@ -297,9 +310,32 @@ class EmailService {
   // ══════════════════════════════════════════════════════════════════════════
   // 9. TRIAL ENDING IN 3 DAYS
   // ══════════════════════════════════════════════════════════════════════════
-  async sendTrialEndingEmail(toEmail, userName, { trialEndDate, tier }) {
+  // cardOnFile: the card was saved at sign-up (phone-line trials), so it will simply be charged
+  async sendTrialEndingEmail(toEmail, userName, { trialEndDate, tier, cardOnFile = false, phoneOnly = false }) {
     const billingUrl = `${this.siteUrl}/usersDashboard/billing`;
     const tierLabel = { ESSENTIAL: 'SureTalk Essential ($6.99/mo)', LEGACY_VAULT_PREMIUM: 'SureTalk Premium ($12.99/mo)' }[tier] || tier;
+    if (cardOnFile) {
+      const change = phoneOnly ? 'To change or cancel your plan before then, call the SureTalk line or reply to this email.'
+                               : 'To change or cancel your plan before then, visit your billing page.';
+      return this._send({
+        to: toEmail,
+        subject: `Your SureTalk free trial ends on ${trialEndDate}`,
+        html: t.render({
+          category: 'Billing', title: 'Your trial ends in 3 days', toEmail,
+          preheader: `Your free trial of ${tierLabel} ends on ${trialEndDate}.`,
+          body: [
+            t.greeting(userName),
+            t.p(t.rich('Your free trial of ', t.b(tierLabel), ' ends on ', t.b(trialEndDate), '. Your saved card will be charged then, and your plan carries on without interruption.')),
+            phoneOnly ? null : t.button('Manage my plan', billingUrl),
+            t.divider(),
+            t.p(change, { muted: true, small: true }),
+          ].filter(Boolean)
+        }),
+        text: t.text({ title: 'Trial ending soon', toEmail, lines: [
+          `Hi ${userName || 'there'},`, '', `Your free trial of ${tierLabel} ends on ${trialEndDate}. Your saved card will be charged then.`, change
+        ] })
+      });
+    }
     const html = t.render({
       category: 'Billing', title: 'Your trial ends in 3 days', toEmail,
       preheader: `Your free trial ends on ${trialEndDate}. Add a card to keep your access.`,

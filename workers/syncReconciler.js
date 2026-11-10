@@ -1,5 +1,6 @@
 // workers/syncReconciler.js
 // Nightly comparison of every customer in the app with their phone-line account (DynamoDB Users).
+// Phone-only customers who subscribed on a call: their phone-line plan is set from their Stripe subscription.
 // Fixed automatically (the app is the source of truth for these; Stripe drives the app's plan):
 //   - plan differs                     → the app's plan is sent to the phone line, EXCEPT when the
 //                                        phone line has an active Stripe subscription the app doesn't
@@ -22,6 +23,7 @@ const logger = require('../utils/logger');
 const { syncAccountToIvr } = require('../utils/syncIvr');
 const { ivrTierName } = require('../utils/tierMapping');
 const { limitsFor } = require('../utils/planLimits');
+const { getStripe, tierOfSubscription } = require('../utils/stripePlans');
 
 const RUN_HOUR_UTC = 3;
 const CHECK_EVERY_MS = 15 * 60 * 1000;
@@ -247,6 +249,34 @@ async function followPhoneLineSchedules(apply) {
   return out;
 }
 
+// Phone-only customers (no app account) who subscribed on a call: the plan on the phone line must match
+// their Stripe subscription, in case a Stripe update never arrived. Only subscriptions this Stripe account
+// knows are checked: ones it doesn't (e.g. customers on the old Stripe account) are left alone.
+async function phoneOnlyPlanFixes(accounts) {
+  const stripe = getStripe();
+  if (!stripe) return [];
+  const out = [];
+  for (const a of accounts.filter(x => /^sub_/.test(String(x.stripeSubscriptionId || '')) && x.status !== 'deleted')) {
+    let sub;
+    try {
+      sub = await stripe.subscriptions.retrieve(a.stripeSubscriptionId);
+    } catch (e) {
+      if (e.code === 'resource_missing') continue;
+      throw e;
+    }
+    const plan = ivrTierName(tierOfSubscription(sub));
+    const line = phoneTier(a.subscription_tier);
+    if (plan !== line) {
+      out.push({
+        userId: null, name: null, email: null, phone: a.userId, type: 'PHONE_PLAN_FROM_STRIPE',
+        label: `Phone-only customer: the phone line said ${PLAN_NAMES[line]}, their Stripe subscription (${sub.status}) gives ${PLAN_NAMES[plan]}`,
+        change: { subscription_tier: plan, action: 'reconcile_stripe_plan' },
+      });
+    }
+  }
+  return out;
+}
+
 async function failedSyncCounts() {
   const app = (await pool.query(`SELECT COUNT(*) FILTER (WHERE status = 'dead')::int AS dead FROM sync_outbox`)).rows[0];
   let phoneLineDead = null;
@@ -327,7 +357,15 @@ async function runReconcile({ trigger = 'manual', runBy = null, applyFixes = tru
       }
       contentToCompare.push({ u, acct });
     }
-    const phoneOnly = phoneAccounts.filter(a => !matchedKeys.has(phoneKey(a.userId))).length;
+    const phoneOnlyAccounts = phoneAccounts.filter(a => !matchedKeys.has(phoneKey(a.userId)));
+    const phoneOnly = phoneOnlyAccounts.length;
+
+    try {
+      fixes.push(...await phoneOnlyPlanFixes(phoneOnlyAccounts));
+    } catch (err) {
+      logger.warn(`Reconcile: could not compare phone-only plans with Stripe: ${err.message}`);
+      issues.push({ type: 'STRIPE_CHECK_FAILED', label: `Could not compare phone-only customers' plans with Stripe (${err.message}). It will try again next time.` });
+    }
 
     // Recordings and wills: what each side has, by keypad slot / will slot. Never changed automatically:
     // a Super admin reviews the list and presses "Copy to the phone line".
@@ -458,4 +496,4 @@ const startReconciler = () => {
   setInterval(nightlyTick, CHECK_EVERY_MS);
 };
 
-module.exports = { runReconcile, startReconciler, nightlyTick, phoneKey, MAX_AUTO_FIXES, fixContent, recordingKey, planSide };
+module.exports = { runReconcile, startReconciler, nightlyTick, phoneKey, MAX_AUTO_FIXES, fixContent, recordingKey, planSide, phoneOnlyPlanFixes };

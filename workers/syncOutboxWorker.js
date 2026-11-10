@@ -4,7 +4,10 @@ const logger = require('../utils/logger');
 const emailService = require('../utils/emailService');
 const { isNothingToUpdate, markSkipped } = require('../utils/syncIvr');
 
-const MAX_ATTEMPTS = 5;
+// Retries wait longer each time: 4 min, 8, 16, 32, 64, 128, then every 4 hours. 12 tries cover about
+// 24 hours, so the phone line being down for a while doesn't need anyone to press Retry.
+// Items show in Failed syncs as "Retrying" meanwhile, and as failed (with an alert email) after the last try.
+const MAX_ATTEMPTS = 12;
 const POLL_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
 const TWILIO_RETRY_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 const TWILIO_MAX_ATTEMPTS = 5;
@@ -21,7 +24,8 @@ const processOutbox = async () => {
        FROM sync_outbox
        WHERE status IN ('pending', 'failed')
          AND attempts < $1
-         AND (last_attempt_at IS NULL OR last_attempt_at < NOW() - INTERVAL '2 minutes')
+         AND (last_attempt_at IS NULL
+              OR last_attempt_at < NOW() - LEAST(power(2, attempts) * INTERVAL '2 minutes', INTERVAL '4 hours'))
        FOR UPDATE SKIP LOCKED
        LIMIT 20`,
       [MAX_ATTEMPTS]

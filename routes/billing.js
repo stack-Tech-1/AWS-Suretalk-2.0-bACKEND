@@ -15,6 +15,37 @@ const stripe = process.env.STRIPE_SECRET_KEY
   ? new Stripe(process.env.STRIPE_SECRET_KEY, { httpAgent: _stripeAgent })
   : null;
 
+// Free trial for a first subscription (website and phone line alike)
+const TRIAL_DAYS = 30;
+
+// Subscription statuses that are still billing the customer
+const BILLING_STATUSES = ['active', 'trialing', 'past_due', 'unpaid'];
+
+// The user's subscription that is still charging them, or null.
+// Checks the saved subscription first, then every subscription on their Stripe customer
+// (covers a missing or out-of-date stripe_subscription_id).
+async function findPaidSubscription(userId) {
+  const r = await pool.query('SELECT stripe_customer_id, stripe_subscription_id FROM users WHERE id = $1', [userId]);
+  const { stripe_customer_id: cust, stripe_subscription_id: subId } = r.rows[0] || {};
+  if (subId) {
+    try {
+      const sub = await stripe.subscriptions.retrieve(subId);
+      if (BILLING_STATUSES.includes(sub.status)) return sub;
+    } catch (e) {
+      if (e.code !== 'resource_missing') throw e;   // Stripe unreachable: don't risk a second subscription
+    }
+  }
+  if (cust) {
+    try {
+      const list = await stripe.subscriptions.list({ customer: cust, status: 'all', limit: 20 });
+      return list.data.find(s => BILLING_STATUSES.includes(s.status)) || null;
+    } catch (e) {
+      if (e.code !== 'resource_missing') throw e;
+    }
+  }
+  return null;
+}
+
 // Get billing plans
 router.get('/plans', authenticate, async (req, res) => {
   try {
@@ -213,6 +244,29 @@ router.post('/create-checkout', authenticate, [
 
     const { priceId, successUrl, cancelUrl } = req.body;
 
+    // Already paying? Switch the existing subscription instead of starting a second one
+    // (a new Checkout here would bill them for both plans every month).
+    const current = await findPaidSubscription(req.user.id);
+    if (current) {
+      const item = current.items.data[0];
+      if (item?.price?.id === priceId) {
+        return res.status(400).json({ success: false, code: 'ALREADY_ON_PLAN', error: 'You are already on this plan.' });
+      }
+      const portal = await stripe.billingPortal.sessions.create({
+        customer: typeof current.customer === 'string' ? current.customer : current.customer.id,
+        return_url: cancelUrl,
+        flow_data: {
+          type: 'subscription_update_confirm',
+          subscription_update_confirm: {
+            subscription: current.id,
+            items: [{ id: item.id, price: priceId, quantity: 1 }]
+          },
+          after_completion: { type: 'redirect', redirect: { return_url: successUrl } }
+        }
+      });
+      return res.json({ success: true, data: { url: portal.url, mode: 'switch' } });
+    }
+
     // Get or create Stripe customer
     let stripeCustomerId = null;
     const user = await pool.query(
@@ -240,7 +294,12 @@ router.post('/create-checkout', authenticate, [
       );
     }
 
-    // Create checkout session
+    // 30-day free trial for first-time subscribers only (same as the phone line). Anyone who has had a
+    // subscription before pays from day one, so cancelling and re-subscribing can't give endless trials.
+    const earlier = await stripe.subscriptions.list({ customer: stripeCustomerId, status: 'all', limit: 1 });
+    const firstTime = earlier.data.length === 0;
+
+    // Create checkout session (the card is still collected for a trial, and charged when it ends)
     const session = await stripe.checkout.sessions.create({
       customer: stripeCustomerId,
       payment_method_types: ['card'],
@@ -255,6 +314,7 @@ router.post('/create-checkout', authenticate, [
         userId: req.user.id
       },
       subscription_data: {
+        ...(firstTime ? { trial_period_days: TRIAL_DAYS } : {}),
         metadata: {
           userId: req.user.id,
           userEmail: req.user.email

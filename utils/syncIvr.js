@@ -10,6 +10,8 @@ const logger = require('./logger');
  * 3. On success: marks the record sent.
  * 4. On failure: leaves it pending for the outbox worker to retry.
  * Never throws — always safe to call fire-and-forget.
+ * Returns false only when the update could not even be saved for retrying (it is lost);
+ * callers that must not lose it (the Stripe webhook) treat that as a failure.
  *
  * @param {Object} payload      - Data to send to IVR
  * @param {string} endpointPath - IVR endpoint path (e.g. 'sync-user')
@@ -35,7 +37,7 @@ const syncToIvr = async (payload, endpointPath, client) => {
     outboxId = result.rows[0].id;
   } catch (insertErr) {
     logger.error(`sync_outbox INSERT failed (sync lost): ${insertErr.message}`);
-    return; // Nothing more we can do
+    return false; // Nothing more we can do here
   }
 
   try {
@@ -60,11 +62,12 @@ const syncToIvr = async (payload, endpointPath, client) => {
   } catch (err) {
     if (isNothingToUpdate(err)) {
       await markSkipped(outboxId, err);
-      return;
+      return true;
     }
     // Leave as 'pending' — outbox worker will retry
     logger.warn(`Sync to IVR failed (will retry via outbox): ${err.message}`);
   }
+  return true;
 };
 
 /**
@@ -94,7 +97,7 @@ const markSkipped = async (outboxId, err) => {
  * 'change_phone' (+ newUserId). Users without a phone number have no phone-line account.
  */
 const syncAccountToIvr = (phone, fields) => {
-  if (!phone) return;
+  if (!phone) return Promise.resolve(true);
   return syncToIvr({ userId: phone, source: 'app', ...fields }, 'sync-user');
 };
 
