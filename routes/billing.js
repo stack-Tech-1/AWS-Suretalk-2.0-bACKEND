@@ -15,9 +15,6 @@ const stripe = process.env.STRIPE_SECRET_KEY
   ? new Stripe(process.env.STRIPE_SECRET_KEY, { httpAgent: _stripeAgent })
   : null;
 
-// Free trial for a first subscription (website and phone line alike)
-const TRIAL_DAYS = 30;
-
 // Subscription statuses that are still billing the customer
 const BILLING_STATUSES = ['active', 'trialing', 'past_due', 'unpaid'];
 
@@ -294,12 +291,8 @@ router.post('/create-checkout', authenticate, [
       );
     }
 
-    // 30-day free trial for first-time subscribers only (same as the phone line). Anyone who has had a
-    // subscription before pays from day one, so cancelling and re-subscribing can't give endless trials.
-    const earlier = await stripe.subscriptions.list({ customer: stripeCustomerId, status: 'all', limit: 1 });
-    const firstTime = earlier.data.length === 0;
-
-    // Create checkout session (the card is still collected for a trial, and charged when it ends)
+    // Create checkout session. No free trial: paid plans are charged from day one
+    // (LITE is the free option), same as the phone line.
     const session = await stripe.checkout.sessions.create({
       customer: stripeCustomerId,
       payment_method_types: ['card'],
@@ -314,7 +307,6 @@ router.post('/create-checkout', authenticate, [
         userId: req.user.id
       },
       subscription_data: {
-        ...(firstTime ? { trial_period_days: TRIAL_DAYS } : {}),
         metadata: {
           userId: req.user.id,
           userEmail: req.user.email
