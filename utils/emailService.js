@@ -94,6 +94,33 @@ class EmailService {
   }
 
   // ══════════════════════════════════════════════════════════════════════════
+  // 2b. CODE TO CHANGE THE PHONE ID OR PIN (website /reset-pin)
+  // ══════════════════════════════════════════════════════════════════════════
+  async sendAccountCodeEmail(toEmail, userName, { code, phoneEnding }) {
+    const html = t.render({
+      category: 'Account', title: 'Your SureTalk code', toEmail,
+      preheader: `Your code is ${code}. It expires in 10 minutes.`,
+      body: [
+        t.greeting(userName),
+        t.p(`Someone asked to change the phone ID or PIN of the SureTalk account for the number ending ${phoneEnding}. Enter this code on the page to continue:`),
+        t.raw(`<p style="margin:8px 0 22px;text-align:center;font:700 34px/1.2 Consolas,Menlo,monospace;letter-spacing:8px;color:${t.COLORS.navy}">${t.esc(code)}</p>`),
+        t.p('The code expires in 10 minutes. Never share it with anyone, SureTalk will never ask you for it.'),
+        t.divider(),
+        t.p("If you didn't ask for this, you can ignore this email: nothing has been changed.", { muted: true, small: true }),
+      ]
+    });
+    return this._send({
+      to: toEmail,
+      subject: `Your SureTalk code: ${code}`,
+      html,
+      text: t.text({ title: 'Your SureTalk code', toEmail, lines: [
+        `Hi ${userName || 'there'},`, '', `Your code to change the phone ID or PIN for the number ending ${phoneEnding} is: ${code}`,
+        '', 'It expires in 10 minutes. Never share it with anyone.', "If you didn't ask for this, ignore this email."
+      ] })
+    });
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
   // 3. WELCOME (after email verified)
   // ══════════════════════════════════════════════════════════════════════════
   async sendWelcomeEmail(toEmail, userName) {

@@ -100,7 +100,8 @@ async function phoneLineAccount(phoneLineId) {
   const r = await dynamo().send(new GetCommand({
     TableName: process.env.DYNAMO_USERS_TABLE || 'Users',
     Key: { userId: phoneLineId },
-    ProjectionExpression: 'userId, email, firstName, subscription_tier, stripeSubscriptionId, verified',
+    ProjectionExpression: 'userId, email, firstName, subscription_tier, stripeSubscriptionId, verified, #st',
+    ExpressionAttributeNames: { '#st': 'status' },
   }));
   return r.Item || null;
 }
