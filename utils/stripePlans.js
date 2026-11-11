@@ -10,7 +10,7 @@ const Stripe = require('stripe');
 const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
 const { DynamoDBDocumentClient, GetCommand } = require('@aws-sdk/lib-dynamodb');
 const { pool } = require('../config/database');
-const { TIERS, normalizeTier } = require('./tierMapping');
+const { TIERS } = require('./tierMapping');
 
 let stripeClient;
 const getStripe = () => {
@@ -56,14 +56,16 @@ const priceTiers = () => ({
   [process.env.NEXT_PUBLIC_STRIPE_PREMIUM_PRICE_ID]:   TIERS.PREMIUM,
 });
 
-// The plan a subscription gives right now (app tier names). Price decides; the phone server's
-// metadata.tier is only used for a price this backend doesn't know.
+// Is this subscription on one of our current prices (Lite / Essential / Premium)?
+// Subscriptions on OLD prices (the 2025 phone system's $2.99 plans, on the same Stripe account) are not
+// ours to manage until they are moved to a current price: no plan changes, no emails, nightly check skips them.
+const isCurrentPlan = (sub) => !!priceTiers()[sub?.items?.data?.[0]?.price?.id];
+
+// The plan a subscription gives right now (app tier names), or null for an old price (leave it alone).
 function tierOfSubscription(sub) {
-  if (!sub || !PAID_STATUSES.includes(sub.status)) return TIERS.LITE;
-  const price = sub.items?.data?.[0]?.price?.id;
-  const known = priceTiers()[price];
-  if (known) return known;
-  return sub.metadata?.tier ? normalizeTier(String(sub.metadata.tier)) : TIERS.LITE;
+  if (!sub || !isCurrentPlan(sub)) return null;
+  if (!PAID_STATUSES.includes(sub.status)) return TIERS.LITE;
+  return priceTiers()[sub.items.data[0].price.id];
 }
 
 const APP_USER_COLS = 'id, email, full_name, phone, subscription_tier, stripe_customer_id, stripe_subscription_id';
@@ -154,7 +156,7 @@ async function hasOtherBillingSubscription(appUser, sub) {
 }
 
 module.exports = {
-  getStripe, PAID_STATUSES, BILLING_STATUSES, tierOfSubscription, ownerOfSubscription, phoneLineAccount,
+  getStripe, PAID_STATUSES, BILLING_STATUSES, tierOfSubscription, isCurrentPlan, ownerOfSubscription, phoneLineAccount,
   hasOtherBillingSubscription,
   isAppUserId, isPhoneLineId, phoneKey, appUserByPhone,
 };

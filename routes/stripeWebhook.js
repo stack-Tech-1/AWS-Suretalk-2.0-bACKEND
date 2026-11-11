@@ -20,7 +20,7 @@ const { PLAN_LIMITS } = require('../utils/planLimits');
 const emailService = require('../utils/emailService');
 const logger       = require('../utils/logger');
 const {
-  getStripe, PAID_STATUSES, tierOfSubscription, ownerOfSubscription, phoneLineAccount, hasOtherBillingSubscription,
+  getStripe, PAID_STATUSES, tierOfSubscription, isCurrentPlan, ownerOfSubscription, phoneLineAccount, hasOtherBillingSubscription,
 } = require('../utils/stripePlans');
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -74,8 +74,13 @@ async function freshSubscription(stripe, idOrObj) {
  * Returns { owner, tier, applied } — applied=false when a different subscription runs this account.
  */
 async function applySubscription(sub) {
-  const owner = await ownerOfSubscription(sub);
   const tier  = tierOfSubscription(sub);
+  if (!tier) {
+    // Old price (2025 phone system): not managed here until it's moved to a current price
+    logger.info(`Stripe: subscription ${sub.id} is on an old price (${sub.items?.data?.[0]?.price?.id}); left alone`);
+    return { owner: null, tier: null, applied: false };
+  }
+  const owner = await ownerOfSubscription(sub);
   const paid  = PAID_STATUSES.includes(sub.status);
 
   if (owner.appUser && await hasOtherBillingSubscription(owner.appUser, sub)) {
@@ -177,6 +182,7 @@ async function handleEvent(stripe, event) {
     // ── Subscription ended (cancelled by the customer, or Stripe gave up after failed payments) ─
     case 'customer.subscription.deleted': {
       const sub = await freshSubscription(stripe, obj);
+      if (!isCurrentPlan(sub)) break;   // old price: left alone
       const before = await ownerOfSubscription(sub);
       let previousTier = before.appUser?.subscription_tier;
       if (!previousTier && before.viaPhone) {
@@ -202,11 +208,13 @@ async function handleEvent(stripe, event) {
     case 'invoice.payment_succeeded': {
       if (obj.amount_paid === 0) break;   // $0 invoices (trial starts)
       const sub = subscriptionIdOf(obj) ? await freshSubscription(stripe, subscriptionIdOf(obj)) : null;
-      const owner = sub ? await ownerOfSubscription(sub) : await ownerOfSubscription({ id: null, customer: obj.customer, metadata: {} });
-      if (sub && owner.appUser && await hasOtherBillingSubscription(owner.appUser, sub)) break;
+      // Only invoices of subscriptions on a current price (old 2025 prices and one-off invoices: left alone)
+      if (!sub || !isCurrentPlan(sub)) break;
+      const owner = await ownerOfSubscription(sub);
+      if (owner.appUser && await hasOtherBillingSubscription(owner.appUser, sub)) break;
 
-      const tier = sub ? tierOfSubscription(sub) : (owner.appUser?.subscription_tier || TIERS.ESSENTIAL);
-      if (owner.appUser && sub) {
+      const tier = tierOfSubscription(sub);
+      if (owner.appUser) {
         // Back to 'active' after a late payment
         await pool.query('UPDATE users SET subscription_status = $1, updated_at = NOW() WHERE id = $2',
           [PAID_STATUSES.includes(sub.status) ? sub.status : 'active', owner.appUser.id]);
@@ -239,8 +247,10 @@ async function handleEvent(stripe, event) {
     // ── Payment failed (Stripe retries automatically; the plan is kept meanwhile) ─
     case 'invoice.payment_failed': {
       const sub = subscriptionIdOf(obj) ? await freshSubscription(stripe, subscriptionIdOf(obj)) : null;
-      const owner = sub ? await ownerOfSubscription(sub) : await ownerOfSubscription({ id: null, customer: obj.customer, metadata: {} });
-      if (sub && owner.appUser && await hasOtherBillingSubscription(owner.appUser, sub)) break;
+      // Only invoices of subscriptions on a current price (old 2025 prices and one-off invoices: left alone)
+      if (!sub || !isCurrentPlan(sub)) break;
+      const owner = await ownerOfSubscription(sub);
+      if (owner.appUser && await hasOtherBillingSubscription(owner.appUser, sub)) break;
 
       const nextRetry = obj.next_payment_attempt ? formatDate(obj.next_payment_attempt) : null;   // none = last try
       const attemptCount = obj.attempt_count || 1;
@@ -266,7 +276,7 @@ async function handleEvent(stripe, event) {
     // ── Free trial ends in 3 days (phone-line Essential / Premium start with a trial) ─
     case 'customer.subscription.trial_will_end': {
       const sub = await freshSubscription(stripe, obj);
-      if (!['trialing'].includes(sub.status)) break;
+      if (sub.status !== 'trialing' || !isCurrentPlan(sub)) break;
       const owner = await ownerOfSubscription(sub);
       if (owner.appUser && await hasOtherBillingSubscription(owner.appUser, sub)) break;
       const to = await contactFor(owner);

@@ -250,8 +250,8 @@ async function followPhoneLineSchedules(apply) {
 }
 
 // Phone-only customers (no app account) who subscribed on a call: the plan on the phone line must match
-// their Stripe subscription, in case a Stripe update never arrived. Only subscriptions this Stripe account
-// knows are checked: ones it doesn't (e.g. customers on the old Stripe account) are left alone.
+// their Stripe subscription, in case a Stripe update never arrived. Only subscriptions on a current price
+// are checked: ones Stripe doesn't know, and ones on the old 2025 $2.99 prices, are left alone.
 async function phoneOnlyPlanFixes(accounts) {
   const stripe = getStripe();
   if (!stripe) return [];
@@ -264,7 +264,9 @@ async function phoneOnlyPlanFixes(accounts) {
       if (e.code === 'resource_missing') continue;
       throw e;
     }
-    const plan = ivrTierName(tierOfSubscription(sub));
+    const tier = tierOfSubscription(sub);
+    if (!tier) continue;   // old price (2025 phone system): left alone
+    const plan = ivrTierName(tier);
     const line = phoneTier(a.subscription_tier);
     if (plan !== line) {
       out.push({
