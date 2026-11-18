@@ -25,6 +25,7 @@ const { normalizeTier } = require('./utils/tierMapping');
 const axios = require('axios');
 const { authenticate } = require('./middleware/auth');
 const { requireAudioSignature, signedEc2RecordingUrl, signedEc2S3Url, TTL: AUDIO_TTL } = require('./utils/audioSigning');
+const { archiveDeletedFromPhone } = require('./utils/recordingArchive');
 const EC2_STREAM_URL = process.env.EC2_STREAM_URL || 'https://test-api.suretalknow.com';
 
 const settingsRoutes = require('./routes/settings');
@@ -460,11 +461,13 @@ app.post('/api/sync/slot', syncAuth, async (req, res) => {
 
     // 1. Find internal user_id from phone (stored with or without +1)
     const dbUserId = await findUserIdByPhone(userId);
-    if (!dbUserId) {
-      return res.status(404).json({ success: false, error: 'User not found' });
-    }
     const slotNum = parseInt(slotNumber, 10) || null;
     const isWill = type === 'will' || type === 'voiceWill';
+    const archiveFromPhone = () => archiveDeletedFromPhone(voiceMessage, { kind: isWill ? 'voice-will' : 'voice-note', userId: dbUserId || userId });
+    if (!dbUserId) {
+      if (action === 'delete') archiveFromPhone();   // phone-only customer: no app account to update
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
 
     if (action === 'delete') {
       if (isWill) {
@@ -487,6 +490,7 @@ app.post('/api/sync/slot', syncAuth, async (req, res) => {
           console.warn(`No voice note found to delete for user ${userId}, slot ${slotNum}`);
         }
       }
+      archiveFromPhone();
     } else if (action === 'create' || action === 'update') {
       // If IVR explicitly marks this slot as a will, route to voice_wills
       if (isWill) {
@@ -825,6 +829,8 @@ app.post('/api/sync/will', syncAuth, async (req, res) => {
     // 1. Find the user by phone number (stored with or without +1)
     const dbUserId = await findUserIdByPhone(userId);
     if (!dbUserId) {
+      // Phone-only customer: no app account to update, but the recording is still archived
+      if (action === 'delete') archiveDeletedFromPhone(voiceMessage, { kind: 'voice-will', userId });
       return res.status(404).json({ success: false, error: 'User not found' });
     }
 
@@ -886,6 +892,7 @@ app.post('/api/sync/will', syncAuth, async (req, res) => {
          WHERE user_id = $1 AND will_slot_number = $2 AND deleted_at IS NULL`,
         [dbUserId, willSlotNumber]
       );
+      archiveDeletedFromPhone(voiceMessage, { kind: 'voice-will', userId: dbUserId });
 
     } else {
       return res.status(400).json({ success: false, error: 'Invalid action' });

@@ -5,7 +5,8 @@
 const axios = require('axios');
 const { S3Client, CopyObjectCommand, PutObjectCommand } = require('@aws-sdk/client-s3');
 const Twilio = require('twilio');
-const { deleteFromS3 } = require('./s3Storage');
+const { pool } = require('../config/database');
+const { deleteFromS3, BUCKETS } = require('./s3Storage');
 
 const ARCHIVE_BUCKET = process.env.AWS_S3_BUCKET_ARCHIVE || 'suretalk-deleted-recordings-archive';
 
@@ -79,4 +80,33 @@ async function archiveThenDelete(record, { kind, userId }) {
   }
 }
 
-module.exports = { archiveThenDelete, ARCHIVE_BUCKET };
+/**
+ * A recording deleted from the phone menu. The phone line sends what the slot held: a Twilio id or a
+ * link to the recording. It is kept if another live note or will still uses the same recording.
+ */
+async function archiveDeletedFromPhone(voiceMessage, { kind, userId }) {
+  try {
+    const text = String(voiceMessage || '').split('?')[0];
+    const sid = text.match(/(?:^|\/)(RE[0-9a-f]{32})$/i)?.[1] || null;
+    const s3Key = sid ? null : decodeURIComponent(text.match(/\/stream-s3-recording\/(.+)$/)?.[1] || '') || null;
+    const s3Bucket = s3Key?.startsWith('voice-notes/') ? BUCKETS.VOICE_NOTES : s3Key?.startsWith('wills/') ? BUCKETS.WILLS : null;
+    if (!sid && !s3Bucket) return;
+
+    const recording = sid || s3Key;
+    const inUse = await pool.query(
+      `SELECT 1 FROM voice_notes WHERE deleted_at IS NULL AND (s3_key = $1 OR twilio_recording_sid = $1)
+       UNION ALL SELECT 1 FROM voice_wills WHERE deleted_at IS NULL AND (s3_key = $1 OR twilio_recording_sid = $1) LIMIT 1`,
+      [recording]
+    );
+    if (inUse.rows.length) return;
+
+    await archiveThenDelete(
+      sid ? { id: sid, source: 'ivr', twilio_recording_sid: sid } : { id: s3Key, source: 'app', s3_key: s3Key, s3_bucket: s3Bucket },
+      { kind, userId }
+    );
+  } catch (err) {
+    console.error(`Recording deleted from the phone menu was not archived, so the original was kept: ${err.message}`);
+  }
+}
+
+module.exports = { archiveThenDelete, archiveDeletedFromPhone, ARCHIVE_BUCKET };

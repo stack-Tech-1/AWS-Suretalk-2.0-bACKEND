@@ -4,12 +4,11 @@
 const AWS = require('aws-sdk');
 const logger = require('./logger');
 const t = require('./emailTemplate');
+const { formatCents: money } = require('./money');
 
 // Customer-typed text with its line breaks kept (escaped)
 const multiline = (s) => t.raw(String(s || '').split(/\r?\n/).map(t.esc).join('<br>'));
 const TIER_LABELS ={ LITE: 'SureTalk LITE', ESSENTIAL: 'SureTalk Essential', LEGACY_VAULT_PREMIUM: 'SureTalk Premium (Legacy Vault)' };
-const money = (cents, currency = 'USD') =>
-  new Intl.NumberFormat('en-US', { style: 'currency', currency: String(currency).toUpperCase() }).format((cents || 0) / 100);
 
 class EmailService {
   constructor() {

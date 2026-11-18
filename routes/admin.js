@@ -74,7 +74,7 @@ router.get('/overview', authenticateAdmin, async (req, res) => {
       SELECT 
         EXTRACT(MONTH FROM created_at) as month,
         COUNT(*) as transactions,
-        SUM(amount_cents) / 100 as revenue
+        ROUND(SUM(amount_cents) / 100.0, 2) as revenue
       FROM billing_history
       WHERE status = 'paid'
         AND created_at >= CURRENT_DATE - INTERVAL '6 months'

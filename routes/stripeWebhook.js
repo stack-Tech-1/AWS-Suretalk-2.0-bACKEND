@@ -19,6 +19,7 @@ const { ivrTierName, normalizeTier, TIERS } = require('../utils/tierMapping');
 const { PLAN_LIMITS } = require('../utils/planLimits');
 const emailService = require('../utils/emailService');
 const logger       = require('../utils/logger');
+const { formatCents } = require('../utils/money');
 const {
   getStripe, PAID_STATUSES, tierOfSubscription, isCurrentPlan, ownerOfSubscription, phoneLineAccount, hasOtherBillingSubscription,
 } = require('../utils/stripePlans');
@@ -229,7 +230,7 @@ async function handleEvent(stripe, event) {
         );
         await pool.query(
           `INSERT INTO system_logs (user_id, level, service, message, metadata) VALUES ($1, 'info', 'billing', 'Payment received', $2)`,
-          [owner.appUser.id, JSON.stringify({ invoiceId: obj.id, amount: obj.amount_paid, currency: obj.currency, tier })]
+          [owner.appUser.id, JSON.stringify({ invoiceId: obj.id, amount: formatCents(obj.amount_paid, obj.currency), amountCents: obj.amount_paid, tier })]
         ).catch(() => {});
       }
 
@@ -240,7 +241,7 @@ async function handleEvent(stripe, event) {
           nextBillingDate: formatDate(sub?.current_period_end), phoneOnly: to.phoneOnly,
         }));
       }
-      logger.info(`Invoice paid: ${obj.id}, ${obj.amount_paid} ${obj.currency}${owner.phoneLineId ? `, phone line ${owner.phoneLineId}` : ''}`);
+      logger.info(`Invoice paid: ${obj.id}, ${formatCents(obj.amount_paid, obj.currency)}${owner.phoneLineId ? `, phone line ${owner.phoneLineId}` : ''}`);
       break;
     }
 
@@ -258,7 +259,7 @@ async function handleEvent(stripe, event) {
       if (owner.appUser) {
         await pool.query(
           `INSERT INTO system_logs (user_id, level, service, message, metadata) VALUES ($1, 'warning', 'billing', 'Invoice payment failed', $2)`,
-          [owner.appUser.id, JSON.stringify({ invoiceId: obj.id, amount: obj.amount_due, attempt: attemptCount })]
+          [owner.appUser.id, JSON.stringify({ invoiceId: obj.id, amount: formatCents(obj.amount_due, obj.currency), amountCents: obj.amount_due, attempt: attemptCount })]
         ).catch(() => {});
       }
       const to = await contactFor(owner);
