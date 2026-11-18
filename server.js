@@ -26,6 +26,7 @@ const axios = require('axios');
 const { authenticate } = require('./middleware/auth');
 const { requireAudioSignature, signedEc2RecordingUrl, signedEc2S3Url, TTL: AUDIO_TTL } = require('./utils/audioSigning');
 const { archiveDeletedFromPhone } = require('./utils/recordingArchive');
+const { findDependentMessages, cancelDependentMessages, recordingKey } = require('./utils/scheduledDependencies');
 const EC2_STREAM_URL = process.env.EC2_STREAM_URL || 'https://test-api.suretalknow.com';
 
 const settingsRoutes = require('./routes/settings');
@@ -648,6 +649,32 @@ app.get('/api/sync/schedules', syncAuth, async (req, res) => {
   } catch (err) {
     console.error('List app schedules for phone line failed:', err.message);
     res.status(500).json({ success: false, error: 'Failed to list scheduled messages' });
+  }
+});
+
+// Phone menu "delete this voice note": is a scheduled message still due to send this recording?
+//   { userId, recording }                 answers how many
+//   { userId, recording, cancel: true }   the caller confirmed: cancels them
+app.post('/api/sync/recording-schedules', syncAuth, async (req, res) => {
+  const { userId, recording, cancel } = req.body;
+  if (!userId || !recording) return res.status(400).json({ success: false, error: 'Missing userId or recording' });
+  try {
+    const dbUserId = await findUserIdByPhone(userId);
+    let voiceNoteId = null;
+    if (dbUserId) {
+      const wanted = recordingKey(recording);
+      const notes = await pool.query(
+        'SELECT id, s3_key, twilio_recording_sid FROM voice_notes WHERE user_id = $1 AND deleted_at IS NULL',
+        [dbUserId]
+      );
+      voiceNoteId = notes.rows.find(n => [n.s3_key, n.twilio_recording_sid].some(v => v && recordingKey(v) === wanted))?.id || null;
+    }
+    const messages = await findDependentMessages({ userId: dbUserId, phone: userId, voiceNoteId, recordings: [recording] });
+    if (cancel === true) await cancelDependentMessages(messages, userId);
+    res.json({ success: true, count: messages.length, cancelled: cancel === true });
+  } catch (err) {
+    console.error('Recording schedules check failed:', err.message);
+    res.status(502).json({ success: false, error: 'Could not check scheduled messages' });
   }
 });
 

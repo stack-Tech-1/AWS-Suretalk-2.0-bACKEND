@@ -19,18 +19,7 @@ const twilioClient = process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_T
 // cancel it on the phone line first, or the call would still go out. Returns the phone line's status
 // (200 cancelled, 404 already gone) or null when it couldn't be reached.
 const isPhoneScheduled = (m) => m?.metadata?.source === 'ivr' && m?.metadata?.ivrScheduleId;
-async function cancelOnPhoneLine(phone, ivrScheduleId) {
-  if (!process.env.IVR_API_URL || !process.env.IVR_REQUEST_KEY) return null;
-  try {
-    const r = await require('axios').post(`${process.env.IVR_API_URL}/deleteScheduledMessage`,
-      { key: process.env.IVR_REQUEST_KEY, userId: phone, scheduleId: ivrScheduleId, source: 'app' },
-      { timeout: 8000, validateStatus: () => true });
-    return r.status;
-  } catch (err) {
-    console.error('Phone line cancel failed:', err.message);
-    return null;
-  }
-}
+const { cancelOnPhoneLine } = require('../utils/scheduledDependencies');
 
 // Get all scheduled messages
 router.get('/', authenticate, async (req, res) => {

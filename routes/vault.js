@@ -13,6 +13,7 @@ const {
 const { WILL_MAX_SECONDS } = require('../utils/planLimits');
 const phoneLineContent = require('../utils/phoneLineContent');
 const { archiveThenDelete } = require('../utils/recordingArchive');
+const { clearScheduledBeforeDelete } = require('../utils/scheduledDependencies');
 const { resolveIvrPlaybackUrl } = require('../utils/resolveAudioUrl');
 const { signedProxyRecordingPath } = require('../utils/audioSigning');
 
@@ -612,6 +613,12 @@ router.delete('/wills/:id', authenticate, async (req, res) => {
     }
 
     const will = willResult.rows[0];
+
+    // Messages still due to send this recording: warn first, cancel them once the customer confirms
+    const mayDelete = await clearScheduledBeforeDelete(req, res, {
+      recordings: [will.twilio_recording_sid, will.s3_key],
+    });
+    if (!mayDelete) return;
 
     // Soft delete in database
     await pool.query('UPDATE voice_wills SET deleted_at = NOW() WHERE id = $1', [will.id]);

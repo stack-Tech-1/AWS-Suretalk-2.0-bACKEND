@@ -10,6 +10,7 @@ const { createNotification } = require('./notifications');
 const { syncToIvr } = require('../utils/syncIvr');
 const { resolveIvrPlaybackUrl } = require('../utils/resolveAudioUrl');
 const { archiveThenDelete } = require('../utils/recordingArchive');
+const { clearScheduledBeforeDelete } = require('../utils/scheduledDependencies');
 const { signedProxyRecordingPath, signedEc2S3Url, TTL: AUDIO_TTL } = require('../utils/audioSigning');
 const { limitsFor, effectiveLimit, WILL_MAX_SECONDS } = require('../utils/planLimits');
 
@@ -796,6 +797,13 @@ router.delete('/:id', authenticate, async (req, res) => {
     }
 
     const note = ownershipCheck.rows[0];
+
+    // Messages still due to send this recording: warn first, cancel them once the customer confirms
+    const mayDelete = await clearScheduledBeforeDelete(req, res, {
+      voiceNoteId: note.id,
+      recordings: [note.twilio_recording_sid, note.s3_key],
+    });
+    if (!mayDelete) return;
 
     // Soft delete
     await pool.query(
