@@ -11,7 +11,7 @@ const {
   BUCKETS,
   isOwnS3Key
 } = require('../utils/s3Storage');
-const { willLimitError, WILL_MAX_SECONDS } = require('../utils/planLimits');
+const { WILL_MAX_SECONDS } = require('../utils/planLimits');
 const phoneLineContent = require('../utils/phoneLineContent');
 const { resolveIvrPlaybackUrl } = require('../utils/resolveAudioUrl');
 const { signedProxyRecordingPath } = require('../utils/audioSigning');
@@ -214,8 +214,8 @@ router.post('/wills', authenticate, validateTier('LEGACY_VAULT_PREMIUM'), [
       return res.status(400).json({ success: false, error: 'Invalid recording file' });
     }
 
-    const limitError = await willLimitError(pool, req.user.id, req.user.subscription_tier);
-    if (limitError) return res.status(403).json({ success: false, code: 'WILL_LIMIT', error: limitError });
+    const capacity = await phoneLineContent.willCapacity(req.user.id, req.user.subscription_tier);
+    if (!capacity.canCreate) return res.status(403).json({ success: false, code: 'WILL_LIMIT', error: capacity.message });
     // Up to 5 minutes per will (a couple of seconds of leeway for how browsers measure length)
     if (Number(req.body.duration) > WILL_MAX_SECONDS + 2) {
       return res.status(400).json({ success: false, code: 'WILL_TOO_LONG', error: 'A voice will can be up to 5 minutes long.' });
@@ -304,6 +304,12 @@ router.post('/upload-url', authenticate, validateTier('LEGACY_VAULT_PREMIUM'), [
     }
 
     const { fileName, fileType, isWill } = req.body;
+
+    // Refuse before the recording is uploaded when there's no room for another will
+    if (isWill) {
+      const capacity = await phoneLineContent.willCapacity(req.user.id, req.user.subscription_tier);
+      if (!capacity.canCreate) return res.status(403).json({ success: false, code: 'WILL_LIMIT', error: capacity.message });
+    }
 
     // Determine bucket type
     const bucketType = isWill ? 'WILLS' : 'LEGACY_VAULT';
@@ -537,6 +543,17 @@ router.get('/scheduled-messages', authenticate, validateTier('LEGACY_VAULT_PREMI
       success: false,
       error: 'Failed to fetch scheduled messages'
     });
+  }
+});
+
+// How many voice wills the person holds and whether they can add another
+router.get('/wills/capacity', authenticate, validateTier('LEGACY_VAULT_PREMIUM'), async (req, res) => {
+  try {
+    const { used, max, canCreate } = await phoneLineContent.willCapacity(req.user.id, req.user.subscription_tier);
+    res.json({ success: true, data: { used, max, canCreate } });
+  } catch (error) {
+    console.error('Get will capacity error:', error);
+    res.status(500).json({ success: false, error: 'Failed to check voice will limit' });
   }
 });
 

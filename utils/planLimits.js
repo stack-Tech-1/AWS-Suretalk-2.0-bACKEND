@@ -24,13 +24,9 @@ const effectiveLimit = (tier, kind, stored) => {
   return stored === null || stored === undefined || !Number.isFinite(n) ? plan : Math.min(n, plan);
 };
 
-// Voice wills: message to show when the person can't add another, or null when there's room
-async function willLimitError(pool, userId, tier) {
+// Voice wills: message to show when someone holding n wills can't add another, or null when there's room
+function willLimitMessage(n, tier) {
   const max = limitsFor(tier).wills;
-  const n = (await pool.query(
-    'SELECT COUNT(*)::int AS n FROM voice_wills WHERE user_id = $1 AND deleted_at IS NULL AND admin_removed_at IS NULL',
-    [userId]
-  )).rows[0].n;
   if (n < max) return null;
   if (max === 0) return 'Voice wills are part of Legacy Vault Premium.';
   return n > max
@@ -41,4 +37,4 @@ async function willLimitError(pool, userId, tier) {
 // A voice will recording can be up to 5 minutes long (the phone line stops will recordings at 5 minutes too)
 const WILL_MAX_SECONDS = 300;
 
-module.exports = { PLAN_LIMITS, limitsFor, effectiveLimit, willLimitError, WILL_MAX_SECONDS };
+module.exports = { PLAN_LIMITS, limitsFor, effectiveLimit, willLimitMessage, WILL_MAX_SECONDS };

@@ -7,7 +7,7 @@ const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
 const { DynamoDBDocumentClient, GetCommand } = require('@aws-sdk/lib-dynamodb');
 const { pool } = require('../config/database');
 const { syncToIvr } = require('./syncIvr');
-const { limitsFor } = require('./planLimits');
+const { limitsFor, willLimitMessage } = require('./planLimits');
 const { resolveIvrPlaybackUrl } = require('./resolveAudioUrl');
 
 const WILL_SLOTS = limitsFor('LEGACY_VAULT_PREMIUM').wills; // 3
@@ -72,6 +72,30 @@ async function freeWillSlot(userId, db = pool) {
     console.warn(`Could not read phone-line will slots for user ${userId}: ${err.message}`);
   }
   return lowestFree(taken, WILL_SLOTS);
+}
+
+// How many voice wills the person holds, counting the app and the phone line once each. A recording on
+// the phone line that the app has no record of counts too. If the phone line can't be read, the app's
+// count is used and the phone line still refuses anything over the limit.
+async function willCapacity(userId, tier, db = pool) {
+  const max = limitsFor(tier).wills;
+  const r = await db.query(
+    `SELECT w.id, w.s3_key, w.twilio_recording_sid, w.admin_removed_at, u.phone
+     FROM users u LEFT JOIN voice_wills w ON w.user_id = u.id AND w.deleted_at IS NULL
+     WHERE u.id = $1`,
+    [userId]
+  );
+  const wills = r.rows.filter(w => w.id);
+  const known = new Set(wills.flatMap(w => [w.s3_key, w.twilio_recording_sid]).filter(Boolean).map(recordingKey));
+  let phoneOnly = 0;
+  try {
+    phoneOnly = (await phoneLineWills(r.rows[0]?.phone)).filter(s => !known.has(recordingKey(s.voiceMessage))).length;
+  } catch (err) {
+    console.warn(`Could not read phone-line wills for user ${userId}: ${err.message}`);
+  }
+  const used = wills.filter(w => !w.admin_removed_at).length + phoneOnly;
+  const message = willLimitMessage(used, tier);
+  return { used, max, canCreate: !message, message };
 }
 
 // The one contact a will slot calls on the phone line: its first beneficiary (the app keeps them all)
@@ -185,6 +209,6 @@ async function pushAllToPhoneLine(userId, { only = null } = {}) {
 }
 
 module.exports = {
-  freeNoteSlot, freeWillSlot, willContactPhone, sendNote, sendWill, removeNote, removeWill, removeWillRecording, changeContact,
+  freeNoteSlot, freeWillSlot, willCapacity, willContactPhone, sendNote, sendWill, removeNote, removeWill, removeWillRecording, changeContact,
   pushAllToPhoneLine, WILL_SLOTS,
 };

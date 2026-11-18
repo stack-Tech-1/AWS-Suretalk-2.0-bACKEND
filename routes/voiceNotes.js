@@ -14,7 +14,7 @@ const Twilio = require('twilio');
 const twilioClient = process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN
   ? new Twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
   : null;
-const { limitsFor, effectiveLimit, willLimitError, WILL_MAX_SECONDS } = require('../utils/planLimits');
+const { limitsFor, effectiveLimit, WILL_MAX_SECONDS } = require('../utils/planLimits');
 
 // Voice notes = phone-line slots (3 / 9 / 9). Over the limit after a downgrade: existing notes stay,
 // but nothing new can be added. Returns the message to show, or null when there's room.
@@ -936,14 +936,14 @@ router.post('/:id/convert-to-will', authenticate, validateTier('LEGACY_VAULT_PRE
 
     const n = noteResult.rows[0];
 
-    const limitError = await willLimitError(pool, req.user.id, req.user.subscription_tier);
-    if (limitError) return res.status(403).json({ success: false, code: 'WILL_LIMIT', error: limitError });
+    const phoneLineContent = require('../utils/phoneLineContent');
+    const capacity = await phoneLineContent.willCapacity(req.user.id, req.user.subscription_tier);
+    if (!capacity.canCreate) return res.status(403).json({ success: false, code: 'WILL_LIMIT', error: capacity.message });
     if (Number(n.duration_seconds) > WILL_MAX_SECONDS + 2) {
       return res.status(400).json({ success: false, code: 'WILL_TOO_LONG', error: 'A voice will can be up to 5 minutes long, and this recording is longer.' });
     }
 
     // A will gets its own will slot (1–9); the note's keypad slot is freed on the phone line
-    const phoneLineContent = require('../utils/phoneLineContent');
     const willSlot = await phoneLineContent.freeWillSlot(req.user.id);
     const inserted = await pool.query(
       `INSERT INTO voice_wills (
