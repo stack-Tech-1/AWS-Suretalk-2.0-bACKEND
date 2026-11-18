@@ -201,6 +201,7 @@ router.post('/wills', authenticate, validateTier('LEGACY_VAULT_PREMIUM'), [
       description,
       s3Key,
       s3Bucket,
+      fileSize,
       releaseCondition,
       releaseDate,
       beneficiaries,
@@ -234,8 +235,9 @@ router.post('/wills', authenticate, validateTier('LEGACY_VAULT_PREMIUM'), [
     const result = await pool.query(
       `INSERT INTO voice_wills (
         user_id, title, description, s3_key, s3_bucket,
-        release_condition, release_date, beneficiaries, executors, verification_required
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        release_condition, release_date, beneficiaries, executors, verification_required,
+        source, file_size_bytes
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'app', $11)
       RETURNING *`,
       [
         req.user.id,
@@ -247,7 +249,8 @@ router.post('/wills', authenticate, validateTier('LEGACY_VAULT_PREMIUM'), [
         releaseDate || null,
         ownBeneficiaries,
         executors || [],
-        verificationRequired !== false // Default to true
+        verificationRequired !== false, // Default to true
+        Number.isSafeInteger(fileSize) && fileSize > 0 ? fileSize : null
       ]
     );
 
