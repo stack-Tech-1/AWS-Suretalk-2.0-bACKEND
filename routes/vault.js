@@ -7,18 +7,14 @@ const { pool } = require('../config/database');
 const {
   generateUploadUrl,
   generateDownloadUrl,
-  deleteFromS3,
   BUCKETS,
   isOwnS3Key
 } = require('../utils/s3Storage');
 const { WILL_MAX_SECONDS } = require('../utils/planLimits');
 const phoneLineContent = require('../utils/phoneLineContent');
+const { archiveThenDelete } = require('../utils/recordingArchive');
 const { resolveIvrPlaybackUrl } = require('../utils/resolveAudioUrl');
 const { signedProxyRecordingPath } = require('../utils/audioSigning');
-const Twilio = require('twilio');
-const twilioClient = process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN
-  ? new Twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
-  : null;
 
 // Get all vault items (permanent voice notes)
 router.get('/', authenticate, validateTier('LEGACY_VAULT_PREMIUM'), async (req, res) => {
@@ -623,21 +619,8 @@ router.delete('/wills/:id', authenticate, async (req, res) => {
     // Fire-and-forget: remove it from the phone line's will slot
     phoneLineContent.removeWillRecording(req.user.phone, will);
 
-    // Fire-and-forget: delete from Twilio if IVR recording
-    if (will.source === 'ivr' && twilioClient) {
-      const sid = will.twilio_recording_sid ||
-        (will.s3_key?.startsWith('RE') && !will.s3_key?.includes('/') ? will.s3_key : null);
-      if (sid) {
-        twilioClient.recordings(sid).remove()
-          .catch(err => console.warn('Twilio delete failed for', sid, err.message));
-      }
-    }
-
-    // Fire-and-forget: delete from S3 if app recording
-    if (will.source !== 'ivr' && will.s3_key && will.s3_bucket) {
-      deleteFromS3(will.s3_key, will.s3_bucket)
-        .catch(err => console.warn('S3 delete failed for will', will.id, err.message));
-    }
+    // Fire-and-forget: keep the audio in the 2-year archive, then remove the original
+    archiveThenDelete(will, { kind: 'voice-will', userId: req.user.id });
 
     res.json({ success: true, message: 'Voice will deleted' });
 

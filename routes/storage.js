@@ -3,13 +3,24 @@ const express = require('express');
 const router = express.Router();
 const { body, validationResult } = require('express-validator');
 const { authenticate, validateTier } = require('../middleware/auth');
-const { 
-  generateUploadUrl, 
+const { pool } = require('../config/database');
+const {
+  generateUploadUrl,
   generateDownloadUrl,
-  deleteFromS3,
-  getObjectMetadata,
-  BUCKETS 
+  isOwnS3Key,
+  BUCKETS
 } = require('../utils/s3Storage');
+
+// A file belongs to the person when it is in their own folder or on one of their own recordings
+const ownsFile = async (key, userId) => {
+  if (isOwnS3Key(key, userId)) return true;
+  const r = await pool.query(
+    `SELECT 1 FROM voice_notes WHERE s3_key = $1 AND user_id = $2
+     UNION ALL SELECT 1 FROM voice_wills WHERE s3_key = $1 AND user_id = $2 LIMIT 1`,
+    [key, userId]
+  );
+  return r.rows.length > 0;
+};
 
 // Generate upload URL for voice note
 router.post('/upload-url/voice-note', authenticate, [
@@ -126,6 +137,13 @@ router.post('/download-url', authenticate, [
       });
     }
 
+    if (!(await ownsFile(key, req.user.id))) {
+      return res.status(403).json({
+        success: false,
+        error: 'You do not have access to this file'
+      });
+    }
+
     const downloadUrl = await generateDownloadUrl(key, bucket, parseInt(expiresIn));
 
     res.json({
@@ -141,82 +159,6 @@ router.post('/download-url', authenticate, [
     res.status(500).json({
       success: false,
       error: 'Failed to generate download URL'
-    });
-  }
-});
-
-// Get object metadata
-router.get('/metadata', authenticate, [
-  body('key').notEmpty(),
-  body('bucket').notEmpty()
-], async (req, res) => {
-  try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({
-        success: false,
-        errors: errors.array()
-      });
-    }
-
-    const { key, bucket } = req.body;
-
-    const metadata = await getObjectMetadata(key, bucket);
-
-    res.json({
-      success: true,
-      data: metadata
-    });
-
-  } catch (error) {
-    console.error('Get metadata error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to get object metadata'
-    });
-  }
-});
-
-// Delete file from S3 (admin/owner only)
-router.delete('/file', authenticate, [
-  body('key').notEmpty(),
-  body('bucket').notEmpty()
-], async (req, res) => {
-  try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({
-        success: false,
-        errors: errors.array()
-      });
-    }
-
-    const { key, bucket } = req.body;
-
-    // Validate bucket access
-    const allowedBuckets = Object.values(BUCKETS);
-    if (!allowedBuckets.includes(bucket)) {
-      return res.status(403).json({
-        success: false,
-        error: 'Access to this bucket is not allowed'
-      });
-    }
-
-    // Note: In production, you should verify ownership
-    // by checking database records before deletion
-
-    await deleteFromS3(key, bucket);
-
-    res.json({
-      success: true,
-      message: 'File deleted successfully'
-    });
-
-  } catch (error) {
-    console.error('Delete file error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to delete file'
     });
   }
 });

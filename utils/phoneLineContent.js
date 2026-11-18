@@ -33,17 +33,18 @@ const phoneLineId = (phone) => {
   return digits.length === 10 ? `+1${digits}` : `+${digits}`;
 };
 
-// The will slots on the person's phone-line account. Throws when the phone line can't be read.
-async function phoneLineWills(phone) {
+// A list of slots on the person's phone-line account. Throws when the phone line can't be read.
+async function phoneLineSlots(phone, field) {
   if (!phone) return [];
   const r = await dynamo().send(new GetCommand({
     TableName: process.env.DYNAMO_USERS_TABLE || 'Users',
     Key: { userId: phoneLineId(phone) },
-    ProjectionExpression: 'voiceWillSlots',
+    ProjectionExpression: field,
     ConsistentRead: true,
   }));
-  return r.Item?.voiceWillSlots || [];
+  return r.Item?.[field] || [];
 }
+const phoneLineWills = (phone) => phoneLineSlots(phone, 'voiceWillSlots');
 
 // The recording a link or id points at, without the link's signature
 const recordingKey = (v) => String(v || '').split('?')[0].replace(/\/+$/, '').split('/').pop();
@@ -157,6 +158,23 @@ async function removeWillRecording(phone, will) {
   }
 }
 
+// The same protection for a deleted voice note's keypad slot
+async function removeNoteRecording(phone, note) {
+  if (!phone || !note.ivr_slot_number) return;
+  try {
+    const slot = (await phoneLineSlots(phone, 'slots')).find(s => Number(s.slotNumber) === Number(note.ivr_slot_number));
+    if (!slot) return;
+    const own = recordingKey(note.twilio_recording_sid || note.s3_key);
+    if (!own || recordingKey(slot.voiceMessage) !== own) {
+      console.warn(`Note ${note.id}: phone-line slot ${note.ivr_slot_number} holds another recording, so it was kept`);
+      return;
+    }
+    return await removeNote(phone, note.ivr_slot_number);
+  } catch (err) {
+    console.warn(`Note ${note.id}: could not check the phone line, slot ${note.ivr_slot_number} was kept: ${err.message}`);
+  }
+}
+
 const changeContact = (phone, { kind, slot, contact }) =>
   slot && send(phone, { ...(kind === 'will' ? { kind: 'will' } : {}), slotNumber: String(slot), contact: contact || '', action: 'updateContact' });
 
@@ -209,6 +227,6 @@ async function pushAllToPhoneLine(userId, { only = null } = {}) {
 }
 
 module.exports = {
-  freeNoteSlot, freeWillSlot, willCapacity, willContactPhone, sendNote, sendWill, removeNote, removeWill, removeWillRecording, changeContact,
+  freeNoteSlot, freeWillSlot, willCapacity, willContactPhone, sendNote, sendWill, removeNote, removeNoteRecording, removeWill, removeWillRecording, changeContact,
   pushAllToPhoneLine, WILL_SLOTS,
 };
