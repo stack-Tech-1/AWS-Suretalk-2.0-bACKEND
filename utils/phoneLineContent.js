@@ -3,6 +3,8 @@
 //   notes:  { userId, slotNumber, contact, voiceMessage, action: 'create' | 'delete' | 'updateContact' }
 //   wills:  same, plus kind: 'will' (slotNumber = will slot)
 // Everything goes through syncToIvr, so it's retried on failure and shows in Failed syncs.
+const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
+const { DynamoDBDocumentClient, GetCommand } = require('@aws-sdk/lib-dynamodb');
 const { pool } = require('../config/database');
 const { syncToIvr } = require('./syncIvr');
 const { limitsFor } = require('./planLimits');
@@ -10,6 +12,41 @@ const { resolveIvrPlaybackUrl } = require('./resolveAudioUrl');
 
 const WILL_SLOTS = limitsFor('LEGACY_VAULT_PREMIUM').wills; // 3
 const lowestFree = (taken, max) => { for (let s = 1; s <= max; s++) if (!taken.has(s)) return s; return null; };
+
+let doc;
+const dynamo = () => {
+  if (!doc) {
+    doc = DynamoDBDocumentClient.from(new DynamoDBClient({
+      region: process.env.IVR_AWS_REGION || 'eu-central-1',
+      credentials: process.env.AWS_ACCESS_KEY_ID
+        ? { accessKeyId: process.env.AWS_ACCESS_KEY_ID, secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY }
+        : undefined,
+      maxAttempts: 3,
+    }));
+  }
+  return doc;
+};
+
+// The phone line's id for a number: +1XXXXXXXXXX for US numbers, otherwise + and the digits
+const phoneLineId = (phone) => {
+  const digits = String(phone || '').replace(/\D/g, '');
+  return digits.length === 10 ? `+1${digits}` : `+${digits}`;
+};
+
+// The will slots on the person's phone-line account. Throws when the phone line can't be read.
+async function phoneLineWills(phone) {
+  if (!phone) return [];
+  const r = await dynamo().send(new GetCommand({
+    TableName: process.env.DYNAMO_USERS_TABLE || 'Users',
+    Key: { userId: phoneLineId(phone) },
+    ProjectionExpression: 'voiceWillSlots',
+    ConsistentRead: true,
+  }));
+  return r.Item?.voiceWillSlots || [];
+}
+
+// The recording a link or id points at, without the link's signature
+const recordingKey = (v) => String(v || '').split('?')[0].replace(/\/+$/, '').split('/').pop();
 
 // Lowest keypad slot not used by one of the person's live notes (null when all are used)
 async function freeNoteSlot(userId, tier, db = pool) {
@@ -20,13 +57,21 @@ async function freeNoteSlot(userId, tier, db = pool) {
   return lowestFree(new Set(r.rows.map(x => x.ivr_slot_number)), limitsFor(tier).slots);
 }
 
-// Lowest will slot (1–3) not used by one of the person's wills (removed-by-admin wills keep theirs: they can be restored)
+// Lowest will slot (1–3) free in the app AND on the phone line, which can hold wills recorded on a call
+// that the app has no record of (removed-by-admin wills keep their slot: they can be restored)
 async function freeWillSlot(userId, db = pool) {
   const r = await db.query(
     `SELECT will_slot_number FROM voice_wills WHERE user_id = $1 AND deleted_at IS NULL AND will_slot_number IS NOT NULL`,
     [userId]
   );
-  return lowestFree(new Set(r.rows.map(x => x.will_slot_number)), WILL_SLOTS);
+  const taken = new Set(r.rows.map(x => x.will_slot_number));
+  try {
+    const u = await db.query('SELECT phone FROM users WHERE id = $1', [userId]);
+    for (const s of await phoneLineWills(u.rows[0]?.phone)) taken.add(Number(s.willSlotNumber));
+  } catch (err) {
+    console.warn(`Could not read phone-line will slots for user ${userId}: ${err.message}`);
+  }
+  return lowestFree(taken, WILL_SLOTS);
 }
 
 // The one contact a will slot calls on the phone line: its first beneficiary (the app keeps them all)
@@ -69,6 +114,25 @@ async function sendWill(phone, will, db = pool) {
 
 const removeNote = (phone, slot) => slot && send(phone, { slotNumber: String(slot), action: 'delete' });
 const removeWill = (phone, slot) => slot && send(phone, { kind: 'will', slotNumber: String(slot), action: 'delete' });
+
+// Removes a deleted will from the phone line, only if that slot really holds this will's recording.
+// A will that never reached the phone line must not take another recording in the same slot with it.
+async function removeWillRecording(phone, will) {
+  if (!phone || !will.will_slot_number) return;
+  try {
+    const slot = (await phoneLineWills(phone)).find(s => Number(s.willSlotNumber) === Number(will.will_slot_number));
+    if (!slot) return;
+    const own = recordingKey(will.twilio_recording_sid || will.s3_key);
+    if (!own || recordingKey(slot.voiceMessage) !== own) {
+      console.warn(`Will ${will.id}: phone-line slot ${will.will_slot_number} holds another recording, so it was kept`);
+      return;
+    }
+    return await removeWill(phone, will.will_slot_number);
+  } catch (err) {
+    console.warn(`Will ${will.id}: could not check the phone line, slot ${will.will_slot_number} was kept: ${err.message}`);
+  }
+}
+
 const changeContact = (phone, { kind, slot, contact }) =>
   slot && send(phone, { ...(kind === 'will' ? { kind: 'will' } : {}), slotNumber: String(slot), contact: contact || '', action: 'updateContact' });
 
@@ -121,6 +185,6 @@ async function pushAllToPhoneLine(userId, { only = null } = {}) {
 }
 
 module.exports = {
-  freeNoteSlot, freeWillSlot, willContactPhone, sendNote, sendWill, removeNote, removeWill, changeContact,
+  freeNoteSlot, freeWillSlot, willContactPhone, sendNote, sendWill, removeNote, removeWill, removeWillRecording, changeContact,
   pushAllToPhoneLine, WILL_SLOTS,
 };

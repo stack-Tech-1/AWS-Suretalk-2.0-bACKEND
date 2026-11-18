@@ -604,7 +604,7 @@ router.delete('/wills/:id', authenticate, async (req, res) => {
     await pool.query('UPDATE voice_wills SET deleted_at = NOW() WHERE id = $1', [will.id]);
 
     // Fire-and-forget: remove it from the phone line's will slot
-    phoneLineContent.removeWill(req.user.phone, will.will_slot_number);
+    phoneLineContent.removeWillRecording(req.user.phone, will);
 
     // Fire-and-forget: delete from Twilio if IVR recording
     if (will.source === 'ivr' && twilioClient) {
