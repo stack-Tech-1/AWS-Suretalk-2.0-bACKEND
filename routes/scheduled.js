@@ -20,6 +20,7 @@ const twilioClient = process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_T
 // (200 cancelled, 404 already gone) or null when it couldn't be reached.
 const isPhoneScheduled = (m) => m?.metadata?.source === 'ivr' && m?.metadata?.ivrScheduleId;
 const { cancelOnPhoneLine, reschedulePhoneMessage } = require('../utils/scheduledDependencies');
+const { sendTestToSelf } = require('../utils/scheduledTest');
 
 // Get all scheduled messages
 router.get('/', authenticate, async (req, res) => {
@@ -451,16 +452,19 @@ router.delete('/:id', authenticate, async (req, res) => {
   }
 });
 
-// Send test message (immediate delivery)
+// Send a test of this message to the signed-in customer only. The scheduled message is not changed.
 router.post('/:id/send-test', authenticate, async (req, res) => {
   try {
     const { id } = req.params;
+    if (!/^[0-9a-f-]{36}$/i.test(id)) {
+      return res.status(404).json({ success: false, error: 'Scheduled message not found' });
+    }
 
     // Check ownership
     const messageQuery = await pool.query(
-      `SELECT sm.*, vn.s3_key, vn.s3_bucket
+      `SELECT sm.id, sm.metadata, vn.s3_key, vn.s3_bucket, vn.twilio_recording_sid, vn.title AS voice_note_title
        FROM scheduled_messages sm
-       LEFT JOIN voice_notes vn ON sm.voice_note_id = vn.id
+       LEFT JOIN voice_notes vn ON sm.voice_note_id = vn.id AND vn.deleted_at IS NULL
        WHERE sm.id = $1 AND sm.user_id = $2`,
       [id, req.user.id]
     );
@@ -472,35 +476,8 @@ router.post('/:id/send-test', authenticate, async (req, res) => {
       });
     }
 
-    const message = messageQuery.rows[0];
-
-    // Generate download URL for voice note
-    const downloadUrl = await generateDownloadUrl(
-      message.s3_key,
-      message.s3_bucket,
-      3600 // 1 hour expiry for test
-    );
-
-    // Update status to testing
-    await pool.query(
-      `UPDATE scheduled_messages 
-       SET delivery_status = 'testing', updated_at = CURRENT_TIMESTAMP
-       WHERE id = $1`,
-      [id]
-    );
-
-    // In production: Actually send via Twilio or email service
-    // For now, return the download URL for manual testing
-    res.json({
-      success: true,
-      message: 'Test initiated',
-      data: {
-        downloadUrl,
-        recipientPhone: message.recipient_phone,
-        recipientEmail: message.recipient_email,
-        deliveryMethod: message.delivery_method
-      }
-    });
+    const { status, body: answer } = await sendTestToSelf(messageQuery.rows[0], req.user);
+    res.status(status).json(answer);
 
   } catch (error) {
     console.error('Send test error:', error);
@@ -731,7 +708,7 @@ ${message}
 Voice note "${voiceNoteTitle}" from ${senderName}
 Listen here: ${downloadUrl}
 
-Link expires in 7 days.
+Link expires in 1 hour.
 Sent via SureTalk
     `.trim();
 
