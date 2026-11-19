@@ -277,7 +277,7 @@ router.post('/wills/:id/release', authenticateAdmin, [
           await twilioClient.messages.create({
             to: r.phone,
             from: process.env.TWILIO_PHONE_NUMBER,
-            body: `${ownerName} left a voice will for you on SureTalk. Listen privately here (link works until ${expiresDate}): ${listenUrl}`
+            body: `SureTalk: ${ownerName} left a voice will for you. Listen privately here (link works until ${expiresDate}): ${listenUrl}\n\nReply STOP to opt out.`
           });
           smsStatus = 'sent';
         } catch (err) {

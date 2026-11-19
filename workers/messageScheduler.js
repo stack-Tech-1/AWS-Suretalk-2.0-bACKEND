@@ -66,9 +66,10 @@ const sendSMS = async (to, senderName, downloadUrl, customMessage) => {
   const fromNumber = process.env.TWILIO_PHONE_NUMBER;
   if (!fromNumber) throw new Error('TWILIO_PHONE_NUMBER not set in environment');
 
+  // Every recipient text names SureTalk and the sender and says how to stop (toll-free messaging rules)
   const body = customMessage
-    ? `${customMessage}\n\nListen to your voice note: ${downloadUrl}`
-    : `You have a voice message from ${senderName} on SureTalk.\n\nListen here: ${downloadUrl}`;
+    ? `SureTalk: ${customMessage}\n\nVoice message from ${senderName}. Listen here: ${downloadUrl}\n\nReply STOP to opt out.`
+    : `SureTalk: You have a voice message from ${senderName}.\n\nListen here: ${downloadUrl}\n\nReply STOP to opt out.`;
 
   const smsMessage = await twilioClient.messages.create({
     to,

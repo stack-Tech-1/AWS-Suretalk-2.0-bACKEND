@@ -709,7 +709,7 @@ Voice note "${voiceNoteTitle}" from ${senderName}
 Listen here: ${downloadUrl}
 
 Link expires in 1 hour.
-Sent via SureTalk
+Sent via SureTalk. Reply STOP to opt out.
     `.trim();
 
     await twilioClient.messages.create({

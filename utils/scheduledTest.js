@@ -56,7 +56,7 @@ async function textTest(to, title, url) {
   await client.messages.create({
     from: process.env.TWILIO_PHONE_NUMBER,
     to,
-    body: `SureTalk test of your scheduled message "${title}". Only you received this. Listen: ${url}\nThis link expires in 1 hour.`,
+    body: `SureTalk test of your scheduled message "${title}". Only you received this. Listen: ${url}\nThis link expires in 1 hour. Reply STOP to opt out.`,
   });
 }
 
