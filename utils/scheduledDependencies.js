@@ -3,7 +3,7 @@
 // customer can be warned, and cancels them once the customer confirms.
 const axios = require('axios');
 const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
-const { DynamoDBDocumentClient, ScanCommand } = require('@aws-sdk/lib-dynamodb');
+const { DynamoDBDocumentClient, ScanCommand, UpdateCommand } = require('@aws-sdk/lib-dynamodb');
 const { pool } = require('../config/database');
 
 let doc;
@@ -106,6 +106,89 @@ async function cancelOnPhoneLine(phone, ivrScheduleId) {
   }
 }
 
+// The phone line sends a message once its saved time has passed, so moving it means changing that time.
+// Returns false when the message is no longer waiting (already due, being sent, sent or cancelled).
+async function rescheduleOnPhoneLine(ivrScheduleId, when) {
+  const now = new Date().toISOString();
+  try {
+    await dynamo().send(new UpdateCommand({
+      TableName: process.env.DYNAMO_SCHEDULES_TABLE || 'SCHEDULES',
+      Key: { scheduleId: ivrScheduleId },
+      UpdateExpression: 'SET scheduledFor = :when, rescheduledAt = :now',
+      ConditionExpression: '#s = :pending AND scheduledFor > :now',
+      ExpressionAttributeNames: { '#s': 'status' },
+      ExpressionAttributeValues: { ':when': when.toISOString(), ':now': now, ':pending': 'PENDING' },
+    }));
+    return true;
+  } catch (err) {
+    if (err.name === 'ConditionalCheckFailedException') return false;
+    throw err;
+  }
+}
+
+const MIN_RESCHEDULE_MS = 5 * 60 * 1000;
+
+/**
+ * Changes the send time of a message scheduled by phone. The app's copy only keeps the new time if the
+ * phone line accepted it, so the two can't disagree.
+ */
+async function reschedulePhoneMessage(req, res, message) {
+  const closed = () => res.status(409).json({
+    success: false,
+    code: 'PHONE_SCHEDULE_CLOSED',
+    error: "This message is already being sent or is no longer scheduled, so its time can't be changed.",
+  });
+
+  const when = new Date(req.body.scheduledFor);
+  if (!req.body.scheduledFor || Number.isNaN(when.getTime())) {
+    return res.status(400).json({ success: false, code: 'INVALID_DATE', error: 'Choose a valid date and time.' });
+  }
+  if (when.getTime() < Date.now() + MIN_RESCHEDULE_MS) {
+    return res.status(400).json({ success: false, code: 'SCHEDULE_TOO_SOON', error: 'Choose a time at least 5 minutes from now.' });
+  }
+  if (message.delivery_status !== 'scheduled') return closed();
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const updated = await client.query(
+      `UPDATE scheduled_messages SET scheduled_for = $1, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $2 AND user_id = $3 AND delivery_status = 'scheduled'
+       RETURNING *`,
+      [when, message.id, req.user.id]
+    );
+    if (updated.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return closed();
+    }
+
+    let moved;
+    try {
+      moved = await rescheduleOnPhoneLine(message.metadata.ivrScheduleId, when);
+    } catch (err) {
+      console.error('Phone line reschedule failed:', err.message);
+      await client.query('ROLLBACK');
+      return res.status(502).json({
+        success: false,
+        code: 'PHONE_LINE_UNAVAILABLE',
+        error: 'Could not reach the phone line, so the time was not changed. Try again in a moment.',
+      });
+    }
+    if (!moved) {
+      await client.query('ROLLBACK');
+      return closed();
+    }
+
+    await client.query('COMMIT');
+    return res.json({ success: true, message: 'Scheduled message updated successfully', data: updated.rows[0] });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 // Throws if a message can't be cancelled, so its recording is not deleted while it is still due to send
 async function cancelDependentMessages(messages, phone) {
   for (const m of messages) {
@@ -155,4 +238,4 @@ async function clearScheduledBeforeDelete(req, res, { voiceNoteId, recordings })
   }
 }
 
-module.exports = { findDependentMessages, cancelDependentMessages, clearScheduledBeforeDelete, cancelOnPhoneLine, recordingKey };
+module.exports = { findDependentMessages, cancelDependentMessages, clearScheduledBeforeDelete, cancelOnPhoneLine, reschedulePhoneMessage, recordingKey };

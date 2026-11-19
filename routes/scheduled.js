@@ -19,7 +19,7 @@ const twilioClient = process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_T
 // cancel it on the phone line first, or the call would still go out. Returns the phone line's status
 // (200 cancelled, 404 already gone) or null when it couldn't be reached.
 const isPhoneScheduled = (m) => m?.metadata?.source === 'ivr' && m?.metadata?.ivrScheduleId;
-const { cancelOnPhoneLine } = require('../utils/scheduledDependencies');
+const { cancelOnPhoneLine, reschedulePhoneMessage } = require('../utils/scheduledDependencies');
 
 // Get all scheduled messages
 router.get('/', authenticate, async (req, res) => {
@@ -313,7 +313,7 @@ router.put('/:id', authenticate, async (req, res) => {
 
     // Check ownership
     const ownershipCheck = await pool.query(
-      'SELECT id, metadata FROM scheduled_messages WHERE id = $1 AND user_id = $2',
+      'SELECT id, metadata, delivery_status FROM scheduled_messages WHERE id = $1 AND user_id = $2',
       [id, req.user.id]
     );
 
@@ -323,12 +323,9 @@ router.put('/:id', authenticate, async (req, res) => {
         error: 'Scheduled message not found'
       });
     }
+    // Scheduled by phone: the phone line sends it, so only the date and time can change, and it changes there too
     if (isPhoneScheduled(ownershipCheck.rows[0])) {
-      return res.status(409).json({
-        success: false,
-        code: 'PHONE_SCHEDULED',
-        error: 'This message was scheduled by phone, so it can only be cancelled here. To change it, cancel it and schedule it again.'
-      });
+      return await reschedulePhoneMessage(req, res, ownershipCheck.rows[0]);
     }
 
     const updates = [];
