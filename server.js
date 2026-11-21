@@ -26,6 +26,7 @@ const axios = require('axios');
 const { authenticate } = require('./middleware/auth');
 const { requireAudioSignature, signedEc2RecordingUrl, signedEc2S3Url, TTL: AUDIO_TTL } = require('./utils/audioSigning');
 const { archiveDeletedFromPhone } = require('./utils/recordingArchive');
+const willRelease = require('./utils/willRelease');
 const { findDependentMessages, cancelDependentMessages, recordingKey } = require('./utils/scheduledDependencies');
 const EC2_STREAM_URL = process.env.EC2_STREAM_URL || 'https://test-api.suretalknow.com';
 
@@ -905,15 +906,19 @@ app.post('/api/sync/will', syncAuth, async (req, res) => {
         );
       } else {
         // Insert new will
-        await pool.query(
+        const inserted = await pool.query(
           `INSERT INTO voice_wills
             (user_id, will_slot_number, s3_key, twilio_recording_sid, twilio_sync_status,
              contact_phone, source, created_at)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-           ON CONFLICT DO NOTHING`,
+           ON CONFLICT DO NOTHING
+           RETURNING *`,
           [dbUserId, willSlotNumber, s3KeyValue, twilioRecordingSid, twilioSyncStatus,
            contact, source, createdAt || new Date()]
         );
+        // Automatic release (only when switched on for this account): 6 months from today by default.
+        // The caller hears the date in the wills menu and can change it with "schedule a will".
+        if (inserted.rows[0]) await willRelease.setUpNewWill(inserted.rows[0], { channel: 'phone' });
       }
 
     } else if (action === 'delete') {
@@ -934,6 +939,58 @@ app.post('/api/sync/will', syncAuth, async (req, res) => {
   } catch (err) {
     console.error('Sync will error:', err);
     res.status(500).json({ success: false, error: 'Internal error' });
+  }
+});
+
+// Phone line ↔ automatic will release. The release date lives here; the phone line reads and sets it.
+//   { userId, willSlotNumber, action: 'status' }                       -> what the wills menu says
+//   { userId, willSlotNumber, action: 'set_date', releaseDate (UTC) }  -> "schedule a will" on the phone
+// { handled: false } means the will is not on the automatic rules: the phone line carries on as before.
+app.post('/api/sync/will-release', syncAuth, async (req, res) => {
+  const { userId, willSlotNumber, action, releaseDate } = req.body || {};
+  const es = String(req.body?.lang || '').toLowerCase().startsWith('es');
+  try {
+    if (!willRelease.isEnabled() || !userId || !willSlotNumber) return res.json({ handled: false });
+    const dbUserId = await findUserIdByPhone(userId);
+    if (!dbUserId) return res.json({ handled: false });
+    const r = await pool.query(
+      `SELECT vw.*, u.will_test_account FROM voice_wills vw JOIN users u ON u.id = vw.user_id
+       WHERE vw.user_id = $1 AND vw.will_slot_number = $2 AND vw.deleted_at IS NULL AND vw.admin_removed_at IS NULL
+       ORDER BY vw.created_at DESC LIMIT 1`,
+      [dbUserId, Number(willSlotNumber)]);
+    const will = r.rows[0];
+    if (!will || will.release_flow !== 'auto') return res.json({ handled: false });
+
+    // What the caller hears (English or Spanish)
+    const when = (w) => new Date(w.release_date).toLocaleDateString(es ? 'es-US' : 'en-US',
+      { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric', timeZone: willRelease.tzOf(w) });
+    const spoken = (w) => {
+      if (w.is_released || w.release_state === 'released') return es ? 'Este testamento de voz ya fue entregado.' : 'This voice will has already been released.';
+      if (w.release_state === 'paused') return es ? 'Este testamento de voz está en espera mientras nuestro equipo lo revisa.' : 'This voice will is on hold while our team looks into it.';
+      return es
+        ? `Está programado para entregarse el ${when(w)}. Para cambiar la fecha, elija programar un testamento de voz en el menú principal.`
+        : `It is set to be released on ${when(w)}. To change the date, choose schedule a voice will from the main menu.`;
+    };
+
+    if (action === 'status') return res.json({ handled: true, releaseDate: will.release_date, releaseText: spoken(will) });
+
+    if (action === 'set_date') {
+      const result = await willRelease.changeReleaseDate(will.id, { newDate: releaseDate, by: 'owner', channel: 'phone' });
+      if (!result.ok) {
+        const why = (es
+          ? { TOO_SOON: 'No se cambió la fecha. Elija una fecha con al menos 4 días de anticipación.', ALREADY_RELEASED: 'Este testamento de voz ya fue entregado.', BAD_DATE: 'No se cambió la fecha. La fecha no es válida.', TOO_FAR: 'No se cambió la fecha. Elija una fecha dentro de los próximos 10 años.' }
+          : { TOO_SOON: 'The date was not changed. Please choose a date at least 4 days from today.', ALREADY_RELEASED: 'This voice will has already been released.', BAD_DATE: 'The date was not changed. That date is not valid.', TOO_FAR: 'The date was not changed. Please choose a date within the next 10 years.' })[result.error];
+        return res.json({ handled: true, ok: false, error: result.error,
+          releaseText: why || (es ? 'No se pudo cambiar la fecha. Inténtelo de nuevo.' : 'The date could not be changed. Please try again.') });
+      }
+      const w = { ...will, ...result.will };
+      return res.json({ handled: true, ok: true, releaseDate: result.will.release_date,
+        releaseText: es ? `Listo. Su testamento de voz ahora se entregará el ${when(w)}.` : `Done. Your voice will is now set to be released on ${when(w)}.` });
+    }
+    res.status(400).json({ handled: false, error: 'Invalid action' });
+  } catch (err) {
+    console.error('Phone will release sync failed:', err.message);
+    res.status(500).json({ handled: false, error: 'Internal error' });
   }
 });
 
