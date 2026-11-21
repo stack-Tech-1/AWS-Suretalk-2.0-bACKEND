@@ -12,6 +12,8 @@ const ALWAYS_OPEN = [
   '/api/sync/',             // IVR (phone line) sync from the Lambdas
   '/api/audio/',            // audio links in calls/SMS
   '/api/play',              // message links opened by recipients
+  '/api/will-release/call/',  // key presses on voice will warning calls (Twilio)
+  '/api/will-release/link/',  // postpone links in voice will warning texts
   '/api/admin',             // admin console (routes still require an admin token)
   '/api/super-admin',
   '/api/auth/admin-login',  // admin sign-in

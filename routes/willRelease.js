@@ -288,6 +288,16 @@ router.post('/link/:token/postpone', async (req, res) => {
 });
 
 // ═══ 3. Owner's will page on the website ═══════════════════════════════════════════════════════
+// Whether this account's new wills get a release date (the website shows the new form only then)
+router.get('/status', authenticate, async (req, res) => {
+  try {
+    res.json({ success: true, data: { automatic: await wr.autoReleaseFor(req.user.id), postponeDays: wr.POSTPONE_DAYS, defaultMonths: 6, minDaysAhead: 4 } });
+  } catch (err) {
+    logger.error(`Will release status failed: ${err.message}`);
+    res.json({ success: true, data: { automatic: false } });
+  }
+});
+
 async function ownWill(req, res) {
   const will = await loadWill(req.params.id);
   if (!will || will.user_id !== req.user.id) { fail(res, 404, 'NOT_FOUND', CHANGE_ERRORS.NOT_FOUND); return null; }
