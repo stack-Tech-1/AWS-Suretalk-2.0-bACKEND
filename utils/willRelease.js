@@ -285,8 +285,130 @@ async function deliverWill(will, { willAudioUrl, buildRecipients }) {
   return { recipients: results.length, delivered, results };
 }
 
+// ── Owner's PIN (the same PIN the phone line uses, stored hashed in the phone line's Users table) ─
+// 5 wrong PINs for a will in 30 minutes (calls and links together) locks postponing for 30 minutes.
+const PIN_LOCK = { tries: 5, minutes: 30 };
+let dynamoDoc;
+const dynamo = () => {
+  if (!dynamoDoc) {
+    const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
+    const { DynamoDBDocumentClient } = require('@aws-sdk/lib-dynamodb');
+    dynamoDoc = DynamoDBDocumentClient.from(new DynamoDBClient({
+      region: process.env.IVR_AWS_REGION || 'eu-central-1',
+      credentials: process.env.AWS_ACCESS_KEY_ID
+        ? { accessKeyId: process.env.AWS_ACCESS_KEY_ID, secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY }
+        : undefined,
+      maxAttempts: 3,
+    }));
+  }
+  return dynamoDoc;
+};
+// '+14045551234' -> '4045551234' (the phone line's account id)
+const phoneLineId = (phone) => {
+  const d = String(phone || '').replace(/\D/g, '');
+  if (d.length === 11 && d.startsWith('1')) return d.slice(1);
+  return d.length === 10 ? d : null;
+};
+
+async function pinLocked(willId) {
+  const r = await pool.query(
+    `SELECT count(*)::int n FROM will_release_events
+     WHERE will_id = $1 AND event = 'pin_failed' AND created_at > NOW() - ($2 * interval '1 minute')`,
+    [willId, PIN_LOCK.minutes]);
+  return r.rows[0].n >= PIN_LOCK.tries;
+}
+
+// → { ok: true } | { ok: false, reason: 'LOCKED' | 'NO_PHONE_ACCOUNT' | 'WRONG_PIN' | 'PIN_FORMAT' }
+async function checkOwnerPin(will, pin, channel) {
+  if (!/^\d{4}$/.test(String(pin || ''))) return { ok: false, reason: 'PIN_FORMAT' };
+  if (await pinLocked(will.id)) return { ok: false, reason: 'LOCKED' };
+  const id = phoneLineId(will.owner_phone);
+  if (!id) return { ok: false, reason: 'NO_PHONE_ACCOUNT' };
+  const { GetCommand } = require('@aws-sdk/lib-dynamodb');
+  const r = await dynamo().send(new GetCommand({
+    TableName: process.env.DYNAMO_USERS_TABLE || 'Users', Key: { userId: id }, ProjectionExpression: 'userPin, #st',
+    ExpressionAttributeNames: { '#st': 'status' } }));
+  const hashed = r.Item?.status !== 'deleted' ? r.Item?.userPin : null;
+  if (!hashed) return { ok: false, reason: 'NO_PHONE_ACCOUNT' };
+  const bcrypt = require('bcrypt');
+  if (await bcrypt.compare(String(pin), String(hashed).replace(/^\$2y\$/, '$2a$'))) return { ok: true };
+  await logEvent(null, will.id, 'pin_failed', 'owner', channel);
+  return { ok: false, reason: (await pinLocked(will.id)) ? 'LOCKED' : 'WRONG_PIN' };
+}
+
+// ── New wills ─────────────────────────────────────────────────────────────────────────────────
+// Whether a new will from this account follows the automatic rules (instead of waiting for an admin)
+async function autoReleaseFor(userId) {
+  if (mode() === 'on') return true;
+  if (mode() !== 'test') return false;
+  const r = await pool.query('SELECT will_test_account FROM users WHERE id = $1', [userId]);
+  return !!r.rows[0]?.will_test_account;
+}
+
+const cleanPhone = (v) => {
+  const d = String(v || '').replace(/\D/g, '');
+  if (d.length === 10) return `+1${d}`;
+  if (d.length === 11 && d.startsWith('1')) return `+${d}`;
+  return null;
+};
+
+// Called right after a will is saved (website or phone line). Gives it its release date and trusted
+// contact when the automatic rules apply; otherwise leaves it with admins. Never throws.
+async function setUpNewWill(will, { chosenDate = null, timezone = null, trusted = null, channel = 'web' } = {}) {
+  try {
+    if (!(await autoReleaseFor(will.user_id))) return null;
+    const date = initialReleaseDate(chosenDate);
+    const tz = timezone && validTz(timezone) ? timezone : DEFAULT_TZ;
+    const tPhone = cleanPhone(trusted?.phone);
+    const r = await pool.query(
+      `UPDATE voice_wills SET release_flow = 'auto', release_state = 'scheduled', release_condition = 'date',
+              release_date = $2, owner_timezone = $3, trusted_name = $4, trusted_phone = $5, trusted_email = $6,
+              warning_stage = 0, last_warning_at = NULL, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1 RETURNING *`,
+      [will.id, date, tz, tPhone ? String(trusted?.name || '').trim().slice(0, 255) || null : null, tPhone,
+       tPhone && trusted?.email ? String(trusted.email).trim().slice(0, 255) : null]);
+    await logEvent(null, will.id, 'date_set', 'owner', channel, { newDate: date, details: { chosen: !!chosenDate, trustedContact: !!tPhone } });
+    return r.rows[0];
+  } catch (err) {
+    logger.error(`Setting up automatic release for will ${will.id} failed (stays with admins): ${err.message}`);
+    return null;
+  }
+}
+
+async function setTrustedContact(willId, { name, phone, email }, userId) {
+  const tPhone = phone ? cleanPhone(phone) : null;
+  if (phone && !tPhone) return { ok: false, error: 'BAD_PHONE' };
+  const r = await pool.query(
+    `UPDATE voice_wills SET trusted_name = $2, trusted_phone = $3, trusted_email = $4, trusted_postpones_in_row = 0,
+            updated_at = CURRENT_TIMESTAMP
+     WHERE id = $1 AND release_flow = 'auto' AND deleted_at IS NULL RETURNING id`,
+    [willId, tPhone ? String(name || '').trim().slice(0, 255) || null : null, tPhone,
+     tPhone && email ? String(email).trim().slice(0, 255) : null]);
+  if (!r.rowCount) return { ok: false, error: 'NOT_FOUND' };
+  await logEvent(null, willId, 'trusted_changed', 'owner', 'web', { details: { removed: !tPhone }, createdBy: userId });
+  return { ok: true };
+}
+
+// Admin dispute pause. A paused will gets no warnings and is not released until resumed.
+async function setPaused(willId, paused, adminId, reason) {
+  const r = await pool.query(paused
+    ? `UPDATE voice_wills SET release_state = 'paused', paused_at = CURRENT_TIMESTAMP, paused_by = $2, paused_reason = $3,
+              updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1 AND release_flow = 'auto' AND release_state IN ('scheduled', 'failed') RETURNING release_date`
+    : `UPDATE voice_wills SET release_state = 'scheduled', warning_stage = 0, last_warning_at = NULL, release_attempts = 0,
+              paused_at = NULL, paused_by = NULL, paused_reason = NULL, updated_at = CURRENT_TIMESTAMP,
+              release_date = GREATEST(release_date, NOW() + interval '4 days')
+       WHERE id = $1 AND release_flow = 'auto' AND release_state IN ('paused', 'failed') RETURNING release_date`,
+    paused ? [willId, adminId, reason || null] : [willId]);
+  if (!r.rowCount) return { ok: false };
+  await logEvent(null, willId, paused ? 'paused' : 'resumed', 'admin', 'web',
+    { newDate: r.rows[0].release_date, details: reason ? { reason } : {}, createdBy: adminId });
+  return { ok: true, releaseDate: r.rows[0].release_date };
+}
+
 module.exports = {
-  mode, isEnabled, dayMs, withinCallHours, initialReleaseDate, tzOf, dateText, willTitle, hash,
-  logEvent, createActionLink, findActionLink, changeReleaseDate, sendWarning, deliverWill,
+  mode, isEnabled, dayMs, withinCallHours, initialReleaseDate, tzOf, dateText, willTitle, hash, apiBaseUrl, phoneLineId,
+  logEvent, createActionLink, findActionLink, changeReleaseDate, sendWarning, deliverWill, sendSms,
+  checkOwnerPin, autoReleaseFor, setUpNewWill, setTrustedContact, setPaused,
   DEFAULT_TZ, POSTPONE_DAYS, TRUSTED_POSTPONE_LIMIT, MAX_RELEASE_ATTEMPTS,
 };

@@ -186,6 +186,9 @@ app.use(['/api/auth/check-phone', '/api/auth/claim-account', '/api/auth/reset-pa
 // Public "change my phone ID or PIN" page: sending codes costs money, the rest reveals / changes accounts
 app.use(['/api/pin-reset/send-code', '/api/pin-reset/send-new-number-code'], messageSendLimiter);
 app.use(['/api/pin-reset/lookup', '/api/pin-reset/check-code', '/api/pin-reset/set-pin', '/api/pin-reset/change-number'], lookupLimiter);
+// Voice will postpone links from warning texts: guessing PINs/codes, and texting codes
+app.use('/api/will-release/link', lookupLimiter);
+app.use(/^\/api\/will-release\/link\/[^/]+\/send-code$/, messageSendLimiter);
 
 // IMPORTANT: Custom body parser that excludes webhook routes
 app.use((req, res, next) => {
@@ -238,6 +241,7 @@ app.use('/api/admin/login', adminSlowDown, adminRateLimit);
 app.use('/api/auth', authSlowDown, require('./routes/auth'));
 app.use('/api/users', require('./routes/users'));
 app.use('/api/pin-reset', require('./routes/phoneReset'));
+app.use('/api/will-release', require('./routes/willRelease'));
 app.use('/api/voice-notes', require('./routes/voiceNotes'));
 app.use('/api/contacts', require('./routes/contacts'));
 app.use('/api/vault', require('./routes/vault'));

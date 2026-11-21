@@ -12,6 +12,7 @@ const {
 } = require('../utils/s3Storage');
 const { WILL_MAX_SECONDS } = require('../utils/planLimits');
 const phoneLineContent = require('../utils/phoneLineContent');
+const willRelease = require('../utils/willRelease');
 const { archiveThenDelete } = require('../utils/recordingArchive');
 const { clearScheduledBeforeDelete } = require('../utils/scheduledDependencies');
 const { resolveIvrPlaybackUrl } = require('../utils/resolveAudioUrl');
@@ -251,7 +252,17 @@ router.post('/wills', authenticate, validateTier('LEGACY_VAULT_PREMIUM'), [
       ]
     );
 
-    const will = result.rows[0];
+    let will = result.rows[0];
+
+    // Automatic release (only when switched on for this account): release date (chosen, or 6 months),
+    // owner's time zone for daytime reminders, optional trusted contact. Otherwise it stays with admins.
+    const autoWill = await willRelease.setUpNewWill(will, {
+      chosenDate: releaseDate || null,
+      timezone: req.body.timezone,
+      trusted: req.body.trustedPhone ? { name: req.body.trustedName, phone: req.body.trustedPhone, email: req.body.trustedEmail } : null,
+      channel: 'web',
+    });
+    if (autoWill) will = autoWill;
     const ivrPlaybackUrl = resolveIvrPlaybackUrl(will);
 
     // Give it a will slot (1–9, what callers press on the keypad) and copy it to the phone line.

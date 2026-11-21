@@ -13,6 +13,7 @@ const { syncToIvr } = require('../utils/syncIvr');
 const { generateDownloadUrl, BUCKETS } = require('../utils/s3Storage');
 const { resolveAudioUrl, resolveIvrPlaybackUrl } = require('../utils/resolveAudioUrl');
 const emailService = require('../utils/emailService');
+const willRelease = require('../utils/willRelease');
 
 const twilioClient = process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN
   ? require('twilio')(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
@@ -26,7 +27,8 @@ const s3 = new AWS.S3({
 
 const LINK_DAYS = 30;
 const isUuid = (v) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(v));
-const DUE_SQL = `(vw.release_condition = 'date' AND vw.release_date IS NOT NULL AND vw.release_date <= NOW() AND COALESCE(vw.is_released, false) = false)`;
+// "Due" = waiting for an admin. Wills on the automatic rules (release_flow 'auto') release themselves.
+const DUE_SQL = `(vw.release_flow = 'admin' AND vw.release_condition = 'date' AND vw.release_date IS NOT NULL AND vw.release_date <= NOW() AND COALESCE(vw.is_released, false) = false)`;
 
 async function logAdminAudit({ userId, action, targetId = null, oldValue = null, newValue = null, ipAddress = null }) {
   try {
@@ -248,11 +250,17 @@ router.post('/wills/:id/release', authenticateAdmin, [
     if (!will) return res.status(404).json({ success: false, error: 'Voice will not found' });
     if (will.admin_removed_at) return res.status(400).json({ success: false, error: 'This will was removed from service. Restore it before releasing.' });
     if (will.is_released) return res.status(400).json({ success: false, error: 'This will has already been released' });
+    // Wills on the automatic rules release themselves on their date. Admins can release one by hand
+    // only if the automatic release failed or it is paused for a dispute.
+    if (will.release_flow === 'auto' && !['failed', 'paused'].includes(will.release_state)) {
+      return res.status(400).json({ success: false, error: 'This will is released automatically on its release date. Use Pause if there is a dispute.' });
+    }
 
     // Claim the release atomically so two admins can't release (and send links) twice
     const claimed = await pool.query(
       `UPDATE voice_wills SET is_released = true, released_at = CURRENT_TIMESTAMP, released_by = $1,
-              release_notes = $2, updated_at = CURRENT_TIMESTAMP
+              release_notes = $2, updated_at = CURRENT_TIMESTAMP,
+              release_state = CASE WHEN release_flow = 'auto' THEN 'released' ELSE release_state END
        WHERE id = $3 AND COALESCE(is_released, false) = false AND admin_removed_at IS NULL AND deleted_at IS NULL
        RETURNING id`,
       [req.user.id, req.body.notes?.trim() || null, will.id]
@@ -317,6 +325,40 @@ router.post('/wills/:id/release', authenticateAdmin, [
   } catch (error) {
     console.error('Release will error:', error);
     res.status(500).json({ success: false, error: 'Failed to release voice will' });
+  }
+});
+
+// ── Pause / resume an automatic release (disputes) ──────────────────────────
+// Paused: no warnings, no release. Resuming restarts the warnings, with the date at least 4 days away.
+router.post('/wills/:id/pause', authenticateAdmin, [
+  body('reason').optional({ nullable: true }).isString().isLength({ max: 2000 })
+], async (req, res) => {
+  try {
+    if (!validationResult(req).isEmpty()) return res.status(400).json({ success: false, error: 'Reason is too long' });
+    const will = await loadWill(req.params.id);
+    if (!will) return res.status(404).json({ success: false, error: 'Voice will not found' });
+    if (will.release_flow !== 'auto') return res.status(400).json({ success: false, error: 'Only wills with a release date can be paused' });
+    const result = await willRelease.setPaused(will.id, true, req.user.id, req.body.reason?.trim());
+    if (!result.ok) return res.status(409).json({ success: false, error: 'This will cannot be paused right now (already paused or released)' });
+    logAdminAudit({ userId: req.user.id, action: 'PAUSE_WILL_RELEASE', targetId: will.id, newValue: { reason: req.body.reason || null }, ipAddress: req.ip });
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Pause will error:', error);
+    res.status(500).json({ success: false, error: 'Failed to pause voice will' });
+  }
+});
+
+router.post('/wills/:id/resume', authenticateAdmin, async (req, res) => {
+  try {
+    const will = await loadWill(req.params.id);
+    if (!will) return res.status(404).json({ success: false, error: 'Voice will not found' });
+    const result = await willRelease.setPaused(will.id, false, req.user.id);
+    if (!result.ok) return res.status(409).json({ success: false, error: 'This will is not paused' });
+    logAdminAudit({ userId: req.user.id, action: 'RESUME_WILL_RELEASE', targetId: will.id, newValue: { releaseDate: result.releaseDate }, ipAddress: req.ip });
+    res.json({ success: true, data: { releaseDate: result.releaseDate } });
+  } catch (error) {
+    console.error('Resume will error:', error);
+    res.status(500).json({ success: false, error: 'Failed to resume voice will' });
   }
 });
 
