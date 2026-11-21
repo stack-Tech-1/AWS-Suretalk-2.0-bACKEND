@@ -415,6 +415,35 @@ class EmailService {
   }
 
   // ══════════════════════════════════════════════════════════════════════════
+  // 10b. VOICE WILL ABOUT TO BE RELEASED (warning to the owner)
+  // ══════════════════════════════════════════════════════════════════════════
+  async sendWillReleaseWarningEmail(toEmail, userName, { willTitle, releaseDateText, postponeUrl }) {
+    const html = t.render({
+      category: 'Legacy Vault', title: 'Your voice will is about to be released', toEmail,
+      preheader: `Your voice will is set to be released on ${releaseDateText}.`,
+      reason: 'You received this email because you have a voice will on SureTalk with a release date.',
+      body: [
+        t.greeting(userName),
+        t.p(t.rich('Your voice will ', t.b(willTitle), ' is set to be released to the people you chose on ', t.b(releaseDateText), '.')),
+        t.p('If you are not ready for it to go out, postpone it by 30 days or choose a new date. You will need your SureTalk PIN.'),
+        t.button('Postpone or change the date', postponeUrl),
+        t.callout('If you do nothing, your voice will is released on that date.', { tone: 'neutral' }),
+        t.p('You can also call 1-855-680-4522 and use the wills menu.', { muted: true, small: true }),
+      ]
+    });
+    return this._send({
+      to: toEmail,
+      subject: `Your SureTalk voice will is set to be released on ${releaseDateText}`,
+      html,
+      text: t.text({ title: 'Your voice will is about to be released', toEmail, lines: [
+        `Hi ${userName || 'there'},`, '', `Your voice will "${willTitle}" is set to be released on ${releaseDateText}.`,
+        `To postpone it or choose a new date (PIN needed): ${postponeUrl}`, '', 'If you do nothing, it is released on that date.',
+        'You can also call 1-855-680-4522 and use the wills menu.'
+      ] })
+    });
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
   // 11. NEW ADMIN ACCESS REQUEST (to super admins)
   // ══════════════════════════════════════════════════════════════════════════
   async sendAdminRequestNotification(toEmail, { applicantName, applicantEmail, department, reason }) {

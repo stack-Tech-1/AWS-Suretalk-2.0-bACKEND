@@ -441,3 +441,4 @@ router.post('/wills/:id/restore', authenticateAdmin, async (req, res) => {
 
 module.exports = router;
 module.exports.willAudioUrl = willAudioUrl;
+module.exports.buildRecipients = buildRecipients; // also used by the automatic release (utils/willRelease.js)

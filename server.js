@@ -1080,6 +1080,10 @@ if (process.env.NODE_ENV === 'production' || process.env.ENABLE_SCHEDULER === 't
   const { startReconciler } = require('./workers/syncReconciler');
   startReconciler();
   logger.info('Sync reconciler started');
+
+  // Automatic voice will release. Does nothing unless WILL_AUTO_RELEASE is 'test' or 'on'.
+  const { startWillReleaseWorker } = require('./workers/willReleaseWorker');
+  startWillReleaseWorker();
 }
 
 // Start server
