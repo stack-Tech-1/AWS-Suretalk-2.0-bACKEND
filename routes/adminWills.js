@@ -223,7 +223,7 @@ router.get('/wills/:id', authenticateAdmin, async (req, res) => {
           release_flow: will.release_flow,
           release_state: will.release_state,
           warning_stage: will.warning_stage,
-          trusted_contact: will.trusted_phone ? { name: will.trusted_name, phone: will.trusted_phone, email: will.trusted_email } : null,
+          trusted_contact: will.trusted_phone ? { name: will.trusted_name, phone: will.trusted_phone, email: will.trusted_email, nameRecordedByPhone: !!will.trusted_name_recording } : null,
           trusted_postpones_in_row: will.trusted_postpones_in_row,
           paused_at: will.paused_at,
           paused_reason: will.paused_reason,

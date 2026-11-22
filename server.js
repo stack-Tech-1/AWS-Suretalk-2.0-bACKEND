@@ -979,7 +979,53 @@ app.post('/api/sync/will-release', syncAuth, async (req, res) => {
         : `It is set to be released on ${when(w)}. To change the date, choose schedule a voice will from the main menu.`;
     };
 
-    if (action === 'status') return res.json({ handled: true, releaseDate: will.release_date, releaseText: spoken(will) });
+    // Trusted contact, read out digit by digit ("ending in 4 5 6 7")
+    const ending = (p) => String(p || '').replace(/\D/g, '').slice(-4).split('').join(' ');
+    const trustedText = (w) => (w.trusted_phone
+      ? (es ? `Su contacto de confianza es el número que termina en ${ending(w.trusted_phone)}.` : `Your trusted contact is the number ending in ${ending(w.trusted_phone)}.`)
+      : (es ? 'Todavía no tiene un contacto de confianza.' : 'You do not have a trusted contact yet.'));
+
+    if (action === 'status') {
+      const short = will.is_released || will.release_state === 'released' || will.release_state === 'paused' ? spoken(will)
+        : (es ? `Su testamento de voz se entregará el ${when(will)}, a menos que lo aplace. Le llamaremos 3 días antes.` : `Your voice will is set to be released on ${when(will)}, unless you postpone it. We will call you 3 days before.`);
+      return res.json({ handled: true, releaseDate: will.release_date, releaseText: spoken(will), releaseShort: short,
+        hasTrusted: !!will.trusted_phone, trustedText: trustedText(will) });
+    }
+
+    // Trusted contact set on a call: their number from the keypad, their name as a recording
+    if (action === 'set_trusted' || action === 'remove_trusted') {
+      if (will.is_released || ['released', 'releasing'].includes(will.release_state)) {
+        return res.json({ handled: true, ok: false, error: 'ALREADY_RELEASED',
+          releaseText: es ? 'Este testamento de voz ya fue entregado.' : 'This voice will has already been released.' });
+      }
+      let phone = null, recording = null;
+      if (action === 'set_trusted') {
+        const d = String(req.body.trustedPhone || '').replace(/\D/g, '').replace(/^1(?=\d{10}$)/, '');
+        const own = String(userId).replace(/\D/g, '').replace(/^1(?=\d{10}$)/, '');
+        if (d.length !== 10) {
+          return res.json({ handled: true, ok: false, error: 'BAD_PHONE',
+            releaseText: es ? 'No se guardó. Ese número no tiene 10 dígitos.' : 'That was not saved. The number must have 10 digits.' });
+        }
+        if (d === own) {
+          return res.json({ handled: true, ok: false, error: 'OWN_PHONE',
+            releaseText: es ? 'No se guardó. Su contacto de confianza debe ser otra persona.' : 'That was not saved. Your trusted contact must be someone else.' });
+        }
+        phone = `+1${d}`;
+        recording = /^RE[0-9a-f]{32}$/i.test(String(req.body.nameRecordingSid || '')) ? req.body.nameRecordingSid : null;
+      }
+      const upd = await pool.query(
+        `UPDATE voice_wills SET trusted_phone = $2, trusted_name = NULL, trusted_email = NULL, trusted_name_recording = $3,
+                trusted_postpones_in_row = 0, updated_at = CURRENT_TIMESTAMP
+         WHERE id = $1 AND release_flow = 'auto' RETURNING *`,
+        [will.id, phone, recording]);
+      await willRelease.logEvent(null, will.id, 'trusted_changed', 'owner', 'phone',
+        { details: { removed: !phone, nameRecorded: !!recording } });
+      const w = upd.rows[0] || will;
+      return res.json({ handled: true, ok: true, hasTrusted: !!w.trusted_phone,
+        releaseText: phone
+          ? (es ? `Listo. Guardamos su contacto de confianza, el número que termina en ${ending(phone)}.` : `Done. Your trusted contact is saved: the number ending in ${ending(phone)}.`)
+          : (es ? 'Listo. Quitamos su contacto de confianza.' : 'Done. Your trusted contact was removed.') });
+    }
 
     if (action === 'set_date') {
       const result = await willRelease.changeReleaseDate(will.id, { newDate: releaseDate, by: 'owner', channel: 'phone' });

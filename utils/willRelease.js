@@ -202,7 +202,14 @@ function warningCallTwiml(will, audience) {
     : 'To postpone it by 30 days, press 1. To let it go out as planned, simply hang up.';
   if (!base) return `<?xml version="1.0" encoding="UTF-8"?><Response>${SAY(intro)}${SAY('To postpone it, use the link in the text we sent you, or call 1 8 5 5 6 8 0 4 5 2 2.')}</Response>`;
   const action = xml(`${base}/api/will-release/call/menu?w=${will.id}&a=${audience}`);
-  return `<?xml version="1.0" encoding="UTF-8"?><Response>${SAY(intro)}` +
+  // Trusted contact set on a phone call: their name was recorded, so the call greets them with it
+  let greeting = '';
+  if (audience === 'trusted' && will.trusted_name_recording) {
+    const { resolveIvrPlaybackUrl } = require('./resolveAudioUrl');
+    const nameUrl = resolveIvrPlaybackUrl({ source: 'ivr', twilio_recording_sid: will.trusted_name_recording });
+    if (nameUrl) greeting = `<Play>${xml(nameUrl)}</Play>`;
+  }
+  return `<?xml version="1.0" encoding="UTF-8"?><Response>${greeting}${SAY(intro)}` +
     `<Gather numDigits="1" timeout="8" action="${action}" method="POST">${SAY(choices)}</Gather>` +
     `${SAY('We did not get a choice. You can still postpone using the link in the text we sent you. Goodbye.')}</Response>`;
 }
@@ -417,6 +424,8 @@ async function setTrustedContact(willId, { name, phone, email }, userId) {
   if (phone && !tPhone) return { ok: false, error: 'BAD_PHONE' };
   const r = await pool.query(
     `UPDATE voice_wills SET trusted_name = $2, trusted_phone = $3, trusted_email = $4, trusted_postpones_in_row = 0,
+            -- the recorded name stays while the number is the same person's; a new number means a new person
+            trusted_name_recording = CASE WHEN trusted_phone = $3 THEN trusted_name_recording ELSE NULL END,
             updated_at = CURRENT_TIMESTAMP
      WHERE id = $1 AND release_flow = 'auto' AND deleted_at IS NULL RETURNING id`,
     [willId, tPhone ? String(name || '').trim().slice(0, 255) || null : null, tPhone,

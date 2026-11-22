@@ -317,7 +317,7 @@ router.get('/wills/:id', authenticate, async (req, res) => {
       ...(auto ? publicInfo(will) : { releaseDate: null, releaseDateText: null, state: null }),
       released: !!will.is_released,
       timezone: wr.tzOf(will),
-      trustedContact: will.trusted_phone ? { name: will.trusted_name, phone: will.trusted_phone, email: will.trusted_email } : null,
+      trustedContact: will.trusted_phone ? { name: will.trusted_name, phone: will.trusted_phone, email: will.trusted_email, nameRecordedByPhone: !!will.trusted_name_recording } : null,
       warningsSent: will.warning_stage,
       paused: will.release_state === 'paused',
       postponeDays: wr.POSTPONE_DAYS,
