@@ -56,6 +56,22 @@ router.post('/register', requireTurnstile, validateRegister, async (req, res) =>
       [email, phone]
     );
 
+    // A phone line customer (account made by a call, no password yet) should claim it, not get a duplicate
+    const phoneDigits = String(phone || '').replace(/\D/g, '').replace(/^1(?=\d{10}$)/, '');
+    if (phoneDigits.length === 10) {
+      const unclaimed = await pool.query(
+        `SELECT id FROM users WHERE regexp_replace(phone, '[^0-9]', '', 'g') = ANY($1)
+           AND password_hash IS NULL AND deleted_at IS NULL LIMIT 1`,
+        [[phoneDigits, `1${phoneDigits}`]]);
+      if (unclaimed.rows.length) {
+        return res.status(409).json({
+          success: false,
+          code: 'PHONE_ACCOUNT_UNCLAIMED',
+          error: 'This phone number already has a SureTalk phone line account. Claim it to use the website with the same account.'
+        });
+      }
+    }
+
     if (existingUser.rows.length > 0) {
       return res.status(400).json({
         success: false,

@@ -58,6 +58,14 @@ const hash = (token) => crypto.createHash('sha256').update(String(token)).digest
 
 const dateText = (date, tz) => new Date(date).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric', timeZone: tz || DEFAULT_TZ });
 const willTitle = (w) => w.title || (w.will_slot_number ? `Phone voice will ${w.will_slot_number}` : 'Your voice will');
+// Who recorded the will, for messages to other people. Phone-only owners have no name on file.
+const ownerLabel = (w, spoken = false) => {
+  if (w.owner_name && String(w.owner_name).trim()) return String(w.owner_name).trim();
+  const d = String(w.owner_phone || '').replace(/\D/g, '').slice(-4);
+  if (d.length !== 4) return 'A SureTalk member';
+  return `The SureTalk member whose phone number ends in ${spoken ? d.split('').join(' ') : d}`;
+};
+const lowerFirst = (s) => (s.startsWith('The SureTalk') || s.startsWith('A SureTalk') ? s[0].toLowerCase() + s.slice(1) : s);
 
 function withinCallHours(will, now = new Date()) {
   const hour = Number(new Intl.DateTimeFormat('en-US', { hour: 'numeric', hourCycle: 'h23', timeZone: tzOf(will) }).format(now));
@@ -188,7 +196,7 @@ function warningCallTwiml(will, audience) {
   const when = dateText(will.release_date, tzOf(will));
   const intro = audience === 'owner'
     ? `Hello, this is SureTalk. Your voice will is set to be released on ${when}.`
-    : `Hello, this is SureTalk. ${will.owner_name || 'Someone'} named you as a trusted contact. Their voice will is set to be released on ${when}, and they have not answered our reminders.`;
+    : `Hello, this is SureTalk. ${ownerLabel(will, true)} named you as a trusted contact. Their voice will is set to be released on ${when}, and they have not answered our reminders.`;
   const choices = audience === 'owner'
     ? 'To postpone it by 30 days, press 1. To choose a new date, press 2. To let it go out as planned, simply hang up.'
     : 'To postpone it by 30 days, press 1. To let it go out as planned, simply hang up.';
@@ -224,7 +232,7 @@ async function sendWarning(will, stage) {
       const tlink = await createActionLink(will, 'trusted');
       await attempt('trustedCall', () => placeCall(will.trusted_phone, warningCallTwiml(will, 'trusted')));
       await attempt('trustedText', () => sendSms(will.trusted_phone,
-        `SureTalk: ${will.owner_name || 'Someone'} named you as a trusted contact. Their voice will is set to be released on ${when}. If it should wait, postpone it here: ${tlink} Reply STOP to opt out.`));
+        `SureTalk: ${ownerLabel(will)} named you as a trusted contact. Their voice will is set to be released on ${when}. If it should wait, postpone it here: ${tlink} Reply STOP to opt out.`));
     }
     if (will.owner_phone) {
       const link = await createActionLink(will, 'owner');
@@ -242,7 +250,8 @@ async function deliverWill(will, { willAudioUrl, buildRecipients }) {
   const recipients = (await buildRecipients(will)).filter(r => r.reachable);
   const expiresAt = new Date(Date.now() + RELEASE_LINK_DAYS * DAY_MS);
   const expiresDate = expiresAt.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
-  const ownerName = will.owner_name || 'Someone';
+  const ownerName = ownerLabel(will);
+  const ownerSpoken = lowerFirst(ownerLabel(will, true));
   let audioUrl = null;
   try { audioUrl = await willAudioUrl(will); } catch (err) { logger.warn(`Will ${will.id} audio URL failed: ${err.message}`); }
   const results = [];
@@ -255,7 +264,7 @@ async function deliverWill(will, { willAudioUrl, buildRecipients }) {
     if (r.phone && audioUrl) {
       try {
         await placeCall(r.phone, `<?xml version="1.0" encoding="UTF-8"?><Response>` +
-          SAY(`Hello. This is SureTalk, with a voice will that ${ownerName} recorded for you.`) + '<Pause length="1"/>' +
+          SAY(`Hello. This is SureTalk, with a voice will that ${ownerSpoken} recorded for you.`) + '<Pause length="1"/>' +
           `<Play>${xml(audioUrl)}</Play><Pause length="1"/>` +
           SAY('We have also sent you a private link so you can listen again. Goodbye.') + '</Response>');
         callStatus = 'sent';
@@ -303,12 +312,40 @@ const dynamo = () => {
   }
   return dynamoDoc;
 };
-// '+14045551234' -> '4045551234' (the phone line's account id)
+// The phone line's account id for a US number: '+14045551234' (same as utils/phoneLineContent.js)
 const phoneLineId = (phone) => {
-  const d = String(phone || '').replace(/\D/g, '');
-  if (d.length === 11 && d.startsWith('1')) return d.slice(1);
-  return d.length === 10 ? d : null;
+  let d = String(phone || '').replace(/\D/g, '');
+  if (d.length === 11 && d.startsWith('1')) d = d.slice(1);
+  return d.length === 10 ? `+1${d}` : null;
 };
+
+// Safety net: a phone customer who finished sign-up on the phone line normally got a website record
+// then (no password, claimable later). If that never arrived, create the same record now, with the
+// phone line's own plan, so the nightly check has nothing to "fix". Returns the user id, or null.
+async function ensurePhoneAccount(phone) {
+  const id = phoneLineId(phone);
+  if (!id) return null;
+  const existing = await pool.query(
+    `SELECT id FROM users WHERE regexp_replace(phone, '[^0-9]', '', 'g') = ANY($1) ORDER BY created_at LIMIT 1`,
+    [[id.slice(2), id.slice(1)]]);
+  if (existing.rows.length) return null;            // has (or had) a website record: never re-create
+  const { GetCommand } = require('@aws-sdk/lib-dynamodb');
+  const r = await dynamo().send(new GetCommand({
+    TableName: process.env.DYNAMO_USERS_TABLE || 'Users', Key: { userId: id },
+    ProjectionExpression: 'verified, #st, subscription_tier, createdAt', ExpressionAttributeNames: { '#st': 'status' } }));
+  const acct = r.Item;
+  if (!acct || acct.verified !== true || acct.status === 'deleted') return null;
+  const { normalizeTier } = require('./tierMapping');
+  const tier = normalizeTier(acct.subscription_tier);
+  const lim = require('./planLimits').limitsFor(tier);
+  const ins = await pool.query(
+    `INSERT INTO users (phone, subscription_tier, status, created_at, source, storage_limit_gb, contacts_limit, voice_notes_limit)
+     VALUES ($1, $2, 'active', $3, 'ivr', $4, $5, $6)
+     ON CONFLICT (phone) DO NOTHING RETURNING id`,
+    [id, tier, acct.createdAt ? new Date(acct.createdAt) : new Date(), lim.storageGb, lim.contacts, lim.voiceNotes]);
+  if (ins.rows[0]) logger.info(`Website record created for phone customer ${last4(id)} (sign-up record had never arrived)`);
+  return ins.rows[0]?.id || null;
+}
 
 async function pinLocked(willId) {
   const r = await pool.query(
@@ -409,6 +446,6 @@ async function setPaused(willId, paused, adminId, reason) {
 module.exports = {
   mode, isEnabled, dayMs, withinCallHours, initialReleaseDate, tzOf, dateText, willTitle, hash, apiBaseUrl, phoneLineId,
   logEvent, createActionLink, findActionLink, changeReleaseDate, sendWarning, deliverWill, sendSms,
-  checkOwnerPin, autoReleaseFor, setUpNewWill, setTrustedContact, setPaused,
+  checkOwnerPin, autoReleaseFor, setUpNewWill, setTrustedContact, setPaused, ensurePhoneAccount,
   DEFAULT_TZ, POSTPONE_DAYS, TRUSTED_POSTPONE_LIMIT, MAX_RELEASE_ATTEMPTS,
 };

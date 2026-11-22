@@ -858,8 +858,15 @@ app.post('/api/sync/will', syncAuth, async (req, res) => {
   }
 
   try {
-    // 1. Find the user by phone number (stored with or without +1)
-    const dbUserId = await findUserIdByPhone(userId);
+    // 1. Find the user by phone number (stored with or without +1). A phone customer whose sign-up
+    //    record never reached the website gets it now (same no-password record a phone sign-up makes).
+    let dbUserId = await findUserIdByPhone(userId);
+    if (!dbUserId && action !== 'delete') {
+      dbUserId = await willRelease.ensurePhoneAccount(userId).catch(err => {
+        console.warn('Phone account safety net failed:', err.message);
+        return null;
+      });
+    }
     if (!dbUserId) {
       // Phone-only customer: no app account to update, but the recording is still archived
       if (action === 'delete') archiveDeletedFromPhone(voiceMessage, { kind: 'voice-will', userId });
